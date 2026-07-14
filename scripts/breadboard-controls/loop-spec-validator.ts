@@ -69,6 +69,7 @@ const EXPECTED_COMMAND_IDS = [
   "unit-integration",
 ] as const;
 const COMMAND_REGISTRY_HASH = "5aa0d5056b6ff29f1fe82015afe073de9ee1bbbcbd9bb225b41e18f1814d9f62";
+const FROZEN_SIMULATION_REPLAY_SHA256 = "789648b0d1fcd43eeaa2d0742876d88a2562aab3bfcb0af935581cabb36fe94b";
 const REQUIRED_NEGATIVE_SIMULATIONS = [
   "failed-evidence",
   "final-index-scan-cycle-attempt",
@@ -118,6 +119,24 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 
 function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) fail("canonical-json-number-invalid");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const object = objectValue(value, "canonical-json-value-invalid");
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+    .join(",")}}`;
+}
+
+function hashDomain(domain: string, value: unknown): string {
+  return createHash("sha256").update(`${domain}\0${canonicalJson(value)}`).digest("hex");
 }
 
 function walk(value: unknown, path: string, visit: (node: JsonObject, path: string) => void): void {
@@ -544,27 +563,56 @@ function validatePredicatesAndSimulations(spec: JsonObject): {
   const simulations = objectArray(spec.seededSimulations, "simulations-invalid");
   const simulationIds = idsFromObjects(simulations, "simulation");
   const simulationById = new Map(simulations.map((simulation) => [simulation.id as string, simulation]));
+  const replayTranscripts: Array<{
+    id: string;
+    terminal: string;
+    stateHash: string;
+    outcomeHash: string;
+  }> = [];
 
   for (const simulation of simulations) {
     const initial = objectValue(simulation.initialRecords, "simulation-initial-invalid");
     if (typeof initial.fixture !== "string" || !(initial.fixture in fixtures)) fail("simulation-fixture-unresolved");
     const fixture = fixtures[initial.fixture];
     if (initial.fixtureSpecHash !== fixture.fixtureSpecHash) fail("simulation-fixture-stale");
+    const fixtureProjection = Object.fromEntries(
+      Object.entries(fixture).filter(([key]) => key !== "fixtureSpecHash"),
+    );
+    if (
+      fixture.deterministic !== true ||
+      fixture.canonicalization !== "RFC8785-compatible-sorted-UTF8-JSON" ||
+      typeof fixture.fixtureSpecHash !== "string" ||
+      createHash("sha256").update(canonicalJson(fixtureProjection)).digest("hex") !== fixture.fixtureSpecHash
+    ) {
+      fail("simulation-fixture-hash-invalid");
+    }
+    let replayStateHash = hashDomain("bb.loop.seeded-replay.v1", initial);
     const events = objectArray(simulation.events, "simulation-events-invalid");
     if (events.length === 0) fail("simulation-events-empty");
     for (const event of events) {
       if (typeof event.event !== "string" || !knownEvents.has(event.event)) fail("simulation-event-unresolved");
+      replayStateHash = hashDomain(`${replayStateHash}\0event`, event);
     }
     const assertions = objectArray(simulation.assertions, "simulation-assertions-invalid");
     if (assertions.length === 0) fail("simulation-assertions-empty");
     for (const assertion of assertions) {
       if (typeof assertion.op !== "string" || !registeredSet.has(assertion.op)) fail("simulation-assertion-operator-unresolved");
+      if (!engine.validateShape(assertion).value) fail("simulation-assertion-shape-invalid");
+      replayStateHash = hashDomain(`${replayStateHash}\0assertion`, assertion);
     }
     const expected = objectValue(simulation.expected, "simulation-expected-invalid");
     if (typeof expected.terminal !== "string" || expected.terminal.length === 0) fail("simulation-terminal-missing");
     if (simulation.id !== "complete-positive-replay" && expected.terminal === "CLOSED") {
       fail("false-terminal-closure");
     }
+    const simulationId = simulation.id;
+    if (typeof simulationId !== "string") fail("simulation-id-invalid");
+    replayTranscripts.push({
+      id: simulationId,
+      terminal: expected.terminal,
+      stateHash: replayStateHash,
+      outcomeHash: hashDomain(`${replayStateHash}\0expected`, expected),
+    });
   }
   for (const id of REQUIRED_NEGATIVE_SIMULATIONS) {
     const simulation = simulationById.get(id);
@@ -583,24 +631,17 @@ function validatePredicatesAndSimulations(spec: JsonObject): {
   const closedCount = simulations.filter((simulation) => objectValue(simulation.expected, "simulation-expected-invalid").terminal === "CLOSED").length;
   if (closedCount !== 1) fail("simulation-closed-outcome-not-sole");
 
-  const replayProjection = simulations
-    .map((simulation) => {
-      const initial = objectValue(simulation.initialRecords, "simulation-initial-invalid");
-      const expected = objectValue(simulation.expected, "simulation-expected-invalid");
-      return {
-        id: simulation.id,
-        fixture: initial.fixture,
-        fixtureSpecHash: initial.fixtureSpecHash,
-        events: objectArray(simulation.events, "simulation-events-invalid").map((event) => event.event),
-        terminal: expected.terminal,
-        assertions: objectArray(simulation.assertions, "simulation-assertions-invalid").map((assertion) => assertion.op),
-      };
-    })
-    .sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  replayTranscripts.sort((left, right) => left.id.localeCompare(right.id));
+  const simulationReplayHash = createHash("sha256")
+    .update(canonicalJson(replayTranscripts))
+    .digest("hex");
+  if (simulationReplayHash !== FROZEN_SIMULATION_REPLAY_SHA256) {
+    fail("simulation-replay-divergence");
+  }
   return {
     operatorCount: registered.length,
     simulationCount: simulationIds.length,
-    simulationReplayHash: createHash("sha256").update(JSON.stringify(replayProjection)).digest("hex"),
+    simulationReplayHash,
   };
 }
 

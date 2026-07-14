@@ -210,6 +210,39 @@ function git(args: string[], code: string, root = ROOT): Uint8Array {
   return result.stdout;
 }
 
+export function validateDonorTagListing(listing: string): string {
+  const expectedRef = `refs/tags/${OMP_TAG}`;
+  const records = listing.trimEnd().split("\n");
+  if (records.length !== 1) throw new ControlViolation("donor-tag-listing-invalid");
+  const fields = records[0].split("\t");
+  if (fields.length !== 2 || fields[0] !== ORACLE_BASE || fields[1] !== expectedRef) {
+    throw new ControlViolation("donor-tag-object-drift");
+  }
+  return fields[0];
+}
+
+let verifiedDonorTagObject: string | undefined;
+
+function verifyDonorTagBinding(root: string): string {
+  if (verifiedDonorTagObject) return verifiedDonorTagObject;
+  const result = Bun.spawnSync(
+    ["git", "ls-remote", "--exit-code", "--refs", OMP_ORIGIN, `refs/tags/${OMP_TAG}`],
+    {
+      cwd: root,
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: 15_000,
+      env: {
+        GIT_TERMINAL_PROMPT: "0",
+        PATH: process.env.PATH ?? "",
+      },
+    },
+  );
+  if (result.exitCode !== 0) throw new ControlViolation("donor-tag-lookup-failed");
+  verifiedDonorTagObject = validateDonorTagListing(Buffer.from(result.stdout).toString("utf8"));
+  return verifiedDonorTagObject;
+}
+
 function decodeNul(data: Uint8Array): string[] {
   const text = Buffer.from(data).toString("utf8");
   if (text.length === 0) return [];
@@ -443,6 +476,7 @@ export interface SourceVerificationSummary {
   schemaVersion: "breadboard.source-verification.v1";
   controlStage: string;
   oracleObject: string;
+  donorTagObject: string;
   oracleTree: string;
   changedPathCount: number;
   ownedPathCount: number;
@@ -463,6 +497,7 @@ export function verifySourceProvenance(root = ROOT): SourceVerificationSummary {
     .toString("utf8")
     .trim();
   if (!/^[0-9a-f]{40}$/.test(oracleTree)) throw new ControlViolation("oracle-tree-invalid");
+  const donorTagObject = verifyDonorTagBinding(root);
 
   const donor = readJson<unknown>(resolve(root, "scripts/breadboard-controls/donor-pin.json"));
   const ownership = readJson<unknown>(resolve(root, "scripts/breadboard-controls/ownership-manifest.json"));
@@ -506,6 +541,7 @@ export function verifySourceProvenance(root = ROOT): SourceVerificationSummary {
     controlStage: stage,
     schemaVersion: "breadboard.source-verification.v1",
     oracleObject: ORACLE_BASE,
+    donorTagObject,
     oracleTree,
     changedPathCount: changedPaths.length,
     ownedPathCount: ownership.ownedPaths.length,

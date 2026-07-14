@@ -1,17 +1,26 @@
+import { createHash } from "node:crypto";
+
 export type JsonObject = Record<string, unknown>;
 
 export interface ArtifactEvidenceState {
   outerVerdict: string;
   supportLevel: string;
-  schemaValid: boolean;
-  semanticPredicatesValid: boolean;
-  requiredCollectionsNonempty: boolean;
+  payload: JsonObject;
   current: boolean;
 }
 
+export interface PredicateRecord {
+  predicateHash: string;
+  sourceRecordHash: string;
+  recordHash: string;
+  current: boolean;
+  actual: unknown;
+  expected: unknown;
+}
+
 export interface PredicateContext {
-  facts?: Record<string, boolean>;
-  artifacts?: Record<string, ArtifactEvidenceState>;
+  records?: Readonly<Record<string, PredicateRecord>>;
+  artifacts?: Readonly<Record<string, ArtifactEvidenceState>>;
 }
 
 export interface PredicateEvaluation {
@@ -28,6 +37,7 @@ interface EvaluationState {
   errors: string[];
   evaluatedOperatorCount: number;
   spec: JsonObject;
+  schemaDocuments: Map<string, JsonObject>;
   handlers: Map<string, OperatorHandler>;
   shapes: PredicateShapes;
 }
@@ -54,6 +64,39 @@ function predicateSignature(predicate: JsonObject): string {
     .join("|");
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("predicate-numeric-invalid");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (!value || typeof value !== "object") throw new Error("predicate-json-invalid");
+  const object = value as JsonObject;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+    .join(",")}}`;
+}
+
+export function predicateBindingHash(predicate: JsonObject): string {
+  return createHash("sha256").update(canonicalJson(predicate)).digest("hex");
+}
+
+export function predicateRecordHash(
+  predicateHash: string,
+  sourceRecordHash: string,
+  current: boolean,
+  actual: unknown,
+  expected: unknown,
+): string {
+  return createHash("sha256")
+    .update(
+      `${predicateHash}\0${sourceRecordHash}\0${current ? "current" : "stale"}\0${canonicalJson(actual)}\0${canonicalJson(expected)}`,
+    )
+    .digest("hex");
+}
+
 function collectPredicateShapes(value: unknown, shapes: PredicateShapes): void {
   if (Array.isArray(value)) {
     for (const entry of value) collectPredicateShapes(entry, shapes);
@@ -70,6 +113,131 @@ function collectPredicateShapes(value: unknown, shapes: PredicateShapes): void {
     signatures.add(predicateSignature(object));
   }
   for (const entry of Object.values(object)) collectPredicateShapes(entry, shapes);
+}
+
+function collectSchemaDocuments(value: unknown, documents: Map<string, JsonObject>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectSchemaDocuments(entry, documents);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const object = value as JsonObject;
+  if (typeof object.$id === "string" && object.$id.length > 0) documents.set(object.$id, object);
+  for (const entry of Object.values(object)) collectSchemaDocuments(entry, documents);
+}
+
+function resolvePointer(document: JsonObject, fragment: string): unknown {
+  if (fragment === "" || fragment === "#") return document;
+  if (!fragment.startsWith("#/")) return undefined;
+  let current: unknown = document;
+  for (const encoded of fragment.slice(2).split("/")) {
+    const currentObject = schemaObject(current);
+    if (!currentObject) return undefined;
+    const key = encoded.replaceAll("~1", "/").replaceAll("~0", "~");
+    if (!(key in currentObject)) return undefined;
+    current = currentObject[key];
+  }
+  return current;
+}
+
+function schemaObject(value: unknown): JsonObject | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
+}
+
+function validateJsonSchema(
+  value: unknown,
+  schema: JsonObject,
+  documents: Map<string, JsonObject>,
+  root: JsonObject,
+): boolean {
+  if (typeof schema.$ref === "string") {
+    const marker = schema.$ref.indexOf("#");
+    const documentId = marker < 0 ? schema.$ref : schema.$ref.slice(0, marker);
+    const fragment = marker < 0 ? "" : schema.$ref.slice(marker);
+    const document = documentId.length === 0 ? root : documents.get(documentId);
+    if (!document) return false;
+    const target = schemaObject(resolvePointer(document, fragment));
+    return target ? validateJsonSchema(value, target, documents, document) : false;
+  }
+  if (schema.const !== undefined && canonicalJson(value) !== canonicalJson(schema.const)) return false;
+  if (Array.isArray(schema.enum) && !schema.enum.some((entry) => canonicalJson(entry) === canonicalJson(value))) return false;
+  if (Array.isArray(schema.allOf) && !schema.allOf.every((entry) => {
+    const child = schemaObject(entry);
+    return child ? validateJsonSchema(value, child, documents, root) : false;
+  })) return false;
+  if (Array.isArray(schema.anyOf) && !schema.anyOf.some((entry) => {
+    const child = schemaObject(entry);
+    return child ? validateJsonSchema(value, child, documents, root) : false;
+  })) return false;
+  if (Array.isArray(schema.oneOf)) {
+    const matches = schema.oneOf.filter((entry) => {
+      const child = schemaObject(entry);
+      return child ? validateJsonSchema(value, child, documents, root) : false;
+    }).length;
+    if (matches !== 1) return false;
+  }
+  if (schema.not !== undefined) {
+    const child = schemaObject(schema.not);
+    if (!child || validateJsonSchema(value, child, documents, root)) return false;
+  }
+  if (typeof schema.type === "string") {
+    const typeMatches =
+      (schema.type === "object" && !!value && typeof value === "object" && !Array.isArray(value)) ||
+      (schema.type === "array" && Array.isArray(value)) ||
+      (schema.type === "string" && typeof value === "string") ||
+      (schema.type === "boolean" && typeof value === "boolean") ||
+      (schema.type === "number" && typeof value === "number" && Number.isFinite(value)) ||
+      (schema.type === "integer" && typeof value === "number" && Number.isInteger(value)) ||
+      (schema.type === "null" && value === null);
+    if (!typeMatches) return false;
+  }
+  if (typeof value === "string") {
+    if (typeof schema.minLength === "number" && value.length < schema.minLength) return false;
+    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return false;
+    if (typeof schema.pattern === "string" && !new RegExp(schema.pattern, "u").test(value)) return false;
+  }
+  if (typeof value === "number") {
+    if (typeof schema.minimum === "number" && value < schema.minimum) return false;
+    if (typeof schema.maximum === "number" && value > schema.maximum) return false;
+  }
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) return false;
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) return false;
+    if (schema.uniqueItems === true && new Set(value.map(canonicalJson)).size !== value.length) return false;
+    const itemSchema = schemaObject(schema.items);
+    if (itemSchema && !value.every((entry) => validateJsonSchema(entry, itemSchema, documents, root))) return false;
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const object = value as JsonObject;
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    if (required.some((key) => typeof key !== "string" || !(key in object))) return false;
+    const properties = schemaObject(schema.properties) ?? {};
+    for (const [key, entry] of Object.entries(object)) {
+      const propertySchema = schemaObject(properties[key]);
+      if (propertySchema) {
+        if (!validateJsonSchema(entry, propertySchema, documents, root)) return false;
+      } else if (schema.additionalProperties === false) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function requiredCollectionsNonempty(payload: JsonObject, schema: JsonObject): boolean {
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const properties = schemaObject(schema.properties) ?? {};
+  for (const key of required) {
+    if (typeof key !== "string") return false;
+    const value = payload[key];
+    if (Array.isArray(value) && value.length === 0) return false;
+    const childSchema = schemaObject(properties[key]);
+    if (childSchema?.type === "object") {
+      const childPayload = schemaObject(value);
+      if (!childPayload || !requiredCollectionsNonempty(childPayload, childSchema)) return false;
+    }
+  }
+  return true;
 }
 
 function evaluateNode(value: unknown, context: PredicateContext, state: EvaluationState): boolean {
@@ -97,14 +265,33 @@ function evaluateNode(value: unknown, context: PredicateContext, state: Evaluati
   }
 }
 
-function factHandler(predicate: JsonObject, context: PredicateContext, state: EvaluationState): boolean {
-  const op = predicate.op as string;
-  const fact = context.facts?.[op];
-  if (typeof fact !== "boolean") {
-    state.errors.push("predicate-fact-missing");
+function recordHandler(predicate: JsonObject, context: PredicateContext, state: EvaluationState): boolean {
+  const predicateHash = predicateBindingHash(predicate);
+  const record = context.records?.[predicateHash];
+  if (!record) {
+    state.errors.push("predicate-record-missing");
     return false;
   }
-  return fact;
+  if (
+    record.predicateHash !== predicateHash ||
+    !/^[0-9a-f]{64}$/.test(record.sourceRecordHash) ||
+    record.recordHash !==
+      predicateRecordHash(
+        record.predicateHash,
+        record.sourceRecordHash,
+        record.current,
+        record.actual,
+        record.expected,
+      )
+  ) {
+    state.errors.push("predicate-record-binding-invalid");
+    return false;
+  }
+  if (!record.current) {
+    state.errors.push("predicate-record-stale");
+    return false;
+  }
+  return canonicalJson(record.actual) === canonicalJson(record.expected);
 }
 
 function andHandler(predicate: JsonObject, context: PredicateContext, state: EvaluationState): boolean {
@@ -152,8 +339,39 @@ function artifactSupportsAcceptanceHandler(
     state.errors.push("evidence-stale");
     return false;
   }
-  if (!artifact.schemaValid || !artifact.semanticPredicatesValid || !artifact.requiredCollectionsNonempty) {
-    state.errors.push("evidence-invalid");
+  if (typeof predicate.payloadConstraintsFromSchema !== "string") {
+    state.errors.push("predicate-field-missing");
+    return false;
+  }
+  const payloadSchemas = schemaObject(state.spec.evidencePayloadSchemas);
+  const payloadDefinition = payloadSchemas
+    ? schemaObject(payloadSchemas[predicate.payloadConstraintsFromSchema])
+    : undefined;
+  const payloadSchema = payloadDefinition ? schemaObject(payloadDefinition.jsonSchema) : undefined;
+  if (!payloadDefinition || !payloadSchema) {
+    state.errors.push("evidence-schema-missing");
+    return false;
+  }
+  if (
+    !validateJsonSchema(artifact.payload, payloadSchema, state.schemaDocuments, payloadSchema) ||
+    !requiredCollectionsNonempty(artifact.payload, payloadSchema)
+  ) {
+    state.errors.push("evidence-schema-invalid");
+    return false;
+  }
+  const semanticPredicates = payloadDefinition.semanticPredicates;
+  if (!Array.isArray(semanticPredicates) || semanticPredicates.length === 0) {
+    state.errors.push("evidence-semantic-predicates-missing");
+    return false;
+  }
+  let semanticValid = true;
+  for (const semanticPredicate of semanticPredicates) {
+    if (!evaluateNode(semanticPredicate, context, state)) semanticValid = false;
+  }
+  if (!semanticValid) {
+    if (!state.errors.includes("predicate-record-missing") && !state.errors.includes("predicate-record-binding-invalid")) {
+      state.errors.push("evidence-semantic-invalid");
+    }
     return false;
   }
   if (
@@ -182,6 +400,7 @@ export class PredicateEngine {
   readonly implementedOperators: readonly string[];
   private readonly handlers: Map<string, OperatorHandler>;
   private readonly shapes: PredicateShapes;
+  private readonly schemaDocuments: Map<string, JsonObject>;
 
   constructor(private readonly spec: JsonObject) {
     const engine = spec.predicateEngine;
@@ -197,7 +416,7 @@ export class PredicateEngine {
     const registeredOperators = registered as string[];
 
     this.handlers = new Map<string, OperatorHandler>();
-    for (const op of registeredOperators) this.handlers.set(op, factHandler);
+    for (const op of registeredOperators) this.handlers.set(op, recordHandler);
     const specialHandlers: Record<string, OperatorHandler> = {
       and: andHandler,
       artifactSupportsAcceptance: artifactSupportsAcceptanceHandler,
@@ -211,7 +430,26 @@ export class PredicateEngine {
     }
     this.shapes = new Map();
     collectPredicateShapes(this.spec, this.shapes);
+    this.schemaDocuments = new Map();
+    collectSchemaDocuments(this.spec, this.schemaDocuments);
     this.implementedOperators = [...this.handlers.keys()].sort();
+  }
+
+  validateShape(predicate: unknown): PredicateEvaluation {
+    if (!predicate || typeof predicate !== "object" || Array.isArray(predicate)) {
+      return { value: false, errors: ["predicate-shape-invalid"], evaluatedOperatorCount: 0 };
+    }
+    const object = predicate as JsonObject;
+    if (typeof object.op !== "string" || object.op.length === 0) {
+      return { value: false, errors: ["predicate-operator-missing"], evaluatedOperatorCount: 0 };
+    }
+    if (!this.handlers.has(object.op)) {
+      return { value: false, errors: ["predicate-operator-unknown"], evaluatedOperatorCount: 0 };
+    }
+    if (!this.shapes.get(object.op)?.has(predicateSignature(object))) {
+      return { value: false, errors: ["predicate-schema-violation"], evaluatedOperatorCount: 0 };
+    }
+    return { value: true, errors: [], evaluatedOperatorCount: 0 };
   }
 
   evaluate(predicate: unknown, context: PredicateContext = {}): PredicateEvaluation {
@@ -221,6 +459,7 @@ export class PredicateEngine {
       spec: this.spec,
       handlers: this.handlers,
       shapes: this.shapes,
+      schemaDocuments: this.schemaDocuments,
     };
     const value = evaluateNode(predicate, context, state);
     return { value: value && state.errors.length === 0, errors: state.errors, evaluatedOperatorCount: state.evaluatedOperatorCount };

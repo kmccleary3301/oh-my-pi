@@ -11,10 +11,15 @@ import {
   LoopSpecViolation,
   validateLoopSpecDocument,
 } from "./loop-spec-validator.ts";
-import { PredicateEngine } from "./predicate-engine.ts";
-import type { ArtifactEvidenceState, JsonObject } from "./predicate-engine.ts";
+import {
+  predicateBindingHash,
+  predicateRecordHash,
+  PredicateEngine,
+} from "./predicate-engine.ts";
+import type { ArtifactEvidenceState, JsonObject, PredicateRecord } from "./predicate-engine.ts";
 import {
   ControlViolation,
+  validateDonorTagListing,
   validateDonorPin,
   validateExclusions,
   validateOwnership,
@@ -81,11 +86,100 @@ function passingArtifact(): ArtifactEvidenceState {
   return {
     outerVerdict: "pass",
     supportLevel: "confirmed",
-    schemaValid: true,
-    semanticPredicatesValid: true,
-    requiredCollectionsNonempty: true,
+    payload: {
+      commandId: "focused-test",
+      commandSha256: "a".repeat(64),
+      exitCode: 0,
+      contractAssertionSetHash: "b".repeat(64),
+      assertionResults: [
+        {
+          assertionId: "A1.focused",
+          passed: true,
+          observedDigest: "c".repeat(64),
+        },
+      ],
+      testOutputPolicyHash: "0110e29aacdc718f93354c95c87d4b27b65c3e024f7b59b05b7414c029b9f752",
+      outputDisposition: "no-output-produced",
+      outputQuarantineAttestationHash: "d".repeat(64),
+    },
     current: true,
   };
+}
+
+function predicateRecord(
+  predicate: JsonObject,
+  matches: boolean,
+  current = true,
+): PredicateRecord {
+  const predicateHash = predicateBindingHash(predicate);
+  const sourceRecordHash = "a".repeat(64);
+  const actual = { observed: matches ? "expected" : "different" };
+  const expected = { observed: "expected" };
+  return {
+    predicateHash,
+    sourceRecordHash,
+    current,
+    actual,
+    expected,
+    recordHash: predicateRecordHash(predicateHash, sourceRecordHash, current, actual, expected),
+  };
+}
+
+function predicateRecords(
+  entries: ReadonlyArray<readonly [JsonObject, boolean]>,
+): Record<string, PredicateRecord> {
+  return Object.fromEntries(
+    entries.map(([predicate, matches]) => [
+      predicateBindingHash(predicate),
+      predicateRecord(predicate, matches),
+    ]),
+  );
+}
+
+function collectPredicates(value: unknown, predicates: Map<string, JsonObject>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectPredicates(entry, predicates);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const object = objectValue(value);
+  if (typeof object.op === "string" && !predicates.has(object.op)) predicates.set(object.op, object);
+  for (const entry of Object.values(object)) collectPredicates(entry, predicates);
+}
+
+function collectRequiredRecordOutcomes(
+  predicate: JsonObject,
+  desired: boolean,
+  spec: JsonObject,
+  outcomes: Array<readonly [JsonObject, boolean]>,
+): void {
+  if (predicate.op === "and") {
+    const argumentsToEvaluate = arrayValue(predicate.args).map(objectValue);
+    if (desired) {
+      for (const argument of argumentsToEvaluate) {
+        collectRequiredRecordOutcomes(argument, true, spec, outcomes);
+      }
+    } else {
+      collectRequiredRecordOutcomes(argumentsToEvaluate[0], false, spec, outcomes);
+    }
+    return;
+  }
+  if (predicate.op === "not") {
+    collectRequiredRecordOutcomes(propertyObject(predicate, "arg"), !desired, spec, outcomes);
+    return;
+  }
+  if (predicate.op === "evaluateCanonicalCloseoutPredicate") {
+    collectRequiredRecordOutcomes(propertyObject(spec, "closeoutPredicate"), desired, spec, outcomes);
+    return;
+  }
+  if (predicate.op === "true") {
+    if (!desired) throw new Error("true predicate cannot produce false");
+    return;
+  }
+  if (predicate.op === "artifactSupportsAcceptance") {
+    throw new Error("artifact predicate requires artifact payload fixture");
+  }
+  outcomes.push([predicate, desired]);
 }
 
 describe("pinned provenance and source inventory", () => {
@@ -96,6 +190,7 @@ describe("pinned provenance and source inventory", () => {
     expect(first).toEqual(second);
     expect(first.status).toBe("pass");
     expect(first.oracleObject).toBe(ORACLE_OBJECT);
+    expect(first.donorTagObject).toBe(ORACLE_OBJECT);
     expect(first.controlStage).toBe("A1");
     expect(first.changedPathCount).toBe(13);
     expect(first.ownedPathCount).toBe(13);
@@ -125,6 +220,11 @@ describe("pinned provenance and source inventory", () => {
     const missing = structuredClone(donor);
     delete propertyObject(missing, "donor").origin;
     expectControlCode(() => validateDonorPin(missing), "donor-detail-open");
+    expect(validateDonorTagListing(`${ORACLE_OBJECT}\trefs/tags/v16.5.0\n`)).toBe(ORACLE_OBJECT);
+    expectControlCode(
+      () => validateDonorTagListing(`${"0".repeat(40)}\trefs/tags/v16.5.0\n`),
+      "donor-tag-object-drift",
+    );
   });
 
   test("rejects unsafe exclusion drift, ownership collisions, and changed paths", () => {
@@ -255,6 +355,16 @@ describe("frozen DAG machine validation", () => {
     packetA1.dependsOnPackets = [...arrayValue(packetA1.dependsOnPackets), "G16"];
     expect(() => validateLoopSpecDocument(cycle)).toThrow(new LoopSpecViolation("expanded-dependency-cycle"));
   });
+  test("replays all seeded records and rejects outcome transcript divergence", () => {
+    const driftedReplay = structuredClone(frozenDocument());
+    const simulations = arrayValue(driftedReplay.seededSimulations).map(objectValue);
+    const firstExpected = propertyObject(simulations[0], "expected");
+    firstExpected.terminal = "OWNER_DECISION";
+    expect(() => validateLoopSpecDocument(driftedReplay)).toThrow(
+      new LoopSpecViolation("simulation-replay-divergence"),
+    );
+  });
+
 });
 
 describe("predicate-engine conformance", () => {
@@ -263,11 +373,22 @@ describe("predicate-engine conformance", () => {
     const acceptances = propertyObject(document, "acceptanceCatalog");
     const acceptance = propertyObject(propertyObject(acceptances, "A1.accept.focused-test"), "predicate");
     const engine = new PredicateEngine(document);
+    const payloadDefinitions = propertyObject(document, "evidencePayloadSchemas");
+    const testReportDefinition = propertyObject(payloadDefinitions, "TestReportEvidence");
+    const semanticPredicates = arrayValue(testReportDefinition.semanticPredicates).map(objectValue);
+    const semanticRecords = predicateRecords(
+      semanticPredicates.map((predicate) => [predicate, true] as const),
+    );
 
-    expect(engine.evaluate(acceptance, { artifacts: { "A1.focused-test": passingArtifact() } })).toEqual({
+    expect(
+      engine.evaluate(acceptance, {
+        artifacts: { "A1.focused-test": passingArtifact() },
+        records: semanticRecords,
+      }),
+    ).toEqual({
       value: true,
       errors: [],
-      evaluatedOperatorCount: 1,
+      evaluatedOperatorCount: semanticPredicates.length + 1,
     });
 
     const stale = passingArtifact();
@@ -277,33 +398,130 @@ describe("predicate-engine conformance", () => {
       errors: ["evidence-stale"],
     });
 
-    const empty = passingArtifact();
-    empty.requiredCollectionsNonempty = false;
-    expect(engine.evaluate(acceptance, { artifacts: { "A1.focused-test": empty } })).toMatchObject({
+    const emptyAssertionResults = passingArtifact();
+    emptyAssertionResults.payload.assertionResults = [];
+    expect(
+      engine.evaluate(acceptance, {
+        artifacts: { "A1.focused-test": emptyAssertionResults },
+        records: semanticRecords,
+      }),
+    ).toMatchObject({
       value: false,
-      errors: ["evidence-invalid"],
+      errors: ["evidence-schema-invalid"],
     });
   });
 
-  test("evaluates A1 changed-path and CI predicates against explicit facts", () => {
+  test("evaluates A1 changed-path and CI predicates against immutable records", () => {
     const document = frozenDocument();
     const acceptances = propertyObject(document, "acceptanceCatalog");
     const engine = new PredicateEngine(document);
     const changedPaths = propertyObject(propertyObject(acceptances, "A1.accept.changed-paths"), "predicate");
     const ciMerge = propertyObject(propertyObject(acceptances, "A1.accept.ci-merge"), "predicate");
 
-    expect(engine.evaluate(changedPaths, { facts: { changedPathProofValid: true } }).value).toBe(true);
-    expect(engine.evaluate(changedPaths, { facts: { changedPathProofValid: false } }).value).toBe(false);
+    expect(engine.evaluate(changedPaths, { records: predicateRecords([[changedPaths, true]]) }).value).toBe(true);
+    expect(engine.evaluate(changedPaths, { records: predicateRecords([[changedPaths, false]]) }).value).toBe(false);
+    const ciArguments = arrayValue(ciMerge.args).map(objectValue);
     expect(
-      engine.evaluate(ciMerge, {
-        facts: { allRequiredCiPassed: true, actionScopedHumanApprovalCurrent: true },
-      }).value,
+      engine.evaluate(ciMerge, { records: predicateRecords(ciArguments.map((predicate) => [predicate, true] as const)) }).value,
     ).toBe(true);
     expect(
-      engine.evaluate(ciMerge, {
-        facts: { allRequiredCiPassed: true, actionScopedHumanApprovalCurrent: false },
-      }).value,
+      engine.evaluate(ciMerge, { records: predicateRecords([
+        [ciArguments[0], true],
+        [ciArguments[1], false],
+      ]) }).value,
     ).toBe(false);
+  });
+
+  test("binds every generic operator result to the exact predicate and source record", () => {
+    const document = frozenDocument();
+    const engine = new PredicateEngine(document);
+    const predicates = new Map<string, JsonObject>();
+    collectPredicates(document, predicates);
+    const registered = arrayValue(propertyObject(document, "predicateEngine").registeredOperators);
+    const specialOperators: Record<string, true> = {
+      and: true,
+      artifactSupportsAcceptance: true,
+      evaluateCanonicalCloseoutPredicate: true,
+      not: true,
+      true: true,
+    };
+    let checked = 0;
+    for (const operator of registered) {
+      if (typeof operator !== "string" || specialOperators[operator]) continue;
+      const predicate = predicates.get(operator);
+      if (!predicate) throw new Error(`registered predicate missing: ${operator}`);
+      expect(engine.evaluate(predicate, { records: predicateRecords([[predicate, true]]) })).toMatchObject({
+        value: true,
+        errors: [],
+      });
+      expect(engine.evaluate(predicate, { records: predicateRecords([[predicate, false]]) })).toMatchObject({
+        value: false,
+        errors: [],
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(355);
+
+    const changedPathA1 = propertyObject(
+      propertyObject(propertyObject(document, "acceptanceCatalog"), "A1.accept.changed-paths"),
+      "predicate",
+    );
+    const changedPathOther = structuredClone(changedPathA1);
+    changedPathOther.packetId = "A2";
+    expect(
+      engine.evaluate(changedPathOther, { records: predicateRecords([[changedPathA1, true]]) }),
+    ).toMatchObject({ value: false, errors: ["predicate-record-missing"] });
+
+    const tamperedRecords = predicateRecords([[changedPathA1, true]]);
+    tamperedRecords[predicateBindingHash(changedPathA1)].actual = { observed: "different" };
+    expect(engine.evaluate(changedPathA1, { records: tamperedRecords })).toMatchObject({
+      value: false,
+      errors: ["predicate-record-binding-invalid"],
+    });
+  });
+
+  test("executes boolean and canonical-closeout operator families", () => {
+    const document = frozenDocument();
+    const engine = new PredicateEngine(document);
+    const predicates = new Map<string, JsonObject>();
+    collectPredicates(document, predicates);
+
+    const truePredicate = predicates.get("true");
+    const notPredicate = predicates.get("not");
+    const canonicalPredicate = predicates.get("evaluateCanonicalCloseoutPredicate");
+    if (!truePredicate || !notPredicate || !canonicalPredicate) {
+      throw new Error("special predicate fixture missing");
+    }
+    expect(engine.evaluate(truePredicate)).toMatchObject({ value: true, errors: [] });
+    expect(engine.evaluate({ ...truePredicate, unexpected: true })).toMatchObject({
+      value: false,
+      errors: ["predicate-schema-violation"],
+    });
+
+    const notTrueOutcomes: Array<readonly [JsonObject, boolean]> = [];
+    collectRequiredRecordOutcomes(notPredicate, true, document, notTrueOutcomes);
+    expect(engine.evaluate(notPredicate, { records: predicateRecords(notTrueOutcomes) })).toMatchObject({
+      value: true,
+      errors: [],
+    });
+    const notFalseOutcomes: Array<readonly [JsonObject, boolean]> = [];
+    collectRequiredRecordOutcomes(notPredicate, false, document, notFalseOutcomes);
+    expect(engine.evaluate(notPredicate, { records: predicateRecords(notFalseOutcomes) })).toMatchObject({
+      value: false,
+      errors: [],
+    });
+
+    const closeoutOutcomes: Array<readonly [JsonObject, boolean]> = [];
+    collectRequiredRecordOutcomes(canonicalPredicate, true, document, closeoutOutcomes);
+    expect(
+      engine.evaluate(canonicalPredicate, { records: predicateRecords(closeoutOutcomes) }),
+    ).toMatchObject({ value: true, errors: [] });
+    const deniedCloseout = closeoutOutcomes.map(([predicate, matches], index) =>
+      [predicate, index === 0 ? !matches : matches] as const
+    );
+    expect(
+      engine.evaluate(canonicalPredicate, { records: predicateRecords(deniedCloseout) }),
+    ).toMatchObject({ value: false, errors: [] });
   });
 
   test("fails closed for unknown, malformed, and incomplete predicates", () => {
@@ -317,9 +535,7 @@ describe("predicate-engine conformance", () => {
       value: false,
       errors: ["predicate-required-collection-empty"],
     });
-    expect(
-      engine.evaluate({ op: "changedPathProofValid" }, { facts: { changedPathProofValid: true } }),
-    ).toMatchObject({
+    expect(engine.evaluate({ op: "changedPathProofValid" })).toMatchObject({
       value: false,
       errors: ["predicate-schema-violation"],
     });
