@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "breadboard.source-exclusions.v1",
+  "classification": {
+    "oracleCopiedBaseline": "every tracked oracle path not classified by the active ownership stage",
+    "breadboardOwned": "ownedPaths plus active stage additiveOwnedPatterns",
+    "excludedFromBreadboardAuthorship": "all oracleCopiedBaseline paths"
+  },
+  "controlStageField": "breadboardControls.stage",
+  "stageForbiddenSourcePrefixes": {
+    "A1": [
+      "packages/breadboard-adapters",
+      "packages/breadboard-app"
+    ],
+    "A2": [
+      "packages/breadboard-app"
+    ],
+    "A3": []
+  },
+  "forbiddenImportPathSegments": [
+    "generated",
+    "patches",
+    "vendor",
+    "vendored"
+  ],
+  "stageForbiddenImportSpecifierPrefixes": {
+    "A1": [
+      "packages/breadboard-adapters",
+      "packages/breadboard-app"
+    ],
+    "A2": [
+      "packages/breadboard-app"
+    ],
+    "A3": []
+  },
+  "nonSourceFixturePrefixes": [
+    "scripts/breadboard-controls/fixtures"
+  ]
+}

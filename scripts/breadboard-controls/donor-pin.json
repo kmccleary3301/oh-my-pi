@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "breadboard.donor-pin.v1",
+  "donor": {
+    "name": "Oh My Pi",
+    "origin": "https://github.com/can1357/oh-my-pi",
+    "releaseTag": "v16.5.0",
+    "gitObject": "3047c27c332c5629c8e063283d349384c10c9a56",
+    "gitObjectFormat": "sha1",
+    "license": "MIT",
+    "licenseSourcePath": "LICENSE",
+    "licenseSha256": "545636e19386d3d4e0ae6d77354527499999c3ebfbca61b9fa5aa4ead7c0b308"
+  },
+  "baselineRole": "oracle-copied",
+  "breadboardAuthorshipScope": "owned-control-paths-only"
+}

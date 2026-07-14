@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "breadboard.ownership-manifest.v1",
+  "oracleBase": "3047c27c332c5629c8e063283d349384c10c9a56",
+  "oracleBaselineRole": "oracle-copied",
+  "controlStageField": "breadboardControls.stage",
+  "allowlist": [
+    ".github/workflows/**",
+    "NOTICE.md",
+    "THIRD_PARTY_NOTICES/**",
+    "bun.lock",
+    "package.json",
+    "scripts/**"
+  ],
+  "ownedPaths": [
+    ".github/workflows/breadboard-controls.yml",
+    "NOTICE.md",
+    "THIRD_PARTY_NOTICES/oh-my-pi-v16.5.0.md",
+    "package.json",
+    "scripts/breadboard-controls/controls.test.ts",
+    "scripts/breadboard-controls/donor-pin.json",
+    "scripts/breadboard-controls/fixtures/BB_TUI_P29_BB_OMP_TOTAL_FULFILLMENT_PR_DAG.json",
+    "scripts/breadboard-controls/import-verifier.ts",
+    "scripts/breadboard-controls/loop-spec-validator.ts",
+    "scripts/breadboard-controls/ownership-manifest.json",
+    "scripts/breadboard-controls/predicate-engine.ts",
+    "scripts/breadboard-controls/source-exclusions.json",
+    "scripts/breadboard-controls/source-verifier.ts"
+  ],
+  "stagePolicies": {
+    "A1": {
+      "additiveOwnedPatterns": [],
+      "requiredChangedPrefixes": [],
+      "forbiddenPackageRoots": [
+        "packages/breadboard-adapters",
+        "packages/breadboard-app"
+      ]
+    },
+    "A2": {
+      "additiveOwnedPatterns": [
+        "bun.lock",
+        "packages/breadboard-adapters/**"
+      ],
+      "requiredChangedPrefixes": [
+        "packages/breadboard-adapters"
+      ],
+      "forbiddenPackageRoots": [
+        "packages/breadboard-app"
+      ]
+    },
+    "A3": {
+      "additiveOwnedPatterns": [
+        "bun.lock",
+        "packages/breadboard-adapters/**",
+        "packages/breadboard-app/**"
+      ],
+      "requiredChangedPrefixes": [
+        "packages/breadboard-adapters",
+        "packages/breadboard-app"
+      ],
+      "forbiddenPackageRoots": []
+    }
+  }
+}

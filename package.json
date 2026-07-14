@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.14",
+  "breadboardControls": {
+    "stage": "A1"
+  },
   "patchedDependencies": {
     "@ark/schema@0.56.2": "patches/@ark%2Fschema@0.56.2.patch",
     "puppeteer-core@25.3.0": "patches/puppeteer-core@25.3.0.patch",
@@ -113,6 +116,11 @@
     "test": "bun scripts/ci-test-ts.ts local",
     "test:ts": "bun scripts/ci-test-ts.ts local-ts",
     "test:scripts": "bun test scripts/ci-build-native.test.ts scripts/ci-concurrency.test.ts scripts/ci-release-build-binaries.test.ts scripts/ci-release-notes.test.ts scripts/fix-dts-extensions.test.ts scripts/link-omp.test.ts",
+    "test:breadboard-controls": "bun test scripts/breadboard-controls/controls.test.ts",
+    "verify:breadboard-source": "bun scripts/breadboard-controls/source-verifier.ts",
+    "verify:breadboard-imports": "bun scripts/breadboard-controls/import-verifier.ts",
+    "verify:breadboard-loop-spec": "bun scripts/breadboard-controls/loop-spec-validator.ts",
+    "ci:breadboard-controls": "bun run test:breadboard-controls && bun run verify:breadboard-source && bun run verify:breadboard-imports && bun run verify:breadboard-loop-spec",
     "test:rs": "bun scripts/run-rs-task.ts test:rs",
     "check": "bun run --parallel check:ts check:rs",
     "check:ts": "bun run check:tools && bun run --workspaces --if-present check",
