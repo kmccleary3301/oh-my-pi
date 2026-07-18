@@ -19,6 +19,8 @@ export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 export interface Args {
 	cwd?: string;
 	profile?: string;
+	engineMode?: string;
+	engineUrl?: string;
 	alias?: string;
 	allowHome?: boolean;
 	provider?: string;
@@ -362,6 +364,8 @@ export function getExtraHelpText(): string {
   ${chalk.dim("# Configuration")}
   OMP_PROFILE                 - Named profile for isolated agent state (same as --profile)
   Use \`omp --profile <name> --alias <command>\` to create a shell shortcut for a profile
+  BREADBOARD_ENGINE_MODE      - Engine mode: local-owned, local-external, remote, or off
+  BREADBOARD_API_URL          - Exact BreadBoard engine endpoint URL
   PI_CODING_AGENT_DIR        - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
   PI_PACKAGE_DIR             - Override package directory (for Nix/Guix store paths)
   PI_SMOL_MODEL              - Override smol/fast model (see --smol)
@@ -386,6 +390,10 @@ ${chalk.bold("Available Tools (default-enabled unless noted):")}
   todo          - Manage todo/task lists
   web_search    - Search the web
   ask           - Ask user questions (interactive mode only)
+
+${chalk.bold("BreadBoard Engine Options:")}
+  --engine-mode <mode>       local-owned | local-external | remote | off
+  --engine-url <url>         Exact normalized engine endpoint (no aliases or fallback)
 
 ${chalk.bold("Plugin Options:")}
   --plugin-dir <path>        Load plugin from directory (repeatable)

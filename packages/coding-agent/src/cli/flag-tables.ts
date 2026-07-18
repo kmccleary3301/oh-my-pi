@@ -98,6 +98,12 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--config": (result, value) => {
 		result.config = [...(result.config ?? []), value];
 	},
+	"--engine-mode": (result, value) => {
+		result.engineMode = value;
+	},
+	"--engine-url": (result, value) => {
+		result.engineUrl = value;
+	},
 	"--mode": (result, value) => {
 		if (value === "text" || value === "json" || value === "rpc" || value === "acp" || value === "rpc-ui") {
 			result.mode = value;

@@ -51,6 +51,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",
     "@babel/parser": "catalog:",
+    "@breadboard/sdk": "file:/Users/kylemccleary/projects/breadboard_p30_artifacts_20260717/sdk/breadboard-sdk-0.1.0.tgz",
     "@mozilla/readability": "catalog:",
     "@oh-my-pi/hashline": "catalog:",
     "@oh-my-pi/omp-stats": "catalog:",

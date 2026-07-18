@@ -7,11 +7,13 @@
 import * as fsSync from "node:fs";
 import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
+import { join } from "node:path";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryExists,
+	getAgentDir,
 	getLogPath,
 	getProjectDir,
 	logger,
@@ -1035,20 +1037,69 @@ interface RunRootCommandDependencies {
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
+
+async function runBreadboardLifecyclePreflight(parsed: Args): Promise<boolean> {
+	// Intentionally lazy: launch help/version/export and other non-session exits must not load lifecycle process code.
+	const runConfig = await import("./breadboard/lifecycle/run-config");
+	try {
+		const selectedConfig = await runConfig.loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
+		const config = runConfig.resolveBreadboardRunConfig({
+			cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
+			selectedConfig,
+			workspacePath: getProjectDir(),
+		});
+		const [{ dispatchLifecycleAction, LifecycleSupervisor }, { LocalAuthorityStore }, presenter] =
+			await Promise.all([
+				import("./breadboard/lifecycle/lifecycle-supervisor"),
+				import("./breadboard/lifecycle/local-authority-store"),
+				import("./breadboard/lifecycle/lifecycle-presenter"),
+			]);
+		const store = config.mode === "local-owned"
+			? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
+			: undefined;
+		const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
+		const execution = await dispatchLifecycleAction(supervisor, "connect", {
+			closeReady: true,
+			restoreTerminal: presenter.restoreLifecycleTerminal,
+		});
+		const presentation = presenter.writeLifecyclePresentation(execution.result);
+		let exitCode: number = presentation.exitCode;
+		if (execution.result.kind === "ready") {
+			process.stderr.write(
+				"BreadBoard lifecycle is ready, but the governed interactive session slice is not installed in this packet.\n",
+			);
+			exitCode = 1;
+		}
+		if (execution.closeResult?.kind === "failure") {
+			exitCode = presenter.writeLifecyclePresentation(execution.closeResult).exitCode || 1;
+		}
+		if (execution.signal !== undefined) exitCode = execution.signal === "SIGINT" ? 130 : 143;
+		process.exitCode = exitCode;
+		return true;
+	} catch (error) {
+		const message = error instanceof runConfig.BreadboardRunConfigError
+			? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
+			: "BreadBoard lifecycle failed unexpectedly.";
+		process.stderr.write(`${message}\n`);
+		process.exitCode = 1;
+		return true;
+	}
+}
+
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	const parsedArgs = parsed;
+	await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+
 	logger.startTiming();
 	startStartupWatchdog();
 
 	// Initialize theme early with defaults (CLI commands need symbols)
 	// Will be re-initialized with user preferences later
 	await logger.time("initTheme:initial", initTheme);
-
-	const parsedArgs = parsed;
-	await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
 
@@ -1355,6 +1406,11 @@ export async function runRootCommand(
 	};
 
 	if (mode === "acp") {
+		if (await runBreadboardLifecyclePreflight(parsedArgs)) {
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			return;
+		}
 		const createAcpSession = createAcpSessionFactory({
 			baseOptions: sessionOptions,
 			settings: settingsInstance,
@@ -1419,6 +1475,11 @@ export async function runRootCommand(
 			stdinIsTTY: process.stdin.isTTY,
 			stdoutIsTTY: process.stdout.isTTY,
 		});
+		if (await runBreadboardLifecyclePreflight(parsedArgs)) {
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			return;
+		}
 
 		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
 			...sessionOptions,

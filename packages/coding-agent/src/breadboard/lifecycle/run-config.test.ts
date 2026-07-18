@@ -1,0 +1,129 @@
+import { describe, expect, test } from "bun:test";
+import { BreadboardRunConfigError, resolveBreadboardRunConfig } from "./run-config";
+import type { EngineArtifact } from "./run-config";
+
+const workspaceId: `workspace:v1:sha256:${string}` = `workspace:v1:sha256:${"a".repeat(64)}`;
+const artifact: EngineArtifact = {
+	executablePath: "/usr/bin/false",
+	argv: ["--serve"],
+	executableSha256: `sha256:${"b".repeat(64)}`,
+	engineSourceSha256: `sha256:${"c".repeat(64)}`,
+	servedBackendCommit: "d".repeat(40),
+};
+const baseInput = {
+	workspacePath: "/workspace",
+	canonicalizeWorkspace: () => "/canonical/workspace",
+	environment: {} as Record<string, string | undefined>,
+};
+
+function configError(run: () => unknown): BreadboardRunConfigError {
+	try {
+		run();
+	} catch (error) {
+		if (error instanceof BreadboardRunConfigError) return error;
+		throw error;
+	}
+	throw new Error("expected BreadboardRunConfigError");
+}
+
+describe("resolveBreadboardRunConfig", () => {
+	test("applies independent CLI, environment, selected-config, and derived precedence", () => {
+		const config = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "local-external", engineUrl: "http://LOCALHOST:8080/v1/" },
+			environment: {
+				BREADBOARD_ENGINE_MODE: "remote",
+				BREADBOARD_API_URL: "https://environment.example/v1",
+				BREADBOARD_STARTUP_TIMEOUT_MS: "4000",
+			},
+			selectedConfig: {
+				engineMode: "remote",
+				baseUrl: "https://selected.example/v1",
+				startupTimeoutMs: 5000,
+				requestTimeoutMs: 9000,
+				workspaceId,
+			},
+		});
+		expect(config.mode).toBe("local-external");
+		expect(config.endpoint).toBe("http://localhost:8080/v1");
+		expect(config.startupTimeoutMs).toBe(4000);
+		expect(config.requestTimeoutMs).toBe(9000);
+		expect(config.workspaceId).toBe(workspaceId);
+		expect(config.sources).toMatchObject({
+			mode: "cli",
+			endpoint: "cli",
+			startupTimeoutMs: "environment",
+			requestTimeoutMs: "selected-config",
+			workspaceId: "selected-config",
+		});
+	});
+
+	test("infers only the three governed defaults and requires explicit local-external endpoint", () => {
+		const localExternal = resolveBreadboardRunConfig({ ...baseInput, cli: { engineUrl: "http://127.0.0.2:9000" } });
+		expect(localExternal.mode).toBe("local-external");
+		const remote = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineUrl: "https://engine.example" },
+			environment: { BREADBOARD_API_TOKEN: "synthetic-secret-value" },
+		});
+		expect(remote.mode).toBe("remote");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "local-external" } })).code).toBe("missing_endpoint");
+	});
+
+	test("requires explicit typed artifact identity for local-owned", () => {
+		const missing = configError(() => resolveBreadboardRunConfig(baseInput));
+		expect(missing.code).toBe("missing_engine_artifact");
+		const config = resolveBreadboardRunConfig({ ...baseInput, selectedConfig: { engineArtifact: artifact } });
+		expect(config.mode).toBe("local-owned");
+		expect(config.endpoint).toBe("http://127.0.0.1:7777");
+		expect(config.engineArtifact).toEqual(artifact);
+		expect(Object.isFrozen(config)).toBe(true);
+		expect(Object.isFrozen(config.engineArtifact?.argv)).toBe(true);
+	});
+
+	test("rejects aliases, URL credentials, conflicts, and wrong field types", () => {
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "external" } })).code).toBe("invalid_mode");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineUrl: "https://user:pass@example.test" }, environment: { BREADBOARD_API_TOKEN: "synthetic-secret-value" } })).code).toBe("invalid_url");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off", engineUrl: "http://127.0.0.1" } })).code).toBe("mode_endpoint_conflict");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "remote", engineUrl: "http://engine.example" }, environment: { BREADBOARD_API_TOKEN: "synthetic-secret-value" } })).code).toBe("mode_endpoint_conflict");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "remote", engineUrl: "https://engine.example" }, environment: { BREADBOARD_API_TOKEN: "too-short" } })).code).toBe("invalid_auth");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "remote", engineUrl: "https://engine.example" }, environment: { BREADBOARD_API_TOKEN: "synthetic secret value" } })).code).toBe("invalid_auth");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off" }, selectedConfig: { requestTimeoutMs: "nope" } })).code).toBe("invalid_timeout");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off" }, selectedConfig: { engineMod: "remote" } as never })).code).toBe("invalid_selected_config");
+	});
+
+	test("binds remote HTTPS authentication and fails unsupported trust inputs closed", () => {
+		const config = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "remote", engineUrl: "https://ENGINE.example:443/api/" },
+			environment: { BREADBOARD_API_TOKEN: "synthetic-secret-value" },
+			selectedConfig: { tls: { kind: "system-trust" } },
+		});
+		expect(config.endpoint).toBe("https://engine.example/api");
+		expect(config.auth?.kind).toBe("process-secret");
+		expect(config.tls).toEqual({ kind: "system-trust" });
+		expect(JSON.stringify({ digest: config.configDigest, sources: config.sources })).not.toContain("synthetic-secret-value");
+		const differentCredential = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "remote", engineUrl: "https://ENGINE.example:443/api/" },
+			environment: { BREADBOARD_API_TOKEN: "different-synthetic-secret" },
+			selectedConfig: { tls: { kind: "system-trust" } },
+		});
+		expect(differentCredential.configDigest).not.toBe(config.configDigest);
+		expect(configError(() => resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "remote", engineUrl: "https://engine.example" },
+			selectedConfig: { auth: { kind: "process-secret", value: "stored-secret" } },
+		})).code).toBe("invalid_auth");
+	});
+
+	test("off resolves without endpoint, auth, TLS, artifact, or owner policy", () => {
+		const config = resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off" } });
+		expect(config).toMatchObject({ mode: "off" });
+		expect(config.endpoint).toBeUndefined();
+		expect(config.auth).toBeUndefined();
+		expect(config.tls).toBeUndefined();
+		expect(config.engineArtifact).toBeUndefined();
+		expect(config.ownerExitPolicy).toBeUndefined();
+	});
+});

@@ -13,6 +13,7 @@ import { flagConsumesValue } from "./cli/flag-tables";
 
 export const commands: CommandEntry[] = [
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
+	{ name: "engine", load: () => import("./commands/engine").then(m => m.default) },
 	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "auth-broker", load: () => import("./commands/auth-broker").then(m => m.default) },
 	{ name: "auth-gateway", load: () => import("./commands/auth-gateway").then(m => m.default) },

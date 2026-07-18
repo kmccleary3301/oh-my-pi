@@ -22,6 +22,13 @@ export default class Index extends Command {
 	};
 
 	static flags = {
+		"engine-mode": Flags.string({
+			description: "BreadBoard engine mode",
+			options: ["local-owned", "local-external", "remote", "off"],
+		}),
+		"engine-url": Flags.string({
+			description: "Exact BreadBoard engine endpoint URL",
+		}),
 		model: Flags.string({
 			description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")',
 		}),
