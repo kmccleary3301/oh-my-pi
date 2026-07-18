@@ -871,6 +871,26 @@ export class LocalAuthorityStore {
 		await this.#atomicWrite(`${key}.starting.json`, `${JSON.stringify(attempted)}\n`);
 		return attempted;
 	}
+	async rollbackOwnerAttempt(endpoint: string, expected: LocalStartClaim): Promise<LocalStartClaim> {
+		const key = endpointKey(endpoint);
+		const claim = await this.#readStartClaim(key);
+		if (
+			JSON.stringify(claim) !== JSON.stringify(expected) ||
+			claim.enginePid === undefined ||
+			claim.engineProcessStartToken === undefined ||
+			claim.ownerAttemptGeneration === undefined ||
+			claim.ownerAttemptGeneration < 2
+		) {
+			throw new LocalAuthorityStoreError("generation_conflict", "start claim owner attempt cannot be rolled back");
+		}
+		const rolledBack = assertStartClaim({
+			...claim,
+			ownerAttemptGeneration: claim.ownerAttemptGeneration - 1,
+		});
+		await this.#atomicWrite(`${key}.starting.json`, `${JSON.stringify(rolledBack)}\n`);
+		return rolledBack;
+	}
+
 
 	async verifyStartClaim(endpoint: string, expected: LocalStartClaim): Promise<void> {
 		const current = await this.#readStartClaim(endpointKey(endpoint));

@@ -384,7 +384,12 @@ describe("LocalAuthorityStore", () => {
 				argvSha256: `sha256:${"d".repeat(64)}`,
 			}, { bootstrapCredential, ownerCredential });
 			bootstrapCredential.fill(0);
-			await store.bindStartClaimProcess(endpoint, prepared.token, enginePid, "darwin:4321:123456");
+			const bound = await store.bindStartClaimProcess(endpoint, prepared.token, enginePid, "darwin:4321:123456");
+			const firstAttempt = await store.markOwnerAttempt(endpoint, bound);
+			const secondAttempt = await store.markOwnerAttempt(endpoint, firstAttempt);
+			const rolledBack = await store.rollbackOwnerAttempt(endpoint, secondAttempt);
+			expect(rolledBack.ownerAttemptGeneration).toBe(1);
+			await expect(store.rollbackOwnerAttempt(endpoint, secondAttempt)).rejects.toMatchObject({ code: "generation_conflict" });
 			const recovered = await store.claimStart(endpoint);
 			expect(recovered.kind).toBe("recoverable");
 			if (recovered.kind !== "recoverable") throw new Error("expected recoverable start");

@@ -193,6 +193,83 @@ esac
 			await rm(hostileBin, { recursive: true, force: true });
 		}
 	});
+	test("disables repository-local Git executors before identity and status probes", async () => {
+		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-local-git-config-"));
+		const root = resolve(parent, "backend");
+		await mkdir(root);
+		const marker = resolve(parent, "fsmonitor-executed");
+		const fsmonitor = resolve(parent, "fsmonitor.sh");
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) {
+				throw new Error(new TextDecoder().decode(result.stderr));
+			}
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await writeFile(resolve(root, "tracked.txt"), "clean\n");
+			git("add", "tracked.txt");
+			git("commit", "-qm", "fixture");
+			await writeFile(fsmonitor, `#!/bin/sh
+touch ${JSON.stringify(marker)}
+printf 'token\\n'
+`);
+			await chmod(fsmonitor, 0o755);
+			git("config", "core.fsmonitor", fsmonitor);
+			let [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).resolves.toBeUndefined();
+			expect(await Bun.file(marker).exists()).toBe(false);
+			await writeFile(resolve(root, "tracked.txt"), "dirty\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow("backend worktree is dirty");
+			expect(await Bun.file(marker).exists()).toBe(false);
+			git("checkout", "-q", "--", "tracked.txt");
+			await rm(marker, { force: true });
+
+			await writeFile(resolve(root, "untracked.txt"), "untracked\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow("backend worktree is dirty");
+			expect(await Bun.file(marker).exists()).toBe(false);
+			await rm(resolve(root, "untracked.txt"));
+
+			await chmod(resolve(root, "tracked.txt"), 0o755);
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow("backend worktree is dirty");
+			expect(await Bun.file(marker).exists()).toBe(false);
+			await chmod(resolve(root, "tracked.txt"), 0o644);
+
+			const submoduleOrigin = resolve(parent, "submodule-origin");
+			await mkdir(submoduleOrigin);
+			const submoduleGit = (...args: string[]) => {
+				const result = Bun.spawnSync(["/usr/bin/git", "-C", submoduleOrigin, ...args], {
+					env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			};
+			submoduleGit("init", "-q");
+			submoduleGit("config", "user.name", "BreadBoard Test");
+			submoduleGit("config", "user.email", "breadboard-test@example.invalid");
+			await writeFile(resolve(submoduleOrigin, "child.txt"), "clean\n");
+			submoduleGit("add", "child.txt");
+			submoduleGit("commit", "-qm", "fixture");
+			git("-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleOrigin, "nested");
+			git("commit", "-qam", "add submodule");
+			[commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await rm(marker, { force: true });
+			await writeFile(resolve(root, "nested/child.txt"), "dirty\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow("backend worktree is dirty");
+			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
 
 	test("rejects a substituted backend root despite hostile Git discovery environment", async () => {
 		const identityProcess = Bun.spawnSync([

@@ -2288,6 +2288,52 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect((await recovered.connect()).kind).toBe("ready");
 		expect({ acquireCalls, renewCalls, spawns: process.spawnCount() }).toEqual({ acquireCalls: 1, renewCalls: 1, spawns: 1 });
 	});
+	test.each([
+		["generation-one bootstrap acquire was never delivered", new LifecycleE4ClientError({ kind: "timeout" }), "endpoint_unreachable"],
+		["generation-one bootstrap acquire was aborted before send", new LifecycleE4ClientError({ kind: "caller-abort" }), "request_aborted"],
+	] as const)("%s falls back only after definitive lower-generation proof", async (_name, initialFailure, firstReason) => {
+		const process = processHarness();
+		const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
+		const ownerExpired = () => new LifecycleE4ClientError({
+			kind: "owner-expired",
+			status: 410,
+			code: "owner_expired",
+			correlation: {},
+			body: "[redacted]",
+		});
+		const requests: Array<{ readonly expected: number; readonly bootstrap: boolean }> = [];
+		let firstAcquire = true;
+		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
+			const current = process.current();
+			return {
+				...boundClient(bindingFor(current.pid, current.launchId), []),
+				renewOwner: async () => { throw ownerExpired(); },
+				acquireOwner: async input => {
+					requests.push({
+						expected: input.expectedOwnerGeneration,
+						bootstrap: "bootstrapCredential" in input,
+					});
+					if (firstAcquire) {
+						firstAcquire = false;
+						throw initialFailure;
+					}
+					if (input.expectedOwnerGeneration === 1) throw ownerExpired();
+					return { result: "acquired", ownerGeneration: 1 } as never;
+				},
+			};
+		} });
+		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		expect((await first.connect()).state.reason).toBe(firstReason);
+		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		expect(await recovered.connect()).toMatchObject({ kind: "ready" });
+		expect(requests).toEqual([
+			{ expected: 0, bootstrap: true },
+			{ expected: 1, bootstrap: false },
+			{ expected: 0, bootstrap: true },
+		]);
+		expect(process.spawnCount()).toBe(1);
+	});
+
 
 	test("response loss then owner expiry advances the durable attempt and recovers generation two without bootstrap replay", async () => {
 		const process = processHarness();
@@ -2363,6 +2409,77 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			hardControl: false,
 		});
 	});
+	test.each(["fallback-acquires", "delayed-prior-wins"] as const)(
+		"generation-two acquire nondelivery recovers safely when %s",
+		async outcome => {
+			const process = processHarness();
+			const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
+			const endpoint = "http://127.0.0.1:7777";
+			const ownerExpired = () => new LifecycleE4ClientError({
+				kind: "owner-expired",
+				status: 410,
+				code: "owner_expired",
+				correlation: {},
+				body: "[redacted]",
+			});
+			const ownerConflict = () => new LifecycleE4ClientError({
+				kind: "owner-conflict",
+				status: 409,
+				code: "owner_generation_conflict",
+				correlation: {},
+				body: "[redacted]",
+			});
+			const acquireRequests: Array<{ readonly expected: number; readonly bootstrap: boolean }> = [];
+			const renewRequests: number[] = [];
+			let acquireCall = 0;
+			let delayedPriorWon = false;
+			const createClient = (): LifecycleE4Client => ({ handshake: async () => {
+				const current = process.current();
+				return {
+					...boundClient(bindingFor(current.pid, current.launchId), []),
+					renewOwner: async input => {
+						renewRequests.push(input.ownerGeneration);
+						if (input.ownerGeneration === 2 && delayedPriorWon) {
+							return { result: "renewed", ownerGeneration: 2 } as never;
+						}
+						throw ownerExpired();
+					},
+					acquireOwner: async input => {
+						acquireCall++;
+						acquireRequests.push({
+							expected: input.expectedOwnerGeneration,
+							bootstrap: "bootstrapCredential" in input,
+						});
+						if (acquireCall <= 2) throw new LifecycleE4ClientError({ kind: "timeout" });
+						if (input.expectedOwnerGeneration === 2) throw ownerExpired();
+						if (input.expectedOwnerGeneration !== 1) throw new Error("unexpected fallback generation");
+						if (outcome === "delayed-prior-wins") {
+							delayedPriorWon = true;
+							throw ownerConflict();
+						}
+						return { result: "acquired", ownerGeneration: 2 } as never;
+					},
+				};
+			} });
+			const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+			expect((await first.connect()).state.reason).toBe("endpoint_unreachable");
+			const second = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+			expect((await second.connect()).state.reason).toBe("endpoint_unreachable");
+			const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+			expect(await recovered.connect()).toMatchObject({ kind: "ready" });
+			expect(acquireRequests).toEqual([
+				{ expected: 0, bootstrap: true },
+				{ expected: 1, bootstrap: false },
+				{ expected: 2, bootstrap: false },
+				{ expected: 1, bootstrap: false },
+			]);
+			expect(renewRequests).toEqual(outcome === "delayed-prior-wins" ? [1, 2, 2] : [1, 2]);
+			expect(process.spawnCount()).toBe(1);
+			expect(process.events).not.toContain("hard-control");
+			expect((await store.readCurrent(endpoint))?.ownerGeneration).toBe(2);
+		},
+	);
+
 
 	test("generation conflict after a lost owner request fails closed without bootstrap replay", async () => {
 		const process = processHarness();

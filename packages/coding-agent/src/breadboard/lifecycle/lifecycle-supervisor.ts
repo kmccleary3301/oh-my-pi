@@ -910,6 +910,10 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	#isOwnerExpired(error: unknown): boolean {
 		return error instanceof LifecycleE4ClientError && error.failure.kind === "owner-expired";
 	}
+	#isOwnerConflict(error: unknown): boolean {
+		return error instanceof LifecycleE4ClientError && error.failure.kind === "owner-conflict";
+	}
+
 
 	#isAmbiguousControlRequest(error: unknown): boolean {
 		if (!(error instanceof LifecycleE4ClientError)) return false;
@@ -951,12 +955,40 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				if (!this.#isOwnerExpired(error)) throw error;
 			}
 			const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.markOwnerAttempt(endpoint, claim));
-			const owner = await bound.acquireOwner({
-				expectedOwnerGeneration: priorAttemptGeneration,
+			try {
+				const owner = await bound.acquireOwner({
+					expectedOwnerGeneration: priorAttemptGeneration,
+					ownerCredential,
+					signal: this.abortController.signal,
+				});
+				return { owner, claim: attemptedClaim };
+			} catch (error) {
+				if (!this.#isOwnerExpired(error)) throw error;
+			}
+			const rolledBackClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.rollbackOwnerAttempt(endpoint, attemptedClaim));
+			try {
+				const owner = priorAttemptGeneration === 1
+					? await bound.acquireOwner({
+						expectedOwnerGeneration: 0,
+						bootstrapCredential: pending.bootstrapCredential,
+						ownerCredential,
+						signal: this.abortController.signal,
+					})
+					: await bound.acquireOwner({
+						expectedOwnerGeneration: priorAttemptGeneration - 1,
+						ownerCredential,
+						signal: this.abortController.signal,
+					});
+				return { owner, claim: rolledBackClaim };
+			} catch (error) {
+				if (!this.#isOwnerConflict(error)) throw error;
+			}
+			const owner = await bound.renewOwner({
+				ownerGeneration: priorAttemptGeneration,
 				ownerCredential,
 				signal: this.abortController.signal,
 			});
-			return { owner, claim: attemptedClaim };
+			return { owner, claim: rolledBackClaim };
 		}
 		const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.markOwnerAttempt(endpoint, claim));
 		const owner = await bound.acquireOwner({

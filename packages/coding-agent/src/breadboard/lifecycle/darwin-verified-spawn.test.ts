@@ -112,6 +112,7 @@ function scenarioNative(expected: DarwinCodeIdentity, events: string[], scenario
 				pid: 42,
 				bootstrapFd: 9,
 				exited: Promise.resolve(null),
+				hasExited: () => false,
 				unref: () => events.push("unref"),
 				waitForExit: async () => {
 					events.push("reap");
@@ -350,6 +351,42 @@ describe("spawnDarwinVerified", () => {
 		expect(events.slice(-3)).toEqual(["eof", "SIGKILL", "reap"]);
 		expect(bootstrap.every(byte => byte === 0)).toBe(true);
 	});
+	test("does not signal a reused PID after the suspended child was reaped during deferred binding", async () => {
+		const executableBytes = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x15) }]);
+		const expected = parseDarwinArm64CodeIdentity(executableBytes);
+		const events: string[] = [];
+		let settled = false;
+		const base = scenarioNative(expected, events);
+		const native = {
+			...base,
+			spawnSuspended: () => ({
+				pid: 42,
+				bootstrapFd: 9,
+				exited: Promise.resolve(null),
+				hasExited: () => settled,
+				unref: () => events.push("unref"),
+				waitForExit: async () => {
+					events.push("reap");
+					return true;
+				},
+			}),
+		} as DarwinVerifiedSpawnNative;
+		const bootstrap = Buffer.alloc(16, 0x5a);
+		await expect(spawnDarwinVerified({
+			...spawnOptions(executableBytes, bootstrap, native, events),
+			bindIdentity: async () => {
+				events.push("bind");
+				await Bun.sleep(20);
+				settled = true;
+				events.push("poll-reaped");
+				throw new Error("bind failed after child exit");
+			},
+		})).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
+		expect(events).not.toContain("SIGKILL");
+		expect(events.slice(-3)).toEqual(["poll-reaped", "eof", "reap"]);
+		expect(bootstrap.every(byte => byte === 0)).toBe(true);
+	});
+
 
 	test("closes, kills, and reaps without resume when the bounded write fails", async () => {
 		const executableBytes = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x16) }]);

@@ -65,12 +65,20 @@ function gitEnvironment(): Record<string, string> {
 		GIT_TERMINAL_PROMPT: "0",
 	};
 }
+const GIT_CONFIG_OVERRIDES = [
+	"-c", "core.fsmonitor=false",
+	"-c", "core.hooksPath=/dev/null",
+	"-c", "core.filemode=true",
+	"-c", "core.ignoreStat=false",
+	"-c", "core.untrackedCache=false",
+] as const;
+
 
 const inspectBackendGit: BackendGitInspection = async (root, assertRootIdentity) => {
 	const executable = await trustedGitExecutable();
 	const environment = gitEnvironment();
 	await assertRootIdentity();
-	const identity = Bun.spawn([executable, "-C", root, "rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"], {
+	const identity = Bun.spawn([executable, ...GIT_CONFIG_OVERRIDES, "-C", root, "rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"], {
 		env: environment,
 		stdout: "pipe",
 		stderr: "pipe",
@@ -84,7 +92,7 @@ const inspectBackendGit: BackendGitInspection = async (root, assertRootIdentity)
 	const [inspectedRoot, commit, tree, ...extra] = identityOutput.trim().split("\n");
 	invariant(extra.length === 0 && inspectedRoot !== undefined && commit !== undefined && tree !== undefined, "backend Git identity is malformed");
 	await assertRootIdentity();
-	const statusProcess = Bun.spawn([executable, "-C", root, "status", "--porcelain=v1", "--untracked-files=all"], {
+	const statusProcess = Bun.spawn([executable, ...GIT_CONFIG_OVERRIDES, "-C", root, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], {
 		env: environment,
 		stdout: "pipe",
 		stderr: "pipe",

@@ -42,6 +42,7 @@ export interface DarwinSuspendedChild {
 	readonly pid: number;
 	readonly bootstrapFd: number;
 	readonly exited: Promise<number | null>;
+	hasExited(): boolean;
 	unref(): void;
 	waitForExit(timeoutMs: number): Promise<boolean>;
 }
@@ -390,11 +391,14 @@ class NativeChild implements DarwinSuspendedChild {
 		this.#poll();
 	}
 
+	hasExited(): boolean {
+		return this.#settled;
+	}
+
 	unref(): void {
 		this.#unreferenced = true;
 		this.#timer?.unref();
 	}
-
 	async waitForExit(timeoutMs: number): Promise<boolean> {
 		if (this.#settled) return true;
 		if (timeoutMs <= 0) return false;
@@ -541,10 +545,12 @@ async function cleanupFailedSpawn(native: DarwinVerifiedSpawnNative, child: Darw
 			// Preserve the attestation failure; the descriptor is still closed by process exit.
 		}
 	}
-	try {
-		native.signal(child.pid, "SIGKILL");
-	} catch {
-		// The direct stopped child is still reaped below.
+	if (!child.hasExited()) {
+		try {
+			native.signal(child.pid, "SIGKILL");
+		} catch {
+			// The direct stopped child is still reaped below.
+		}
 	}
 	if (!(await child.waitForExit(CLEANUP_TIMEOUT_MS))) {
 		throw new DarwinVerifiedSpawnError("failed to reap stopped child after verified spawn failure");
