@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { chmod, constants, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { JSONC } from "bun";
+import {
+	DARWIN_PINNED_DIRECTORY_LIMITS,
+	openPinnedDirectory,
+	type PinnedDirectory,
+} from "../src/breadboard/lifecycle/darwin-pinned-directory";
 
 export interface BreadboardSdkProvenance {
 	readonly schemaVersion: "p30.breadboard-sdk-provenance.v1";
@@ -26,6 +32,13 @@ export type BackendGitInspection = (
 	readonly tree: string;
 	readonly status: string;
 }>;
+
+export interface VerifiedBackendSnapshot {
+	readonly root: string;
+	readonly commit: string;
+	readonly tree: string;
+	close(): Promise<void>;
+}
 
 function invariant(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(`BreadBoard SDK provenance gate failed: ${message}`);
@@ -64,6 +77,7 @@ function gitEnvironment(): Record<string, string> {
 		GIT_CONFIG_COUNT: "0",
 		GIT_TERMINAL_PROMPT: "0",
 		GIT_NO_REPLACE_OBJECTS: "1",
+		GIT_NO_LAZY_FETCH: "1",
 	};
 }
 
@@ -202,33 +216,113 @@ function parseBatchBlobs(bytes: Uint8Array, objectIds: readonly string[]): Reado
 	return blobs;
 }
 
-async function listWorktreeLeaves(root: string): Promise<readonly string[]> {
-	const leaves: string[] = [];
-	let visited = 0;
-	const walk = async (directory: string, prefix: string): Promise<void> => {
-		const names = await readdir(directory);
-		names.sort();
-		for (const name of names) {
-			if (prefix === "" && name === ".git") continue;
-			const path = prefix === "" ? name : `${prefix}${sep}${name}`;
-			invariant(Buffer.byteLength(path) <= MAX_TREE_PATH_BYTES, "backend worktree path is too long");
-			visited++;
-			invariant(visited <= MAX_TREE_ENTRIES * 2, "backend worktree has too many entries");
-			const metadata = await lstat(join(root, path));
-			if (metadata.isDirectory() && !metadata.isSymbolicLink()) await walk(join(root, path), path);
-			else leaves.push(path);
-		}
-	};
-	await walk(root, "");
-	return leaves;
+interface VerifiedHeadTree {
+	readonly entries: readonly HeadTreeEntry[];
+	readonly blobs: ReadonlyMap<string, Uint8Array>;
 }
 
+async function writeSnapshotFile(path: string, bytes: Uint8Array, mode: number): Promise<void> {
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const descriptor = await open(
+		path,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+		0o600,
+	);
+	try {
+		await descriptor.writeFile(bytes);
+		await descriptor.sync();
+		await descriptor.chmod(mode);
+	} finally {
+		await descriptor.close();
+	}
+}
 
-async function assertHeadTreeMatchesWorktree(
+async function materializeIgnoreRules(
 	executable: string,
+	verified: VerifiedHeadTree,
+): Promise<{ readonly root: string; close(): Promise<void> }> {
+	const snapshotRoot = await mkdtemp(join(tmpdir(), "breadboard-ignore-snapshot-"));
+	let closed = false;
+	try {
+		for (const entry of verified.entries) {
+			if (entry.mode === "120000" || (entry.path !== ".gitignore" && !entry.path.endsWith(`${sep}.gitignore`))) continue;
+			const expectedBlob = verified.blobs.get(entry.objectId);
+			invariant(expectedBlob !== undefined, "backend tracked blob is missing");
+			await writeSnapshotFile(join(snapshotRoot, entry.path), expectedBlob, 0o400);
+		}
+		await runGit(executable, snapshotRoot, ["init", "-q"]);
+		return {
+			root: snapshotRoot,
+			close: async () => {
+				if (closed) return;
+				closed = true;
+				await rm(snapshotRoot, { recursive: true, force: true });
+			},
+		};
+	} catch (error) {
+		await rm(snapshotRoot, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+async function materializeExecutionSnapshot(
+	verified: VerifiedHeadTree,
+	commit: string,
+	tree: string,
+): Promise<VerifiedBackendSnapshot> {
+	const snapshotRoot = await mkdtemp(join(tmpdir(), "breadboard-backend-snapshot-"));
+	let closed = false;
+	try {
+		for (const entry of verified.entries) {
+			invariant(entry.mode !== "120000", "execution snapshot cannot contain tracked symlinks");
+			const expectedBlob = verified.blobs.get(entry.objectId);
+			invariant(expectedBlob !== undefined, "backend tracked blob is missing");
+			await writeSnapshotFile(
+				join(snapshotRoot, entry.path),
+				expectedBlob,
+				entry.mode === "100755" ? 0o500 : 0o400,
+			);
+		}
+		return {
+			root: snapshotRoot,
+			commit,
+			tree,
+			close: async () => {
+				if (closed) return;
+				closed = true;
+				await rm(snapshotRoot, { recursive: true, force: true });
+			},
+		};
+	} catch (error) {
+		await rm(snapshotRoot, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+async function inspectPinnedBackendGit(
 	root: string,
-	assertRootIdentity: () => Promise<void>,
-): Promise<void> {
+	pinned: PinnedDirectory,
+): Promise<{
+	readonly identity: Awaited<ReturnType<BackendGitInspection>>;
+	readonly verified: VerifiedHeadTree;
+	readonly executable: string;
+}> {
+	const executable = await trustedGitExecutable();
+	const promisorConfig = await runGit(
+		executable,
+		root,
+		["config", "--local", "--get-regexp", "^(extensions\\.partialclone|remote\\..*\\.promisor)$"],
+		undefined,
+		MAX_GIT_OUTPUT_BYTES,
+		[0, 1],
+	);
+	invariant(promisorConfig.byteLength === 0, "backend repository is partial or promisor");
+	const identityOutput = new TextDecoder("utf-8", { fatal: true }).decode(
+		await runGit(executable, root, ["rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"]),
+	);
+	const [inspectedRoot, commit, tree, ...extra] = identityOutput.trim().split("\n");
+	invariant(extra.length === 0 && inspectedRoot !== undefined && commit !== undefined && tree !== undefined, "backend Git identity is malformed");
+	invariant(await realpath(inspectedRoot) === await realpath(root), "backend Git root does not match");
 	const treeBytes = await runGit(executable, root, ["ls-tree", "-rz", "--full-tree", "-r", "HEAD"]);
 	const entries = parseHeadTree(treeBytes);
 	const objectIds = [...new Set(entries.map(entry => entry.objectId))];
@@ -237,112 +331,151 @@ async function assertHeadTreeMatchesWorktree(
 		? new Uint8Array()
 		: await runGit(executable, root, ["cat-file", "--batch"], objectInput, MAX_TREE_BYTES + MAX_GIT_OUTPUT_BYTES);
 	const blobs = parseBatchBlobs(batchBytes, objectIds);
-	await assertRootIdentity();
 	for (const entry of entries) {
-		const absolutePath = join(root, entry.path);
-		const metadata = await lstat(absolutePath).catch(() => undefined);
-		invariant(metadata !== undefined, "backend tracked path is missing");
 		const expectedBlob = blobs.get(entry.objectId);
 		invariant(expectedBlob !== undefined, "backend tracked blob is missing");
 		if (entry.mode === "120000") {
-			invariant(metadata.isSymbolicLink(), "backend tracked symlink type does not match");
-			const target = new TextEncoder().encode(await readlink(absolutePath));
-			invariant(Buffer.from(target).equals(expectedBlob), "backend tracked symlink target does not match");
+			const target = await pinned.readlink(entry.path, MAX_TREE_PATH_BYTES);
+			invariant(target.equals(expectedBlob), "backend tracked symlink target does not match");
 			continue;
 		}
-		invariant(metadata.isFile() && !metadata.isSymbolicLink(), "backend tracked file type does not match");
-		invariant(((metadata.mode & 0o111) !== 0) === (entry.mode === "100755"), "backend worktree is dirty");
-		const bytes = await readFile(absolutePath);
-		invariant(Buffer.from(bytes).equals(expectedBlob), "backend worktree is dirty");
-	}
-	await assertRootIdentity();
-	const trackedPaths = new Set(entries.map(entry => entry.path));
-	const untracked = (await listWorktreeLeaves(root)).filter(path => !trackedPaths.has(path));
-	if (untracked.length > 0) {
-		const input = new TextEncoder().encode(`${untracked.join("\0")}\0`);
-		const ignoredBytes = await runGit(
-			executable,
-			root,
-			["check-ignore", "--no-index", "-v", "-z", "--stdin"],
-			input,
-			MAX_GIT_OUTPUT_BYTES,
-			[0, 1],
-		);
-		const decoder = new TextDecoder("utf-8", { fatal: true });
-		const records = splitNullTerminated(ignoredBytes).map(bytes => decoder.decode(bytes));
-		invariant(records.length % 4 === 0, "backend Git ignore result is malformed");
-		const ignoredByCommittedRules = new Set<string>();
-		for (let index = 0; index < records.length; index += 4) {
-			const source = records[index] as string;
-			const line = records[index + 1] as string;
-			const pattern = records[index + 2] as string;
-			const path = records[index + 3] as string;
-			const sourcePath = relative(root, isAbsolute(source) ? source : resolve(root, source));
-			invariant(
-				!sourcePath.startsWith(`..${sep}`) &&
-					(sourcePath === ".gitignore" || sourcePath.endsWith(`${sep}.gitignore`)) &&
-					trackedPaths.has(sourcePath) &&
-					/^[1-9][0-9]*$/.test(line) &&
-					pattern !== "",
-				"backend worktree is dirty",
-			);
-			ignoredByCommittedRules.add(path);
+		const tracked = await pinned.openFile(entry.path);
+		try {
+			const metadata = await tracked.stat();
+			invariant(metadata.type === "regular", "backend tracked file type does not match");
+			invariant(((metadata.mode & 0o111) !== 0) === (entry.mode === "100755"), "backend worktree is dirty");
+			invariant(metadata.size <= BigInt(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes), "backend tracked file exceeds the verification limit");
+			const bytes = await tracked.read(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes);
+			invariant(bytes.equals(expectedBlob), "backend worktree is dirty");
+		} finally {
+			await tracked.close();
 		}
-		invariant(untracked.every(path => ignoredByCommittedRules.has(path)), "backend worktree is dirty");
 	}
-	await assertRootIdentity();
+	const trackedPaths = new Set(entries.map(entry => entry.path));
+	const leaves = await pinned.listLeaves({
+		maxEntries: Math.min(MAX_TREE_ENTRIES * 2, DARWIN_PINNED_DIRECTORY_LIMITS.maxEntries),
+		maxPathBytes: Math.min(MAX_TREE_PATH_BYTES, DARWIN_PINNED_DIRECTORY_LIMITS.maxRelativePathBytes),
+		maxTotalPathBytes: DARWIN_PINNED_DIRECTORY_LIMITS.maxTotalPathBytes,
+	});
+	const untracked = leaves.filter(path => path !== ".git" && !path.startsWith(`.git${sep}`) && !trackedPaths.has(path));
+	const verified = { entries, blobs };
+	const classificationSnapshot = await materializeIgnoreRules(executable, verified);
+	try {
+		if (untracked.length > 0) {
+			const input = new TextEncoder().encode(`${untracked.join("\0")}\0`);
+			const ignoredBytes = await runGit(
+				executable,
+				classificationSnapshot.root,
+				["check-ignore", "--no-index", "-v", "-z", "--stdin"],
+				input,
+				MAX_GIT_OUTPUT_BYTES,
+				[0, 1],
+			);
+			const decoder = new TextDecoder("utf-8", { fatal: true });
+			const records = splitNullTerminated(ignoredBytes).map(bytes => decoder.decode(bytes));
+			invariant(records.length % 4 === 0, "backend Git ignore result is malformed");
+			const ignoredByCommittedRules = new Set<string>();
+			for (let index = 0; index < records.length; index += 4) {
+				const source = records[index] as string;
+				const line = records[index + 1] as string;
+				const pattern = records[index + 2] as string;
+				const path = records[index + 3] as string;
+				const sourcePath = relative(classificationSnapshot.root, isAbsolute(source) ? source : resolve(classificationSnapshot.root, source));
+				invariant(
+					!sourcePath.startsWith(`..${sep}`) &&
+						(sourcePath === ".gitignore" || sourcePath.endsWith(`${sep}.gitignore`)) &&
+						trackedPaths.has(sourcePath) &&
+						/^[1-9][0-9]*$/.test(line) &&
+						pattern !== "",
+					"backend worktree is dirty",
+				);
+				ignoredByCommittedRules.add(path);
+			}
+			invariant(untracked.every(path => ignoredByCommittedRules.has(path)), "backend worktree is dirty");
+		}
+	} finally {
+		await classificationSnapshot.close();
+	}
+	return {
+		identity: { root: inspectedRoot, commit, tree, status: "" },
+		verified,
+		executable,
+	};
 }
 
-
-const inspectBackendGit: BackendGitInspection = async (root, assertRootIdentity) => {
-	const executable = await trustedGitExecutable();
-	await assertRootIdentity();
-	const identityOutput = new TextDecoder("utf-8", { fatal: true }).decode(
-		await runGit(executable, root, ["rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"]),
-	);
-	const [inspectedRoot, commit, tree, ...extra] = identityOutput.trim().split("\n");
-	invariant(extra.length === 0 && inspectedRoot !== undefined && commit !== undefined && tree !== undefined, "backend Git identity is malformed");
-	invariant(await realpath(inspectedRoot) === await realpath(root), "backend Git root does not match");
-	await assertHeadTreeMatchesWorktree(executable, root, assertRootIdentity);
-	return { root: inspectedRoot, commit, tree, status: "" };
-};
-
-export async function verifyBackendIdentity(
+async function verifyCustomInspection(
 	manifest: Pick<BreadboardSdkProvenance, "backendCommit" | "backendTree">,
-	backendRoot: string | undefined,
-	inspect: BackendGitInspection = inspectBackendGit,
+	root: string,
+	inspect: BackendGitInspection,
 ): Promise<void> {
-	invariant(backendRoot !== undefined && backendRoot !== "", "backend root is required");
-	const root = resolve(backendRoot);
 	const metadata = await lstat(root);
 	invariant(metadata.isDirectory() && !metadata.isSymbolicLink(), "backend root is not a real directory");
 	const canonicalRoot = await realpath(root);
-	const pinned = {
-		dev: metadata.dev,
-		ino: metadata.ino,
-		canonicalRoot,
-	};
 	const assertRootIdentity = async (): Promise<void> => {
 		const current = await lstat(root).catch(() => undefined);
 		invariant(
 			current !== undefined &&
 				current.isDirectory() &&
 				!current.isSymbolicLink() &&
-				current.dev === pinned.dev &&
-				current.ino === pinned.ino,
+				current.dev === metadata.dev &&
+				current.ino === metadata.ino,
 			"backend root identity changed",
 		);
-		const currentCanonicalRoot = await realpath(root).catch(() => undefined);
-		invariant(currentCanonicalRoot === pinned.canonicalRoot, "backend root identity changed");
 	};
 	await assertRootIdentity();
 	const identity = await inspect(root, assertRootIdentity);
 	await assertRootIdentity();
 	const inspectedRoot = await realpath(identity.root);
+	await assertRootIdentity();
 	invariant(inspectedRoot === canonicalRoot, "backend Git root does not match");
 	invariant(identity.commit === manifest.backendCommit, "backend commit does not match");
 	invariant(identity.tree === manifest.backendTree, "backend tree does not match");
 	invariant(identity.status === "", "backend worktree is dirty");
+}
+
+async function openVerifiedBackend(
+	manifest: Pick<BreadboardSdkProvenance, "backendCommit" | "backendTree">,
+	backendRoot: string | undefined,
+): Promise<VerifiedBackendSnapshot> {
+	invariant(backendRoot !== undefined && backendRoot !== "", "backend root is required");
+	const root = resolve(backendRoot);
+	const pinned = await openPinnedDirectory(root);
+	try {
+		const { identity, verified } = await inspectPinnedBackendGit(root, pinned);
+		invariant(identity.commit === manifest.backendCommit, "backend commit does not match");
+		invariant(identity.tree === manifest.backendTree, "backend tree does not match");
+		return await materializeExecutionSnapshot(verified, identity.commit, identity.tree);
+	} finally {
+		await pinned.close();
+	}
+}
+
+export async function openVerifiedBackendSnapshot(
+	manifest: Pick<BreadboardSdkProvenance, "backendCommit" | "backendTree">,
+	backendRoot: string | undefined,
+): Promise<VerifiedBackendSnapshot> {
+	return await openVerifiedBackend(manifest, backendRoot);
+}
+
+export async function verifyBackendIdentity(
+	manifest: Pick<BreadboardSdkProvenance, "backendCommit" | "backendTree">,
+	backendRoot: string | undefined,
+	inspect?: BackendGitInspection,
+): Promise<void> {
+	invariant(backendRoot !== undefined && backendRoot !== "", "backend root is required");
+	const root = resolve(backendRoot);
+	if (inspect) {
+		await verifyCustomInspection(manifest, root, inspect);
+		return;
+	}
+	const pinned = await openPinnedDirectory(root);
+	try {
+		const { identity } = await inspectPinnedBackendGit(root, pinned);
+		invariant(identity.commit === manifest.backendCommit, "backend commit does not match");
+		invariant(identity.tree === manifest.backendTree, "backend tree does not match");
+	} finally {
+		await pinned.close();
+	}
 }
 export function verifyPinnedReferences(
 	manifest: BreadboardSdkProvenance,
@@ -398,7 +531,7 @@ async function installedFiles(root: string, prefix = ""): Promise<string[]> {
 export async function verifyBreadboardSdkProvenance(
 	packageRoot = resolve(import.meta.dir, ".."),
 	backendRoot?: string,
-	inspect: BackendGitInspection = inspectBackendGit,
+	inspect?: BackendGitInspection,
 ): Promise<BreadboardSdkProvenance> {
 	const manifestPath = join(packageRoot, "breadboard-sdk-provenance.json");
 	const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as BreadboardSdkProvenance;

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { type AddressInfo, createServer } from "node:net";
@@ -7,7 +7,8 @@ import { resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createLifecycleE4Client, LifecycleE4ClientError, type BoundLifecycleE4Client } from "@breadboard/sdk";
-import { type BreadboardSdkProvenance, verifyBackendIdentity } from "../scripts/verify-breadboard-sdk-provenance";
+import { type BreadboardSdkProvenance, openVerifiedBackendSnapshot } from "../scripts/verify-breadboard-sdk-provenance";
+import { retryAmbiguousReplay } from "./helpers/retry-ambiguous-replay";
 
 const packageRoot = resolve(import.meta.dir, "..");
 const provenance = JSON.parse(await readFile(resolve(packageRoot, "breadboard-sdk-provenance.json"), "utf8")) as BreadboardSdkProvenance;
@@ -22,6 +23,65 @@ const expectedSessionContract = {
 const authorityId = (): string => randomBytes(32).toString("base64url");
 const clientId = (label: string): string => `p30-real-${label}-${authorityId()}`;
 const workspaceId = (byte: string): string => `workspace:v1:sha256:${byte.repeat(64)}`;
+interface SafeFetchFailure {
+	readonly name: string | null;
+	readonly code: string | null;
+	readonly causeName: string | null;
+	readonly causeCode: string | null;
+	readonly messageClass: "aborted" | "connection_closed" | "connection_refused" | "connection_reset" | "fetch_failed" | "timeout" | "transport_other";
+}
+
+interface IntegrationDiagnosticState {
+	phase: string;
+	fetchFailure: SafeFetchFailure | null;
+}
+
+function safeErrorAtom(value: unknown): string | null {
+	return typeof value === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : null;
+}
+
+function classifyFetchFailure(error: unknown): SafeFetchFailure {
+	const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
+	const cause = typeof record.cause === "object" && record.cause !== null ? record.cause as Record<string, unknown> : {};
+	const message = [record.message, cause.message].filter(value => typeof value === "string").join(" ").toLowerCase();
+	const messageClass: SafeFetchFailure["messageClass"] =
+		message.includes("abort") ? "aborted"
+			: message.includes("timed out") || message.includes("timeout") ? "timeout"
+				: message.includes("refused") ? "connection_refused"
+					: message.includes("reset") ? "connection_reset"
+						: message.includes("closed") || message.includes("socket") ? "connection_closed"
+							: message.includes("fetch failed") ? "fetch_failed"
+								: "transport_other";
+	return {
+		name: safeErrorAtom(record.name),
+		code: safeErrorAtom(record.code),
+		causeName: safeErrorAtom(cause.name),
+		causeCode: safeErrorAtom(cause.code),
+		messageClass,
+	};
+}
+
+function diagnosticFetchFor(state: IntegrationDiagnosticState): typeof fetch {
+	return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+		const requestUrl = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
+		const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+		state.phase = `${method.toUpperCase()} ${new URL(requestUrl).pathname}`;
+		state.fetchFailure = null;
+		try {
+			return await fetch(input, init);
+		} catch (error) {
+			state.fetchFailure = classifyFetchFailure(error);
+			throw error;
+		}
+	}) as typeof fetch;
+}
+
+function safeThrownError(error: unknown): { readonly name: string | null; readonly lifecycleKind: string | null } {
+	const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
+	const failure = typeof record.failure === "object" && record.failure !== null ? record.failure as Record<string, unknown> : {};
+	return { name: safeErrorAtom(record.name), lifecycleKind: safeErrorAtom(failure.kind) };
+}
+
 
 async function unusedPort(): Promise<number> {
 	const server = createServer();
@@ -36,7 +96,7 @@ async function unusedPort(): Promise<number> {
 async function waitForBackend(baseUrl: string, child: ChildProcess, stderr: () => string): Promise<void> {
 	// This integration test observes a real ASGI process; fake timers cannot drive its startup.
 	for (let attempt = 0; attempt < 400; attempt += 1) {
-		if (child.exitCode !== null) throw new Error(`backend exited before readiness: ${stderr()}`);
+		if (child.exitCode !== null) throw new Error("backend exited before readiness");
 		try {
 			const response = await fetch(`${baseUrl}/v1/engine/identity`);
 			if (response.ok) return;
@@ -46,10 +106,10 @@ async function waitForBackend(baseUrl: string, child: ChildProcess, stderr: () =
 	throw new Error(`backend readiness timed out: ${stderr()}`);
 }
 
-async function boundDroppingOneResponse(baseUrl: string, pathname: string): Promise<BoundLifecycleE4Client> {
+async function boundDroppingOneResponse(baseUrl: string, pathname: string, baseFetch: typeof fetch): Promise<BoundLifecycleE4Client> {
 	let drop = true;
 	const droppingFetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-		const response = await fetch(input, init);
+		const response = await baseFetch(input, init);
 		if (drop && new URL(response.url).pathname === pathname) {
 			drop = false;
 			await response.arrayBuffer();
@@ -97,33 +157,35 @@ async function waitForRegistrationExpiry(
 	return { elapsedMs: Date.now() - startedAt, ownerExpiryMarginSeconds };
 }
 test("real backend rolls back an expired cross-process drain exactly once and replays control outcomes", async () => {
-	await verifyBackendIdentity(provenance, backendRoot);
+	const verifiedBackend = await openVerifiedBackendSnapshot(provenance, backendRoot);
 	const port = await unusedPort();
 	const baseUrl = `http://127.0.0.1:${port}`;
 	const bootstrapCredential = Buffer.from(authorityId(), "ascii");
 	const ownerCredential = authorityId();
 	const launchId = authorityId();
 	let stderrText = "";
-	const backend = spawn(backendPython!, ["-m", "agentic_coder_prototype.api.cli_bridge.server"], {
-		cwd: backendRoot!,
-		env: {
-			PATH: "/usr/bin:/bin",
-			PYTHONPATH: backendRoot!,
-			PYTHONUNBUFFERED: "1",
-			BREADBOARD_CLI_HOST: "127.0.0.1",
-			BREADBOARD_CLI_PORT: String(port),
-			BREADBOARD_LIFECYCLE_BOOTSTRAP_FD: "3",
-			BREADBOARD_ENGINE_LAUNCH_ID: launchId,
-		},
-		stdio: ["ignore", "ignore", "pipe", "pipe"],
-	});
-	backend.stderr?.on("data", chunk => { stderrText += String(chunk); });
-	const bootstrapPipe = backend.stdio[3] as Writable;
-	bootstrapPipe.end(bootstrapCredential);
-
+	let backend: ChildProcess | undefined;
+	const diagnosticState: IntegrationDiagnosticState = { phase: "backend-startup", fetchFailure: null };
+	const diagnosticFetch = diagnosticFetchFor(diagnosticState);
 	try {
+		backend = spawn(backendPython!, ["-m", "agentic_coder_prototype.api.cli_bridge.server"], {
+			cwd: verifiedBackend.root,
+			env: {
+				PATH: "/usr/bin:/bin",
+				PYTHONPATH: verifiedBackend.root,
+				PYTHONUNBUFFERED: "1",
+				BREADBOARD_CLI_HOST: "127.0.0.1",
+				BREADBOARD_CLI_PORT: String(port),
+				BREADBOARD_LIFECYCLE_BOOTSTRAP_FD: "3",
+				BREADBOARD_ENGINE_LAUNCH_ID: launchId,
+			},
+			stdio: ["ignore", "ignore", "pipe", "pipe"],
+		});
+		backend.stderr?.on("data", chunk => { stderrText += String(chunk); });
+		const bootstrapPipe = backend.stdio[3] as Writable;
+		bootstrapPipe.end(bootstrapCredential);
 		await waitForBackend(baseUrl, backend, () => stderrText);
-		const bound = await createLifecycleE4Client({ baseUrl, expectedSessionContract }).handshake();
+		const bound = await createLifecycleE4Client({ baseUrl, expectedSessionContract, fetch: diagnosticFetch }).handshake();
 		const owner = await bound.acquireOwner({
 			expectedOwnerGeneration: 0,
 			bootstrapCredential,
@@ -197,26 +259,26 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			registrationCredential: replacementCredential,
 			expectedAdmissionEpoch: replacement.admissionEpoch,
 		};
-		const lostBegin = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain");
+		const lostBegin = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain", diagnosticFetch);
 		await expect(lostBegin.beginControlDrain(lostBeginInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredBegin = await lostBegin.beginControlDrain(lostBeginInput);
+		const recoveredBegin = await retryAmbiguousReplay(() => lostBegin.beginControlDrain(lostBeginInput));
 		expect(recoveredBegin.result).toBe("draining");
 
-		const lostRejection = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/graceful-result");
+		const lostRejection = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/graceful-result", diagnosticFetch);
 		const rejectionInput = { ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: recoveredBegin.drainGeneration, outcome: "definitive_rejection" as const };
 		await expect(lostRejection.recordGracefulControl(rejectionInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
 		const rejectionExpiry = await waitForRegistrationExpiry(bound, owner.ownerGeneration, ownerCredential, replacementRetry.expiresAtUnix);
 		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
-		const recoveredRejection = await lostRejection.recordGracefulControl(rejectionInput);
+		const recoveredRejection = await retryAmbiguousReplay(() => lostRejection.recordGracefulControl(rejectionInput));
 		expect(recoveredRejection.result).toBe("rollback_permitted");
-		const rejectionRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback");
+		const rejectionRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback", diagnosticFetch);
 		const rejectionRollbackInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
 			drainGeneration: recoveredBegin.drainGeneration,
 		};
 		await expect(rejectionRollback.rollbackDrain(rejectionRollbackInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		expect((await rejectionRollback.rollbackDrain(rejectionRollbackInput)).result).toBe("rolled_back");
+		expect((await retryAmbiguousReplay(() => rejectionRollback.rollbackDrain(rejectionRollbackInput))).result).toBe("rolled_back");
 		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
 
 		const abandonedCredential = authorityId();
@@ -273,10 +335,10 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			if (Date.now() > authorizationExpiryDeadline) throw new Error("hard-signal authorization expiry deadline exceeded");
 			await Bun.sleep(Math.min(100, Math.max(1, authorizationExpiresAt - Date.now() + 1)));
 		}
-		const lostAbandoned = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/outcome");
+		const lostAbandoned = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/outcome", diagnosticFetch);
 		const abandonedInput = { ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: pendingBegin.drainGeneration, authorizationId: authorization.authorizationId, outcome: "abandoned" as const };
 		await expect(lostAbandoned.recordHardSignalOutcome(abandonedInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredAbandoned = await lostAbandoned.recordHardSignalOutcome(abandonedInput);
+		const recoveredAbandoned = await retryAmbiguousReplay(() => lostAbandoned.recordHardSignalOutcome(abandonedInput));
 		expect(recoveredAbandoned.result).toBe("rolled_back");
 		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
 
@@ -305,7 +367,7 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			outcome: "timeout",
 		});
 		expect(expiredPreparePending.result).toBe("hard_signal_decision_pending");
-		const lostPrepare = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/prepare");
+		const lostPrepare = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/prepare", diagnosticFetch);
 		const expiredPrepareInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
@@ -320,17 +382,17 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
 			await Bun.sleep(Math.min(5_000, Math.max(1, expiredPrepareDeadline - Date.now() + 1)));
 		}
-		await expect(lostPrepare.prepareHardSignal(expiredPrepareInput)).rejects.toMatchObject({
+		await expect(retryAmbiguousReplay(() => lostPrepare.prepareHardSignal(expiredPrepareInput))).rejects.toMatchObject({
 			failure: { kind: "hard-signal-authorization-expired" },
 		});
-		const lostExpiredRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback");
+		const lostExpiredRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback", diagnosticFetch);
 		const expiredRollbackInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
 			drainGeneration: expiredPrepareBegin.drainGeneration,
 		};
 		await expect(lostExpiredRollback.rollbackDrain(expiredRollbackInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredExpiredRollback = await lostExpiredRollback.rollbackDrain(expiredRollbackInput);
+		const recoveredExpiredRollback = await retryAmbiguousReplay(() => lostExpiredRollback.rollbackDrain(expiredRollbackInput));
 		expect(recoveredExpiredRollback.result).toBe("rolled_back");
 		const expiredPrepareRecoveryMs = Date.now() - expiredPrepareStartedAt;
 		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
@@ -361,10 +423,10 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 		});
 		expect(rollbackPermitted.result).toBe("rollback_permitted");
 		const rollbackExpiry = await waitForRegistrationExpiry(bound, owner.ownerGeneration, ownerCredential, rollbackRegistration.expiresAtUnix);
-		const lostRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback");
+		const lostRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback", diagnosticFetch);
 		const rollbackInput = { ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: rollbackBegin.drainGeneration };
 		await expect(lostRollback.rollbackDrain(rollbackInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredRollback = await lostRollback.rollbackDrain(rollbackInput);
+		const recoveredRollback = await retryAmbiguousReplay(() => lostRollback.rollbackDrain(rollbackInput));
 		expect(recoveredRollback.result).toBe("rolled_back");
 		const expiryWaitsMs = {
 			requester: requesterExpiry.elapsedMs,
@@ -455,9 +517,9 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			pid: bound.binding.process.pid,
 			osProcessStartToken: bound.binding.process.osProcessStartToken,
 		};
-		const lostCommittedPrepare = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/prepare");
+		const lostCommittedPrepare = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/prepare", diagnosticFetch);
 		await expect(lostCommittedPrepare.prepareHardSignal(committedPrepareInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredPreparation = await lostCommittedPrepare.prepareHardSignal(committedPrepareInput);
+		const recoveredPreparation = await retryAmbiguousReplay(() => lostCommittedPrepare.prepareHardSignal(committedPrepareInput));
 		expect(recoveredPreparation).toMatchObject({
 			result: "prepared",
 			signalPermitted: false,
@@ -479,9 +541,9 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			...committedInput,
 			authorizationId: "unsafe",
 		})).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const lostCommit = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/commit");
+		const lostCommit = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/commit", diagnosticFetch);
 		await expect(lostCommit.commitHardSignal(committedInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredPermit = await lostCommit.commitHardSignal(committedInput);
+		const recoveredPermit = await retryAmbiguousReplay(() => lostCommit.commitHardSignal(committedInput));
 		expect(recoveredPermit).toMatchObject({
 			result: "signal_permitted",
 			signalPermitted: true,
@@ -498,15 +560,36 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			},
 			backendRuntime: {
 				python: backendPython,
-				sourceRoot: backendRoot,
-				commit: provenance.backendCommit,
-				tree: provenance.backendTree,
+				sourceRoot: "private-verified-snapshot",
+				commit: verifiedBackend.commit,
+				tree: verifiedBackend.tree,
 			},
 		})}\n`);
+	} catch (error) {
+		const stderrBytes = Buffer.from(stderrText, "utf8");
+		process.stderr.write(`[bb89n34-diagnostic]${JSON.stringify({
+			schemaVersion: "bb89n34.v7.integration-diagnostic.v1",
+			phase: diagnosticState.phase,
+			backend: backend === undefined ? null : {
+				exitCode: backend.exitCode,
+				signalCode: backend.signalCode,
+				killed: backend.killed,
+			},
+			stderr: {
+				byteCount: stderrBytes.byteLength,
+				sha256: createHash("sha256").update(stderrBytes).digest("hex"),
+			},
+			fetchFailure: diagnosticState.fetchFailure,
+			thrown: safeThrownError(error),
+		})}\n`);
+		throw error;
 	} finally {
 		bootstrapCredential.fill(0);
-		backend.kill("SIGTERM");
-		await Promise.race([once(backend, "exit"), Bun.sleep(2_000)]);
-		if (backend.exitCode === null) backend.kill("SIGKILL");
+		if (backend) {
+			backend.kill("SIGTERM");
+			await Promise.race([once(backend, "exit"), Bun.sleep(2_000)]);
+			if (backend.exitCode === null) backend.kill("SIGKILL");
+		}
+		await verifiedBackend.close();
 	}
 }, 240_000);

@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
 	type BreadboardSdkProvenance,
 	verifyBackendIdentity,
+	openVerifiedBackendSnapshot,
 	verifyBreadboardSdkProvenance,
 	verifyPinnedReferences,
 	type BackendGitInspection,
@@ -513,6 +515,186 @@ for (;;) {
 			await symlink("other-target", resolve(root, "tracked-link"));
 			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow(
 				"backend tracked symlink target does not match",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	test("does not lazy-fetch a missing promisor blob through repository SSH configuration", async () => {
+		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-promisor-"));
+		const origin = resolve(parent, "origin");
+		const root = resolve(parent, "partial");
+		const marker = resolve(parent, "ssh-command-executed");
+		const sshCommand = resolve(parent, "ssh-command.sh");
+		await mkdir(origin);
+		const git = (cwd: string, ...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", cwd, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git(origin, "init", "-q");
+			git(origin, "config", "user.name", "BreadBoard Test");
+			git(origin, "config", "user.email", "breadboard-test@example.invalid");
+			git(origin, "config", "uploadpack.allowFilter", "true");
+			await writeFile(resolve(origin, "tracked.txt"), "promised bytes\n");
+			git(origin, "add", "tracked.txt");
+			git(origin, "commit", "-qm", "fixture");
+			const clone = Bun.spawnSync([
+				"/usr/bin/git",
+				"-c",
+				"protocol.file.allow=always",
+				"clone",
+				"-q",
+				"--filter=blob:none",
+				"--no-checkout",
+				`file://${origin}`,
+				root,
+			], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (clone.exitCode !== 0) throw new Error(new TextDecoder().decode(clone.stderr));
+			const [commit, tree] = git(root, "rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await writeFile(resolve(root, "tracked.txt"), "promised bytes\n");
+			await writeFile(sshCommand, `#!/bin/sh
+touch ${JSON.stringify(marker)}
+exit 1
+`);
+			await chmod(sshCommand, 0o755);
+			git(root, "config", "core.sshCommand", sshCommand);
+			git(root, "remote", "set-url", "origin", "ssh://example.invalid/promisor");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow();
+			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a root pathname swapped to a clean clone after the last inode check", async () => {
+		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-root-swap-"));
+		const root = resolve(parent, "backend");
+		const clean = resolve(parent, "clean");
+		const held = resolve(parent, "held");
+		await mkdir(root);
+		const git = (cwd: string, ...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", cwd, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git(root, "init", "-q");
+			git(root, "config", "user.name", "BreadBoard Test");
+			git(root, "config", "user.email", "breadboard-test@example.invalid");
+			await writeFile(resolve(root, "tracked.txt"), "clean\n");
+			git(root, "add", "tracked.txt");
+			git(root, "commit", "-qm", "fixture");
+			const clone = Bun.spawnSync(["/usr/bin/git", "clone", "-q", root, clean], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (clone.exitCode !== 0) throw new Error(new TextDecoder().decode(clone.stderr));
+			const [commit, tree] = git(root, "rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await writeFile(resolve(root, "tracked.txt"), "dirty pinned inode\n");
+			let swapped = false;
+			const swappingInspection = (async (
+				inspectedRoot: string,
+				assertRootIdentity: () => Promise<void>,
+			) => {
+				await assertRootIdentity();
+				return {
+					get root() {
+						if (!swapped) {
+							renameSync(root, held);
+							renameSync(clean, root);
+							swapped = true;
+						}
+						return inspectedRoot;
+					},
+					commit: commit as string,
+					tree: tree as string,
+					status: "",
+				};
+			}) as BackendGitInspection;
+			await expect(
+				verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root, swappingInspection),
+			).rejects.toThrow("backend root identity changed");
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+	test("execution snapshot contains only tracked HEAD bytes and survives original mutation and replacement", async () => {
+		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-execution-snapshot-"));
+		const root = resolve(parent, "backend");
+		const held = resolve(parent, "held");
+		await mkdir(root);
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		let snapshot: Awaited<ReturnType<typeof openVerifiedBackendSnapshot>> | undefined;
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await mkdir(resolve(root, "nested"));
+			await writeFile(resolve(root, "nested/tracked.txt"), "verified bytes\n");
+			git("add", "nested/tracked.txt");
+			git("commit", "-qm", "fixture");
+			const [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			snapshot = await openVerifiedBackendSnapshot({ backendCommit: commit as string, backendTree: tree as string }, root);
+			expect({ commit: snapshot.commit, tree: snapshot.tree }).toEqual({ commit, tree });
+			expect((await lstat(snapshot.root)).mode & 0o777).toBe(0o700);
+			expect(await Bun.file(resolve(snapshot.root, ".git")).exists()).toBe(false);
+			await writeFile(resolve(root, "nested/tracked.txt"), "mutated original\n");
+			renameSync(root, held);
+			await mkdir(root);
+			await mkdir(resolve(root, "nested"));
+			await writeFile(resolve(root, "nested/tracked.txt"), "replacement root\n");
+			expect(await readFile(resolve(snapshot.root, "nested/tracked.txt"), "utf8")).toBe("verified bytes\n");
+			expect(await Bun.file(resolve(snapshot.root, ".git")).exists()).toBe(false);
+		} finally {
+			await snapshot?.close();
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	test("execution snapshot rejects a tracked symlink that could escape the private root", async () => {
+		const root = await mkdtemp(resolve(tmpdir(), "breadboard-snapshot-symlink-"));
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await symlink("../outside", resolve(root, "escape"));
+			git("add", "escape");
+			git("commit", "-qm", "fixture");
+			const [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await expect(openVerifiedBackendSnapshot({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow(
+				"execution snapshot cannot contain tracked symlinks",
 			);
 		} finally {
 			await rm(root, { recursive: true, force: true });

@@ -828,6 +828,7 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	#detachedClosePhase: "detach-pending" | "release-pending" | undefined;
 	#releaseReplayClient: BoundLifecycleE4Client | undefined;
 	#hardSignalCommitActive = false;
+	#connectPromise: Promise<LifecycleResult> | undefined;
 
 
 	constructor(config: BreadboardRunConfig, dependencies: LifecycleSupervisorDependencies) {
@@ -850,7 +851,14 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 
 
 	async connect(): Promise<LifecycleResult> {
-		return await this.#connectAttempt(0);
+		if (this.context) return this.projectReadyResult(this.context);
+		this.#connectPromise ??= this.#connectAttempt(0);
+		const connectPromise = this.#connectPromise;
+		try {
+			return await connectPromise;
+		} finally {
+			if (this.#connectPromise === connectPromise) this.#connectPromise = undefined;
+		}
 	}
 
 	async start(): Promise<LifecycleResult> {

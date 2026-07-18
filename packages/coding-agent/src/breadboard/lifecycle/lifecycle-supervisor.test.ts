@@ -509,6 +509,49 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			argvSha256: artifact.argvSha256,
 		});
 	});
+	test("shares one same-object local-owned initial connect", async () => {
+		const store = await temporaryStore();
+		const process = processHarness();
+		const calls: string[] = [];
+		let registrationAttempts = 0;
+		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient: () => ({
+				handshake: async () => {
+					await Bun.sleep(0);
+					const current = process.current();
+					const base = boundClient(bindingFor(current.pid, current.launchId), calls);
+					return {
+						...base,
+						registerClient: async input => {
+							registrationAttempts++;
+							if (registrationAttempts > 1) {
+								throw new LifecycleE4ClientError({
+									kind: "registration-conflict",
+									status: 409,
+									code: "registration_conflict",
+									correlation: {},
+									body: "[redacted]",
+								});
+							}
+							return await base.registerClient(input);
+						},
+					};
+				},
+			}),
+		});
+		const initial = await Promise.all([supervisor.connect(), supervisor.connect()]);
+		expect(initial).toMatchObject([{ kind: "ready" }, { kind: "ready" }]);
+		expect(initial[1]).toEqual(initial[0]);
+		expect({
+			spawns: process.spawnCount(),
+			acquisitions: calls.filter(call => call === "acquire-owner").length,
+			registrationAttempts,
+			registrations: calls.filter(call => call === "register:local-owned").length,
+		}).toEqual({ spawns: 1, acquisitions: 1, registrationAttempts: 1, registrations: 1 });
+	});
+
 	test("projects repeated and concurrent post-ready connects without mutating lifecycle authority", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
