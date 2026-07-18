@@ -46,12 +46,13 @@
     "gen:native": "bun --cwd=../natives run gen:native",
     "gen:native:reset": "bun --cwd=../natives run gen:native:reset",
     "prepack": "bun run gen:tool-views && bun run gen:bundle",
-    "bench:guard": "bun scripts/bench-guard.ts"
+    "bench:guard": "bun scripts/bench-guard.ts",
+    "gate:breadboard-sdk": "bun scripts/verify-breadboard-sdk-provenance.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",
     "@babel/parser": "catalog:",
-    "@breadboard/sdk": "file:/Users/kylemccleary/projects/breadboard_p30_artifacts_20260717/sdk/breadboard-sdk-0.1.0.tgz",
+    "@breadboard/sdk": "file:./vendor/breadboard-sdk-0.2.2.tgz",
     "@mozilla/readability": "catalog:",
     "@oh-my-pi/hashline": "catalog:",
     "@oh-my-pi/omp-stats": "catalog:",

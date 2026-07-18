@@ -6,6 +6,7 @@ const workspaceId: `workspace:v1:sha256:${string}` = `workspace:v1:sha256:${"a".
 const artifact: EngineArtifact = {
 	executablePath: "/usr/bin/false",
 	argv: ["--serve"],
+	argvSha256: "sha256:b76470afe32d50ae8194866d39a872e4dc846e89ac409f390884db522242a6b4",
 	executableSha256: `sha256:${"b".repeat(64)}`,
 	engineSourceSha256: `sha256:${"c".repeat(64)}`,
 	servedBackendCommit: "d".repeat(40),
@@ -109,12 +110,32 @@ describe("resolveBreadboardRunConfig", () => {
 			environment: { BREADBOARD_API_TOKEN: "different-synthetic-secret" },
 			selectedConfig: { tls: { kind: "system-trust" } },
 		});
-		expect(differentCredential.configDigest).not.toBe(config.configDigest);
+		expect(differentCredential.configDigest).toBe(config.configDigest);
 		expect(configError(() => resolveBreadboardRunConfig({
 			...baseInput,
 			cli: { engineMode: "remote", engineUrl: "https://engine.example" },
 			selectedConfig: { auth: { kind: "process-secret", value: "stored-secret" } },
 		})).code).toBe("invalid_auth");
+	});
+
+	test("config digest excludes raw credential references while retaining auth kind and source", () => {
+		const first = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "remote", engineUrl: "https://engine.example" },
+			selectedConfig: { auth: { kind: "keychain-reference", reference: "account/sentinel-alpha" } },
+		});
+		const changedReference = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "remote", engineUrl: "https://engine.example" },
+			selectedConfig: { auth: { kind: "keychain-reference", reference: "account/sentinel-beta" } },
+		});
+		const changedKind = resolveBreadboardRunConfig({
+			...baseInput,
+			cli: { engineMode: "remote", engineUrl: "https://engine.example" },
+			selectedConfig: { auth: { kind: "mtls-reference", reference: "account/sentinel-alpha" } },
+		});
+		expect(changedReference.configDigest).toBe(first.configDigest);
+		expect(changedKind.configDigest).not.toBe(first.configDigest);
 	});
 
 	test("off resolves without endpoint, auth, TLS, artifact, or owner policy", () => {
@@ -126,4 +147,29 @@ describe("resolveBreadboardRunConfig", () => {
 		expect(config.engineArtifact).toBeUndefined();
 		expect(config.ownerExitPolicy).toBeUndefined();
 	});
+	test("canonicalizes executable paths and binds immutable length-delimited argv identity", () => {
+		const argv = ["--serve"];
+		const canonical = resolveBreadboardRunConfig({
+			...baseInput,
+			selectedConfig: { engineArtifact: { ...artifact, executablePath: "/var/../usr/bin/false", argv } },
+		});
+		const distinct = resolveBreadboardRunConfig({
+			...baseInput,
+			selectedConfig: { engineArtifact: { ...artifact, argv: ["--ser", "ve"] } },
+		});
+		const direct = resolveBreadboardRunConfig({
+			...baseInput,
+			selectedConfig: { engineArtifact: artifact },
+		});
+		argv[0] = "--mutated";
+		expect(canonical.engineArtifact).toMatchObject({
+			executablePath: "/usr/bin/false",
+			argv: ["--serve"],
+			argvSha256: "sha256:b76470afe32d50ae8194866d39a872e4dc846e89ac409f390884db522242a6b4",
+		});
+		expect(canonical.configDigest).toBe(direct.configDigest);
+		expect(distinct.engineArtifact?.argvSha256).not.toBe(canonical.engineArtifact?.argvSha256);
+		expect(distinct.configDigest).not.toBe(canonical.configDigest);
+	});
+
 });

@@ -9,6 +9,7 @@ export const LIFECYCLE_STATES = [
 	"handshaking",
 	"acquiring-owner",
 	"registering-client",
+	"compatible-observed",
 	"ready",
 	"reconnecting",
 	"backing-off",
@@ -112,7 +113,7 @@ export interface LifecycleObservedHandle {
 
 export type LifecycleResult =
 	| { readonly kind: "off"; readonly state: LifecycleState & { readonly name: "off" } }
-	| { readonly kind: "observed"; readonly state: LifecycleState & { readonly name: "ready" }; readonly handle: LifecycleObservedHandle }
+	| { readonly kind: "observed"; readonly state: LifecycleState & { readonly name: "compatible-observed" }; readonly handle: LifecycleObservedHandle }
 	| { readonly kind: "ready"; readonly state: LifecycleState & { readonly name: "ready" }; readonly handle: LifecycleReadyHandle }
 	| { readonly kind: "detached"; readonly state: LifecycleState & { readonly name: "detached" } }
 	| { readonly kind: "stopped"; readonly state: LifecycleState & { readonly name: "stopped" } }

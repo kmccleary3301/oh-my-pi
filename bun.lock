@@ -76,7 +76,7 @@
       "dependencies": {
         "@agentclientprotocol/sdk": "catalog:",
         "@babel/parser": "catalog:",
-        "@breadboard/sdk": "file:/Users/kylemccleary/projects/breadboard_p30_artifacts_20260717/sdk/breadboard-sdk-0.1.0.tgz",
+        "@breadboard/sdk": "file:./vendor/breadboard-sdk-0.2.2.tgz",
         "@mozilla/readability": "catalog:",
         "@oh-my-pi/hashline": "catalog:",
         "@oh-my-pi/omp-stats": "catalog:",
@@ -499,7 +499,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.3", "", { "os": "win32", "cpu": "x64" }, "sha512-ExSaJWi4/u6+GXCszlSKpWSjKNbDseAYqqkCznsCsZ/4uidZ/BEqsCc5/3ctlq6dfIubdIIRSVLC/PG9xPl70Q=="],
 
-    "@breadboard/sdk": ["@breadboard/sdk@/Users/kylemccleary/projects/breadboard_p30_artifacts_20260717/sdk/breadboard-sdk-0.1.0.tgz", { "dependencies": { "eventsource-parser": "^1.1.2" } }, "sha512-FkGx/RE/jC1SfIQqJbT9qptq3rjpEJc5kj4p/7WQhYjO8OuxU4LRXX6H5nQQcO7huXnRpFVK+Bs9XFI06dDyrg=="],
+    "@breadboard/sdk": ["@breadboard/sdk@./vendor/breadboard-sdk-0.2.2.tgz", { "dependencies": { "eventsource-parser": "^1.1.2" } }, "sha512-zXV+lheQnFXpA+GZo0+ow0l2z3I9N2XGWWq8GY96v6z+zlfgC9E94meW1f26wld0P1pKVyFDI28R4Cdn+0MVwA=="],
 
     "@bufbuild/protobuf": ["@bufbuild/protobuf@2.12.1", "", {}, "sha512-BvAMfS6LrgZiryOAZ4pBYucu4wG/Ei/9o9DZ9akbREnMLbPJiom2i8b9C8IsKErQoiKqVhrerzt3kOT/RrzLHg=="],
 

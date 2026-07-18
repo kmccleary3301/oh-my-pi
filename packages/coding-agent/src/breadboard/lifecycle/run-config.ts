@@ -20,6 +20,7 @@ export type BreadboardTls =
 export interface EngineArtifact {
 	readonly executablePath: string;
 	readonly argv: readonly string[];
+	readonly argvSha256: `sha256:${string}`;
 	readonly executableSha256: `sha256:${string}`;
 	readonly engineSourceSha256: `sha256:${string}`;
 	readonly servedBackendCommit: string;
@@ -240,6 +241,10 @@ function parseExitPolicy(value: unknown): OwnerExitPolicy {
 	return value;
 }
 
+export function executablePathSha256(canonicalPath: string): `sha256:${string}` {
+	return `sha256:${createHash("sha256").update("breadboard-engine-executable-path-v1\0").update(canonicalPath).digest("hex")}`;
+}
+
 function parseArtifact(value: unknown): EngineArtifact | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "object" || value === null || Array.isArray(value)) fail("invalid_artifact", "engineArtifact", "engine artifact must be an object");
@@ -253,9 +258,18 @@ function parseArtifact(value: unknown): EngineArtifact | undefined {
 	if (typeof record.executableSha256 !== "string" || !SHA256.test(record.executableSha256)) fail("invalid_artifact", "engineArtifact", "engine executable digest is invalid");
 	if (typeof record.engineSourceSha256 !== "string" || !SHA256.test(record.engineSourceSha256)) fail("invalid_artifact", "engineArtifact", "engine source digest is invalid");
 	if (typeof record.servedBackendCommit !== "string" || !COMMIT_ID.test(record.servedBackendCommit)) fail("invalid_artifact", "engineArtifact", "served backend commit is invalid");
+	let executablePath: string;
+	try {
+		executablePath = realpathSync(record.executablePath);
+	} catch {
+		fail("invalid_artifact", "engineArtifact", "engine artifact executable path cannot be canonicalized");
+	}
+	const argv = Object.freeze([...(record.argv as string[])]);
+	const argvSha256 = `sha256:${createHash("sha256").update("breadboard-engine-argv-v1\0").update(JSON.stringify(argv)).digest("hex")}` as const;
 	return Object.freeze({
-		executablePath: record.executablePath,
-		argv: Object.freeze([...(record.argv as string[])]),
+		executablePath,
+		argv,
+		argvSha256,
 		executableSha256: record.executableSha256 as `sha256:${string}`,
 		engineSourceSha256: record.engineSourceSha256 as `sha256:${string}`,
 		servedBackendCommit: record.servedBackendCommit,
@@ -420,23 +434,25 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	const safeDigestInput = JSON.stringify({
 		mode,
 		endpoint,
-		authKind: authChoice.value?.kind,
+		auth: authChoice.value === undefined ? undefined : {
+			kind: authChoice.value.kind,
+			source: authChoice.source,
+		},
 		tls,
-		engineArtifact: artifactChoice.value,
+		engineArtifact: artifactChoice.value === undefined ? undefined : {
+			executablePathSha256: executablePathSha256(artifactChoice.value.executablePath),
+			argvSha256: artifactChoice.value.argvSha256,
+			executableSha256: artifactChoice.value.executableSha256,
+			engineSourceSha256: artifactChoice.value.engineSourceSha256,
+			servedBackendCommit: artifactChoice.value.servedBackendCommit,
+		},
 		workspaceId: workspaceChoice.value,
 		startupTimeoutMs,
 		requestTimeoutMs,
 		ownerExitPolicy: mode === "local-owned" ? ownerExitPolicy : undefined,
 		sources,
 	});
-	const configHash = createHash("sha256").update("breadboard-run-config-v1\0").update(safeDigestInput);
-	if (authChoice.value) {
-		configHash
-			.update("\0auth\0")
-			.update(authChoice.value.kind)
-			.update("\0")
-			.update(authChoice.value.kind === "process-secret" ? authChoice.value.value : authChoice.value.reference);
-	}
+	const configHash = createHash("sha256").update("breadboard-run-config-v2\0").update(safeDigestInput);
 	return freezeConfig({
 		mode,
 		...(endpoint === undefined ? {} : { endpoint }),

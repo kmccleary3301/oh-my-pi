@@ -3,10 +3,11 @@ import { chmod, lstat, mkdir, mkdtemp, readdir, rename, rm, symlink, writeFile }
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AUTHORITY_RECORD_SCHEMA_VERSION, LocalAuthorityStore, LocalAuthorityStoreError } from "./local-authority-store";
+import { executablePathSha256 } from "./run-config";
 
 const roots: string[] = [];
 const endpoint = "http://127.0.0.1:7777";
-const ownerCredential = "a".repeat(43);
+const ownerCredential = Buffer.from("owner_credential_abcdefghijklmnopqrstuvwxyz012345", "ascii");
 
 async function temporaryRoot(): Promise<string> {
 	const root = await mkdtemp(join(tmpdir(), "omp-lifecycle-store-"));
@@ -24,6 +25,8 @@ function record(generation = 1) {
 		osProcessStartToken: "darwin:123:456",
 		normalizedEndpoint: endpoint,
 		executableSha256: `sha256:${"a".repeat(64)}`,
+		executablePathSha256: executablePathSha256("/usr/bin/false"),
+		argvSha256: `sha256:${"d".repeat(64)}`,
 		engineArtifactSha256: `sha256:${"b".repeat(64)}`,
 		servedBackendCommit: "c".repeat(40),
 		ownerExitPolicy: "attached" as const,
@@ -51,10 +54,157 @@ describe("LocalAuthorityStore", () => {
 		expect(publicMetadata.nlink).toBe(1);
 		expect(committed.schemaVersion).toBe(AUTHORITY_RECORD_SCHEMA_VERSION);
 		const publicText = await Bun.file(join(root, `${key}.authority.json`)).text();
-		expect(publicText).not.toContain(`"ownerCredential":"${ownerCredential}"`);
+		expect(publicText).not.toContain(ownerCredential.toString("ascii"));
 		const secret = await store.readSecret(committed);
-		expect(secret.ownerCredential).toBe(ownerCredential);
+		expect(secret.ownerCredential).toEqual(ownerCredential);
+		secret.ownerCredential.fill(0);
+		const secretBytes = Buffer.from(await Bun.file(join(root, committed.ownerCredentialRef)).arrayBuffer());
+		expect(secretBytes.subarray(0, 32).toString("utf8")).toContain("p30.local-authority-secret");
+		expect(() => JSON.parse(secretBytes.toString("utf8"))).toThrow();
+		secretBytes.fill(0);
 	});
+
+	test("persists one strict control attempt and its drain binding across authority rotation", async () => {
+		const root = await temporaryRoot();
+		const store = new LocalAuthorityStore(root, { now: () => 1_784_373_178_000 });
+		const committed = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		const key = LocalAuthorityStore.endpointKey(endpoint);
+		const orphanControlSecret = `${key}.control.secret.orphan_control_credential_abcdefghijkl.bin`;
+		await writeFile(join(root, orphanControlSecret), "simulated interrupted secret write", { mode: 0o600 });
+		const requester = {
+			registrationId: "registration_abcdefghijklmnopqrstuvwxyz012345",
+			registrationGeneration: 1,
+			clientInstanceId: "p30-real-controller-abcdefghijklmnopqrstuvwxyz",
+			registrationCredential: "requester_credential_abcdefghijklmnopqrstuvwxyz",
+			admissionEpoch: 7,
+		};
+		const first = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
+			endpoint,
+			committed,
+			"stop",
+			"control_request_abcdefghijklmnopqrstuvwxyz012345",
+			requester,
+		));
+		await expect(lstat(join(root, orphanControlSecret))).rejects.toMatchObject({ code: "ENOENT" });
+		const replay = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
+			endpoint,
+			committed,
+			"stop",
+			"replacement_request_abcdefghijklmnopqrstuvwxyz0",
+			requester,
+		));
+		expect(replay).toEqual(first);
+		const draining = await store.withExclusiveLock(endpoint, () => store.markControlAttemptDraining(endpoint, first, 2));
+		expect(draining).toMatchObject({
+			phase: "draining",
+			drainGeneration: 2,
+			registrationId: requester.registrationId,
+			requesterRegistrationGeneration: requester.registrationGeneration,
+			requesterClientInstanceId: requester.clientInstanceId,
+		});
+		expect((await lstat(join(root, first.requesterCredentialRef))).mode & 0o777).toBe(0o600);
+		const requesterSecret = await store.readControlAttemptSecret(first);
+		expect(requesterSecret.requesterRegistrationCredential.toString("utf8")).toBe(requester.registrationCredential);
+		requesterSecret.requesterRegistrationCredential.fill(0);
+		let committing = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, draining, "graceful-accepted"));
+		committing = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, committing, "hard-signal-pending"));
+		committing = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, committing, "hard-signal-commit-pending"));
+		expect(committing.phase).toBe("hard-signal-commit-pending");
+		const rotatedCredential = Buffer.from("rotated_owner_credential_abcdefghijklmnopq", "ascii");
+		const rotated = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, committed, record(2), { ownerCredential: rotatedCredential }));
+		expect(await store.readControlAttempt(endpoint, rotated)).toEqual(committing);
+		expect(await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
+			endpoint,
+			rotated,
+			"stop",
+			"another_request_abcdefghijklmnopqrstuvwxyz012",
+			requester,
+		))).toEqual(committing);
+		const controlPath = join(root, `${key}.control.json`);
+		const controlText = await Bun.file(controlPath).text();
+		expect(controlText).not.toContain(ownerCredential.toString("ascii"));
+		expect(controlText).not.toContain(rotatedCredential.toString("ascii"));
+		expect(controlText).not.toContain(requester.registrationCredential);
+		expect(controlText).not.toContain("/usr/");
+		expect(controlText).not.toContain("authorization_");
+		expect(controlText).not.toContain("owner_credential");
+		expect(controlText).not.toContain("darwin:123:456");
+		await writeFile(controlPath, controlText.replace(',"createdAtUnix"', ',"unexpected":true,"createdAtUnix"'), { mode: 0o600 });
+		await expect(store.readControlAttempt(endpoint, rotated)).rejects.toMatchObject({ code: "control_attempt_integrity" });
+		await writeFile(controlPath, controlText, { mode: 0o600 });
+		await store.withExclusiveLock(endpoint, () => store.clearControlAttempt(endpoint, committing));
+		await expect(lstat(join(root, first.requesterCredentialRef))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await store.readControlAttempt(endpoint, rotated)).toBeNull();
+	});
+	test("atomically converges concurrent replacements of one expired begin requester", async () => {
+		const root = await temporaryRoot();
+		const store = new LocalAuthorityStore(root);
+		const committed = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		const expiredRequester = {
+			registrationId: "registration_expired_abcdefghijklmnopqrstuvwxyz",
+			registrationGeneration: 1,
+			clientInstanceId: "client_expired_abcdefghijklmnopqrstuvwxyz012345",
+			registrationCredential: "requester_expired_credential_abcdefghijklmnopqrstuvwxyz",
+			admissionEpoch: 7,
+		};
+		const expired = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
+			endpoint,
+			committed,
+			"stop",
+			"control_request_expired_abcdefghijklmnopqrstuvwxyz",
+			expiredRequester,
+		));
+		const requesterA = {
+			registrationId: "registration_current_a_abcdefghijklmnopqrstuvwxyz",
+			registrationGeneration: 2,
+			clientInstanceId: "client_current_a_abcdefghijklmnopqrstuvwxyz012345",
+			registrationCredential: "requester_current_a_credential_abcdefghijklmnopqrstuvwxyz",
+			admissionEpoch: 8,
+		};
+		const requesterB = {
+			registrationId: "registration_current_b_abcdefghijklmnopqrstuvwxyz",
+			registrationGeneration: 3,
+			clientInstanceId: "client_current_b_abcdefghijklmnopqrstuvwxyz012345",
+			registrationCredential: "requester_current_b_credential_abcdefghijklmnopqrstuvwxyz",
+			admissionEpoch: 8,
+		};
+		const [winnerA, winnerB] = await Promise.all([
+			store.withExclusiveLock(endpoint, () => store.replaceExpiredBeginControlAttempt(
+				endpoint,
+				committed,
+				expired,
+				"stop",
+				"control_request_current_a_abcdefghijklmnopqrstuvwxyz",
+				requesterA,
+			)),
+			store.withExclusiveLock(endpoint, () => store.replaceExpiredBeginControlAttempt(
+				endpoint,
+				committed,
+				expired,
+				"stop",
+				"control_request_current_b_abcdefghijklmnopqrstuvwxyz",
+				requesterB,
+			)),
+		]);
+		expect(winnerA).toEqual(winnerB);
+		expect(winnerA.controlRequestId).not.toBe(expired.controlRequestId);
+		expect([requesterA.registrationId, requesterB.registrationId]).toContain(winnerA.registrationId);
+		await expect(lstat(join(root, expired.requesterCredentialRef))).rejects.toMatchObject({ code: "ENOENT" });
+		const names = await readdir(root);
+		const secretNames = names.filter(name => name.includes(".control.secret."));
+		expect(secretNames).toEqual([winnerA.requesterCredentialRef]);
+		const publicText = await Bun.file(join(root, `${LocalAuthorityStore.endpointKey(endpoint)}.control.json`)).text();
+		expect(publicText).not.toContain(expiredRequester.registrationCredential);
+		expect(publicText).not.toContain(requesterA.registrationCredential);
+		expect(publicText).not.toContain(requesterB.registrationCredential);
+		const winnerSecret = await store.readControlAttemptSecret(winnerA);
+		expect([
+			requesterA.registrationCredential,
+			requesterB.registrationCredential,
+		]).toContain(winnerSecret.requesterRegistrationCredential.toString("utf8"));
+		winnerSecret.requesterRegistrationCredential.fill(0);
+	});
+
 
 	test("enforces generation CAS and retires only the current generation", async () => {
 		const root = await temporaryRoot();
@@ -70,6 +220,7 @@ describe("LocalAuthorityStore", () => {
 		});
 		const names = await readdir(root);
 		expect(names.some(name => name.includes("retired.2"))).toBe(true);
+		expect(names.some(name => name.includes(".secret."))).toBe(false);
 	});
 
 	test("keeps the public generation fail-closed when retirement is interrupted", async () => {
@@ -85,8 +236,30 @@ describe("LocalAuthorityStore", () => {
 			interrupt = true;
 			await expect(store.retireDeadGeneration(endpoint, current)).rejects.toThrow("synthetic retirement interruption");
 			expect(await store.readCurrent(endpoint)).toEqual(current);
-			await expect(store.readSecret(current)).rejects.toBeDefined();
+			const preservedSecret = await store.readSecret(current);
+			expect(preservedSecret.ownerCredential).toEqual(ownerCredential);
+			preservedSecret.ownerCredential.fill(0);
 		});
+	});
+
+	test("retires the public record before secret cleanup and removes the orphan on restart", async () => {
+		const root = await temporaryRoot();
+		let interruptCleanup = false;
+		const store = new LocalAuthorityStore(root, {
+			beforeUnlink: path => {
+				if (interruptCleanup && path.includes(".secret.")) throw new Error("synthetic secret cleanup interruption");
+			},
+		});
+		const current = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		interruptCleanup = true;
+		await expect(store.withExclusiveLock(endpoint, () => store.retireDeadGeneration(endpoint, current))).rejects.toThrow("synthetic secret cleanup interruption");
+		expect(await store.readCurrent(endpoint)).toBeNull();
+		expect((await readdir(root)).some(name => name === current.ownerCredentialRef)).toBe(true);
+
+		const restarted = new LocalAuthorityStore(root);
+		const claim = await restarted.withExclusiveLock(endpoint, () => restarted.claimStart(endpoint));
+		expect(claim.kind).toBe("claimed");
+		expect((await readdir(root)).some(name => name.includes(".secret."))).toBe(false);
 	});
 
 	test("quarantines malformed current records without using their PID", async () => {
@@ -133,6 +306,14 @@ describe("LocalAuthorityStore", () => {
 		await expect(store.initialize()).rejects.toMatchObject({ code: "root_integrity" });
 		const wrongOwner = new LocalAuthorityStore(root, { uid: () => 99_999 });
 		await expect(wrongOwner.initialize()).rejects.toMatchObject({ code: "root_integrity" });
+	});
+
+	test("rejects an unsafe pre-existing root without repairing its mode", async () => {
+		const root = await temporaryRoot();
+		await chmod(root, 0o755);
+		const store = new LocalAuthorityStore(root);
+		await expect(store.initialize()).rejects.toMatchObject({ code: "root_integrity" });
+		expect((await lstat(root)).mode & 0o777).toBe(0o755);
 	});
 
 	test("fails closed when the lock pathname is replaced after descriptor locking", async () => {
@@ -199,6 +380,8 @@ describe("LocalAuthorityStore", () => {
 				executableSha256: `sha256:${"a".repeat(64)}`,
 				engineArtifactSha256: `sha256:${"b".repeat(64)}`,
 				servedBackendCommit: "c".repeat(40),
+				executablePathSha256: executablePathSha256("/usr/bin/false"),
+				argvSha256: `sha256:${"d".repeat(64)}`,
 			}, { bootstrapCredential, ownerCredential });
 			bootstrapCredential.fill(0);
 			await store.bindStartClaimProcess(endpoint, prepared.token, enginePid, "darwin:4321:123456");
@@ -211,10 +394,51 @@ describe("LocalAuthorityStore", () => {
 			const secondSecret = await store.readPendingSecret(recovered.claim);
 			expect([...secondSecret.bootstrapCredential]).toEqual([...Buffer.alloc(32, 7)]);
 			secondSecret.bootstrapCredential.fill(0);
+			firstSecret.ownerCredential.fill(0);
+			secondSecret.ownerCredential.fill(0);
 			await store.releaseStartClaim(endpoint, recovered.claim.token);
 		});
 		const names = await readdir(root);
 		expect(names.some(name => name.includes(".starting.secret."))).toBe(false);
+	});
+
+	test("wipes both decoded pending credentials when their verifier mismatches", async () => {
+		const root = await temporaryRoot();
+		const store = new LocalAuthorityStore(root);
+		const bootstrapCredential = Buffer.alloc(32, 29);
+		const pendingOwnerCredential = Buffer.from("pending_owner_credential_abcdefghijklmnopqrstuvwxyz", "ascii");
+		const prepared = await store.withExclusiveLock(endpoint, async () => {
+			const claimed = await store.claimStart(endpoint);
+			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
+			return await store.prepareStartClaim(endpoint, claimed.claim.token, {
+				launchId: "launch_pending_mismatch_abcdefghijklmnopqrstuvwxyz",
+				executableSha256: `sha256:${"a".repeat(64)}`,
+				executablePathSha256: executablePathSha256("/usr/bin/false"),
+				argvSha256: `sha256:${"d".repeat(64)}`,
+				engineArtifactSha256: `sha256:${"b".repeat(64)}`,
+				servedBackendCommit: "c".repeat(40),
+			}, { bootstrapCredential, ownerCredential: pendingOwnerCredential });
+		});
+		const originalFrom = Buffer.from;
+		const decoded: Buffer[] = [];
+		(Buffer as unknown as { from: (...args: unknown[]) => Buffer }).from = (...args: unknown[]) => {
+			const value = Reflect.apply(originalFrom, Buffer, args) as Buffer;
+			if (value.equals(bootstrapCredential) || value.equals(pendingOwnerCredential)) decoded.push(value);
+			return value;
+		};
+		try {
+			await expect(store.readPendingSecret({
+				...prepared,
+				pendingSecretVerifier: `sha256:${"f".repeat(64)}`,
+			})).rejects.toMatchObject({ code: "secret_verifier_mismatch" });
+		} finally {
+			(Buffer as unknown as { from: typeof Buffer.from }).from = originalFrom;
+		}
+		expect(decoded).toHaveLength(2);
+		expect(decoded.every(value => value.every(byte => byte === 0))).toBe(true);
+		bootstrapCredential.fill(0);
+		pendingOwnerCredential.fill(0);
+		await store.withExclusiveLock(endpoint, () => store.releaseStartClaim(endpoint, prepared.token));
 	});
 
 	test("uses a stable Darwin process-start identity for live start claims", async () => {

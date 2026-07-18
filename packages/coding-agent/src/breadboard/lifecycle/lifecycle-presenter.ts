@@ -47,9 +47,15 @@ export function displayEndpointIdentity(endpoint: string | undefined): string | 
 
 export function presentLifecycle(result: LifecycleDispatchResult): LifecyclePresentation {
 	if (result.kind === "off") return { summary: "BreadBoard engine: off", remediation: REMEDIATION_BY_REASON.engine_mode_off, exitCode: 0 };
-	if (result.kind === "ready" || result.kind === "observed") {
+	if (result.kind === "ready") {
 		return {
 			summary: `BreadBoard engine: ready (${result.state.mode}; instance ${result.handle.binding.engineInstanceId})`,
+			exitCode: 0,
+		};
+	}
+	if (result.kind === "observed") {
+		return {
+			summary: `BreadBoard engine: compatible, observed only (${result.state.mode}; instance ${result.handle.binding.engineInstanceId})`,
 			exitCode: 0,
 		};
 	}
