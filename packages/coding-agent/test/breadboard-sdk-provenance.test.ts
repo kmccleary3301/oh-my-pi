@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
@@ -269,6 +269,126 @@ printf 'token\\n'
 			await rm(parent, { recursive: true, force: true });
 		}
 	});
+	test.each(["clean", "process"] as const)("does not execute repository-local %s filters", async filterKind => {
+		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-local-filter-"));
+		const root = resolve(parent, "backend");
+		const marker = resolve(parent, "filter-executed");
+		const filter = resolve(parent, filterKind === "clean" ? "filter.sh" : "filter.ts");
+		await mkdir(root);
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await writeFile(resolve(root, "tracked.txt"), "clean\n");
+			git("add", "tracked.txt");
+			git("commit", "-qm", "fixture");
+			const [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await writeFile(resolve(root, ".git/info/attributes"), "tracked.txt filter=pwn\n");
+			if (filterKind === "clean") {
+				await writeFile(filter, `#!/bin/sh
+cat
+touch ${JSON.stringify(marker)}
+`);
+				await chmod(filter, 0o755);
+				git("config", "filter.pwn.clean", filter);
+			} else {
+				await writeFile(filter, `import { readSync, writeFileSync, writeSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+function readExact(length) {
+	const bytes = Buffer.alloc(length);
+	let offset = 0;
+	while (offset < length) {
+		const count = readSync(0, bytes, offset, length - offset, null);
+		if (count === 0) throw new Error("eof");
+		offset += count;
+	}
+	return bytes;
+}
+function readPacket() {
+	const length = Number.parseInt(readExact(4).toString("ascii"), 16);
+	return length === 0 ? null : readExact(length - 4);
+}
+function readList() {
+	const packets = [];
+	for (;;) {
+		const packet = readPacket();
+		if (packet === null) return packets;
+		packets.push(packet);
+	}
+}
+function writePacket(bytes) {
+	writeSync(1, Buffer.from((bytes.length + 4).toString(16).padStart(4, "0"), "ascii"));
+	writeSync(1, bytes);
+}
+function flush() { writeSync(1, Buffer.from("0000", "ascii")); }
+readList();
+writePacket(Buffer.from("git-filter-server\\n"));
+writePacket(Buffer.from("version=2\\n"));
+flush();
+readList();
+writePacket(Buffer.from("capability=clean\\n"));
+flush();
+for (;;) {
+	try {
+		readList();
+		const content = readList();
+		writeFileSync(marker, "executed\\n");
+		writePacket(Buffer.from("status=success\\n"));
+		flush();
+		for (const packet of content) writePacket(packet);
+		flush();
+		flush();
+	} catch {
+		break;
+	}
+}
+`);
+				git("config", "filter.pwn.process", `${process.execPath} ${filter}`);
+			}
+			git("config", "filter.pwn.required", "true");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).resolves.toBeUndefined();
+			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	test.each(["assume-unchanged", "skip-worktree"] as const)("rejects tracked bytes hidden by %s", async flag => {
+		const root = await mkdtemp(resolve(tmpdir(), "breadboard-hidden-index-state-"));
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await writeFile(resolve(root, "tracked.txt"), "clean\n");
+			git("add", "tracked.txt");
+			git("commit", "-qm", "fixture");
+			const [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			git("update-index", `--${flag}`, "tracked.txt");
+			await writeFile(resolve(root, "tracked.txt"), "hidden dirty bytes\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 
 
 	test("rejects a substituted backend root despite hostile Git discovery environment", async () => {
@@ -323,5 +443,79 @@ printf 'token\\n'
 			exitCode: 2,
 			stderr: expect.stringContaining("backend Git root does not match"),
 		});
+	});
+	test.each(["info-exclude", "core-excludes-file"] as const)("does not let %s hide an untracked source executable", async exclusion => {
+		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-local-exclude-"));
+		const root = resolve(parent, "backend");
+		const excludes = resolve(parent, "local-excludes");
+		await mkdir(root);
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await writeFile(resolve(root, "tracked.txt"), "clean\n");
+			git("add", "tracked.txt");
+			git("commit", "-qm", "fixture");
+			const [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await writeFile(resolve(root, "payload.ts"), "process.stdout.write('executed')\n");
+			await chmod(resolve(root, "payload.ts"), 0o755);
+			if (exclusion === "info-exclude") {
+				await writeFile(resolve(root, ".git/info/exclude"), "payload.ts\n");
+			} else {
+				await writeFile(excludes, "payload.ts\n");
+				git("config", "core.excludesFile", excludes);
+			}
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow(
+				"backend worktree is dirty",
+			);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	test("compares nested tracked bytes and tracked symlink targets directly with HEAD", async () => {
+		const root = await mkdtemp(resolve(tmpdir(), "breadboard-nested-symlink-"));
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+			return new TextDecoder().decode(result.stdout).trim();
+		};
+		try {
+			git("init", "-q");
+			git("config", "user.name", "BreadBoard Test");
+			git("config", "user.email", "breadboard-test@example.invalid");
+			await mkdir(resolve(root, "nested"));
+			await writeFile(resolve(root, "nested/tracked.txt"), "clean\n");
+			await symlink("nested/tracked.txt", resolve(root, "tracked-link"));
+			git("add", "nested/tracked.txt", "tracked-link");
+			git("commit", "-qm", "fixture");
+			const [commit, tree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).resolves.toBeUndefined();
+			await writeFile(resolve(root, "nested/tracked.txt"), "dirty\n");
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow(
+				"backend worktree is dirty",
+			);
+			git("checkout", "-q", "--", "nested/tracked.txt");
+			await rm(resolve(root, "tracked-link"));
+			await symlink("other-target", resolve(root, "tracked-link"));
+			await expect(verifyBackendIdentity({ backendCommit: commit as string, backendTree: tree as string }, root)).rejects.toThrow(
+				"backend tracked symlink target does not match",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });

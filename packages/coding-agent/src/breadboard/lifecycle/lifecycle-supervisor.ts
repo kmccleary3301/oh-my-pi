@@ -952,6 +952,35 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				});
 				return { owner, claim };
 			} catch (error) {
+				if (this.#isOwnerConflict(error) && priorAttemptGeneration >= 2) {
+					try {
+						const predecessor = await bound.renewOwner({
+							ownerGeneration: priorAttemptGeneration - 1,
+							ownerCredential,
+							signal: this.abortController.signal,
+						});
+						const rolledBackClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.rollbackOwnerAttempt(endpoint, claim));
+						return { owner: predecessor, claim: rolledBackClaim };
+					} catch (predecessorError) {
+						if (!this.#isOwnerExpired(predecessorError)) throw predecessorError;
+					}
+					try {
+						const owner = await bound.acquireOwner({
+							expectedOwnerGeneration: priorAttemptGeneration - 1,
+							ownerCredential,
+							signal: this.abortController.signal,
+						});
+						return { owner, claim };
+					} catch (acquireError) {
+						if (!this.#isOwnerConflict(acquireError)) throw acquireError;
+					}
+					const owner = await bound.renewOwner({
+						ownerGeneration: priorAttemptGeneration,
+						ownerCredential,
+						signal: this.abortController.signal,
+					});
+					return { owner, claim };
+				}
 				if (!this.#isOwnerExpired(error)) throw error;
 			}
 			const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.markOwnerAttempt(endpoint, claim));

@@ -2409,29 +2409,23 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			hardControl: false,
 		});
 	});
-	test.each(["fallback-acquires", "delayed-prior-wins"] as const)(
-		"generation-two acquire nondelivery recovers safely when %s",
+	test.each(["predecessor-expired", "predecessor-live", "delayed-prior-wins"] as const)(
+		"generation-two acquire nondelivery recovers pinned backend state when %s",
 		async outcome => {
 			const process = processHarness();
 			const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
 			const endpoint = "http://127.0.0.1:7777";
-			const ownerExpired = () => new LifecycleE4ClientError({
-				kind: "owner-expired",
-				status: 410,
-				code: "owner_expired",
-				correlation: {},
-				body: "[redacted]",
-			});
-			const ownerConflict = () => new LifecycleE4ClientError({
-				kind: "owner-conflict",
-				status: 409,
-				code: "owner_generation_conflict",
+			const ownerFailure = (kind: "owner-expired" | "owner-conflict") => new LifecycleE4ClientError({
+				kind,
+				status: kind === "owner-expired" ? 410 : 409,
+				code: kind === "owner-expired" ? "owner_expired" : "owner_generation_conflict",
 				correlation: {},
 				body: "[redacted]",
 			});
 			const acquireRequests: Array<{ readonly expected: number; readonly bootstrap: boolean }> = [];
 			const renewRequests: number[] = [];
 			let acquireCall = 0;
+			let renewOneCalls = 0;
 			let delayedPriorWon = false;
 			const createClient = (): LifecycleE4Client => ({ handshake: async () => {
 				const current = process.current();
@@ -2439,10 +2433,13 @@ describe("LifecycleSupervisor local-owned authority", () => {
 					...boundClient(bindingFor(current.pid, current.launchId), []),
 					renewOwner: async input => {
 						renewRequests.push(input.ownerGeneration);
-						if (input.ownerGeneration === 2 && delayedPriorWon) {
-							return { result: "renewed", ownerGeneration: 2 } as never;
+						if (input.ownerGeneration === 2) {
+							if (delayedPriorWon) return { result: "renewed", ownerGeneration: 2 } as never;
+							throw ownerFailure("owner-conflict");
 						}
-						throw ownerExpired();
+						renewOneCalls++;
+						if (renewOneCalls === 1 || outcome !== "predecessor-live") throw ownerFailure("owner-expired");
+						return { result: "renewed", ownerGeneration: 1 } as never;
 					},
 					acquireOwner: async input => {
 						acquireCall++;
@@ -2451,11 +2448,12 @@ describe("LifecycleSupervisor local-owned authority", () => {
 							bootstrap: "bootstrapCredential" in input,
 						});
 						if (acquireCall <= 2) throw new LifecycleE4ClientError({ kind: "timeout" });
-						if (input.expectedOwnerGeneration === 2) throw ownerExpired();
-						if (input.expectedOwnerGeneration !== 1) throw new Error("unexpected fallback generation");
+						if (input.expectedOwnerGeneration !== 1 || "bootstrapCredential" in input) {
+							throw new Error("unexpected predecessor acquire");
+						}
 						if (outcome === "delayed-prior-wins") {
 							delayedPriorWon = true;
-							throw ownerConflict();
+							throw ownerFailure("owner-conflict");
 						}
 						return { result: "acquired", ownerGeneration: 2 } as never;
 					},
@@ -2465,18 +2463,24 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			expect((await first.connect()).state.reason).toBe("endpoint_unreachable");
 			const second = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 			expect((await second.connect()).state.reason).toBe("endpoint_unreachable");
+			const pending = await store.withExclusiveLock(endpoint, () => store.claimStart(endpoint));
+			expect(pending).toMatchObject({ kind: "recoverable", claim: { ownerAttemptGeneration: 2 } });
 			const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 			expect(await recovered.connect()).toMatchObject({ kind: "ready" });
-			expect(acquireRequests).toEqual([
-				{ expected: 0, bootstrap: true },
-				{ expected: 1, bootstrap: false },
-				{ expected: 2, bootstrap: false },
-				{ expected: 1, bootstrap: false },
-			]);
-			expect(renewRequests).toEqual(outcome === "delayed-prior-wins" ? [1, 2, 2] : [1, 2]);
+			expect(acquireRequests).toEqual(outcome === "predecessor-live"
+				? [
+					{ expected: 0, bootstrap: true },
+					{ expected: 1, bootstrap: false },
+				]
+				: [
+					{ expected: 0, bootstrap: true },
+					{ expected: 1, bootstrap: false },
+					{ expected: 1, bootstrap: false },
+				]);
+			expect(renewRequests).toEqual(outcome === "delayed-prior-wins" ? [1, 2, 1, 2] : [1, 2, 1]);
 			expect(process.spawnCount()).toBe(1);
 			expect(process.events).not.toContain("hard-control");
-			expect((await store.readCurrent(endpoint))?.ownerGeneration).toBe(2);
+			expect((await store.readCurrent(endpoint))?.ownerGeneration).toBe(outcome === "predecessor-live" ? 1 : 2);
 		},
 	);
 

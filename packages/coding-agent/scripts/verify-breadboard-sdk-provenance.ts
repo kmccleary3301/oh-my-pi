@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile, readdir, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { JSONC } from "bun";
 
 export interface BreadboardSdkProvenance {
@@ -63,7 +63,65 @@ function gitEnvironment(): Record<string, string> {
 		GIT_CONFIG_GLOBAL: "/dev/null",
 		GIT_CONFIG_COUNT: "0",
 		GIT_TERMINAL_PROMPT: "0",
+		GIT_NO_REPLACE_OBJECTS: "1",
 	};
+}
+
+const MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
+const MAX_TREE_ENTRIES = 200_000;
+const MAX_TREE_PATH_BYTES = 4096;
+const MAX_BLOB_BYTES = 64 * 1024 * 1024;
+const MAX_TREE_BYTES = 512 * 1024 * 1024;
+
+async function collectLimited(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array> {
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	for await (const chunk of stream) {
+		length += chunk.byteLength;
+		invariant(length <= limit, "backend Git output exceeds the verification limit");
+		chunks.push(chunk);
+	}
+	const output = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		output.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return output;
+}
+
+async function runGit(
+	executable: string,
+	root: string,
+	args: readonly string[],
+	input?: Uint8Array,
+	maxOutputBytes = MAX_GIT_OUTPUT_BYTES,
+	acceptedExitCodes: readonly number[] = [0],
+): Promise<Uint8Array> {
+	const child = Bun.spawn([executable, "--no-replace-objects", ...GIT_CONFIG_OVERRIDES, "-C", root, ...args], {
+		env: gitEnvironment(),
+		stdin: input === undefined ? "ignore" : "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (input !== undefined) {
+		const stdin = child.stdin;
+		invariant(stdin !== undefined, "backend Git input pipe is unavailable");
+		stdin.write(input);
+		stdin.end();
+	}
+	try {
+		const [stdout, stderr, exitCode] = await Promise.all([
+			collectLimited(child.stdout, maxOutputBytes),
+			collectLimited(child.stderr, 64 * 1024),
+			child.exited,
+		]);
+		invariant(acceptedExitCodes.includes(exitCode) && stderr.byteLength === 0, "backend Git inspection failed");
+		return stdout;
+	} catch (error) {
+		child.kill();
+		throw error;
+	}
 }
 const GIT_CONFIG_OVERRIDES = [
 	"-c", "core.fsmonitor=false",
@@ -71,40 +129,182 @@ const GIT_CONFIG_OVERRIDES = [
 	"-c", "core.filemode=true",
 	"-c", "core.ignoreStat=false",
 	"-c", "core.untrackedCache=false",
+	"-c", "core.excludesFile=/dev/null",
 ] as const;
+
+interface HeadTreeEntry {
+	readonly mode: "100644" | "100755" | "120000";
+	readonly objectId: string;
+	readonly path: string;
+}
+
+function splitNullTerminated(bytes: Uint8Array): Uint8Array[] {
+	const records: Uint8Array[] = [];
+	let start = 0;
+	for (let index = 0; index < bytes.byteLength; index++) {
+		if (bytes[index] !== 0) continue;
+		records.push(bytes.subarray(start, index));
+		start = index + 1;
+	}
+	invariant(start === bytes.byteLength, "backend Git listing is not NUL terminated");
+	return records;
+}
+
+function parseHeadTree(bytes: Uint8Array): HeadTreeEntry[] {
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	const entries: HeadTreeEntry[] = [];
+	const seenPaths = new Set<string>();
+	for (const record of splitNullTerminated(bytes)) {
+		invariant(entries.length < MAX_TREE_ENTRIES, "backend tree has too many entries");
+		const tab = record.indexOf(0x09);
+		invariant(tab > 0, "backend tree entry is malformed");
+		const header = decoder.decode(record.subarray(0, tab));
+		const match = /^(100644|100755|120000) blob ([0-9a-f]{40,64})$/.exec(header);
+		invariant(match !== null, "backend worktree is dirty");
+		const pathBytes = record.subarray(tab + 1);
+		invariant(pathBytes.byteLength > 0 && pathBytes.byteLength <= MAX_TREE_PATH_BYTES, "backend tree path is invalid");
+		const path = decoder.decode(pathBytes);
+		invariant(
+			!isAbsolute(path) &&
+				!path.startsWith(`.${sep}`) &&
+				path.split(sep).every(component => component !== "" && component !== "." && component !== ".."),
+			"backend tree path is unsafe",
+		);
+		invariant(!seenPaths.has(path), "backend tree contains a duplicate path");
+		seenPaths.add(path);
+		entries.push({ mode: match[1] as HeadTreeEntry["mode"], objectId: match[2] as string, path });
+	}
+	return entries;
+}
+
+function parseBatchBlobs(bytes: Uint8Array, objectIds: readonly string[]): ReadonlyMap<string, Uint8Array> {
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	const blobs = new Map<string, Uint8Array>();
+	let offset = 0;
+	let totalBytes = 0;
+	for (const expectedObjectId of objectIds) {
+		const newline = bytes.indexOf(0x0a, offset);
+		invariant(newline > offset, "backend blob response is malformed");
+		const header = decoder.decode(bytes.subarray(offset, newline));
+		const match = /^([0-9a-f]{40,64}) blob ([0-9]+)$/.exec(header);
+		invariant(match !== null && match[1] === expectedObjectId, "backend blob response does not match the tree");
+		const size = Number(match[2]);
+		invariant(Number.isSafeInteger(size) && size >= 0 && size <= MAX_BLOB_BYTES, "backend blob exceeds the verification limit");
+		totalBytes += size;
+		invariant(totalBytes <= MAX_TREE_BYTES, "backend tree bytes exceed the verification limit");
+		const start = newline + 1;
+		const end = start + size;
+		invariant(end < bytes.byteLength && bytes[end] === 0x0a, "backend blob response is truncated");
+		blobs.set(expectedObjectId, bytes.subarray(start, end));
+		offset = end + 1;
+	}
+	invariant(offset === bytes.byteLength, "backend blob response contains trailing data");
+	return blobs;
+}
+
+async function listWorktreeLeaves(root: string): Promise<readonly string[]> {
+	const leaves: string[] = [];
+	let visited = 0;
+	const walk = async (directory: string, prefix: string): Promise<void> => {
+		const names = await readdir(directory);
+		names.sort();
+		for (const name of names) {
+			if (prefix === "" && name === ".git") continue;
+			const path = prefix === "" ? name : `${prefix}${sep}${name}`;
+			invariant(Buffer.byteLength(path) <= MAX_TREE_PATH_BYTES, "backend worktree path is too long");
+			visited++;
+			invariant(visited <= MAX_TREE_ENTRIES * 2, "backend worktree has too many entries");
+			const metadata = await lstat(join(root, path));
+			if (metadata.isDirectory() && !metadata.isSymbolicLink()) await walk(join(root, path), path);
+			else leaves.push(path);
+		}
+	};
+	await walk(root, "");
+	return leaves;
+}
+
+
+async function assertHeadTreeMatchesWorktree(
+	executable: string,
+	root: string,
+	assertRootIdentity: () => Promise<void>,
+): Promise<void> {
+	const treeBytes = await runGit(executable, root, ["ls-tree", "-rz", "--full-tree", "-r", "HEAD"]);
+	const entries = parseHeadTree(treeBytes);
+	const objectIds = [...new Set(entries.map(entry => entry.objectId))];
+	const objectInput = new TextEncoder().encode(`${objectIds.join("\n")}\n`);
+	const batchBytes = objectIds.length === 0
+		? new Uint8Array()
+		: await runGit(executable, root, ["cat-file", "--batch"], objectInput, MAX_TREE_BYTES + MAX_GIT_OUTPUT_BYTES);
+	const blobs = parseBatchBlobs(batchBytes, objectIds);
+	await assertRootIdentity();
+	for (const entry of entries) {
+		const absolutePath = join(root, entry.path);
+		const metadata = await lstat(absolutePath).catch(() => undefined);
+		invariant(metadata !== undefined, "backend tracked path is missing");
+		const expectedBlob = blobs.get(entry.objectId);
+		invariant(expectedBlob !== undefined, "backend tracked blob is missing");
+		if (entry.mode === "120000") {
+			invariant(metadata.isSymbolicLink(), "backend tracked symlink type does not match");
+			const target = new TextEncoder().encode(await readlink(absolutePath));
+			invariant(Buffer.from(target).equals(expectedBlob), "backend tracked symlink target does not match");
+			continue;
+		}
+		invariant(metadata.isFile() && !metadata.isSymbolicLink(), "backend tracked file type does not match");
+		invariant(((metadata.mode & 0o111) !== 0) === (entry.mode === "100755"), "backend worktree is dirty");
+		const bytes = await readFile(absolutePath);
+		invariant(Buffer.from(bytes).equals(expectedBlob), "backend worktree is dirty");
+	}
+	await assertRootIdentity();
+	const trackedPaths = new Set(entries.map(entry => entry.path));
+	const untracked = (await listWorktreeLeaves(root)).filter(path => !trackedPaths.has(path));
+	if (untracked.length > 0) {
+		const input = new TextEncoder().encode(`${untracked.join("\0")}\0`);
+		const ignoredBytes = await runGit(
+			executable,
+			root,
+			["check-ignore", "--no-index", "-v", "-z", "--stdin"],
+			input,
+			MAX_GIT_OUTPUT_BYTES,
+			[0, 1],
+		);
+		const decoder = new TextDecoder("utf-8", { fatal: true });
+		const records = splitNullTerminated(ignoredBytes).map(bytes => decoder.decode(bytes));
+		invariant(records.length % 4 === 0, "backend Git ignore result is malformed");
+		const ignoredByCommittedRules = new Set<string>();
+		for (let index = 0; index < records.length; index += 4) {
+			const source = records[index] as string;
+			const line = records[index + 1] as string;
+			const pattern = records[index + 2] as string;
+			const path = records[index + 3] as string;
+			const sourcePath = relative(root, isAbsolute(source) ? source : resolve(root, source));
+			invariant(
+				!sourcePath.startsWith(`..${sep}`) &&
+					(sourcePath === ".gitignore" || sourcePath.endsWith(`${sep}.gitignore`)) &&
+					trackedPaths.has(sourcePath) &&
+					/^[1-9][0-9]*$/.test(line) &&
+					pattern !== "",
+				"backend worktree is dirty",
+			);
+			ignoredByCommittedRules.add(path);
+		}
+		invariant(untracked.every(path => ignoredByCommittedRules.has(path)), "backend worktree is dirty");
+	}
+	await assertRootIdentity();
+}
 
 
 const inspectBackendGit: BackendGitInspection = async (root, assertRootIdentity) => {
 	const executable = await trustedGitExecutable();
-	const environment = gitEnvironment();
 	await assertRootIdentity();
-	const identity = Bun.spawn([executable, ...GIT_CONFIG_OVERRIDES, "-C", root, "rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"], {
-		env: environment,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const [identityOutput, identityError, identityExit] = await Promise.all([
-		new Response(identity.stdout).text(),
-		new Response(identity.stderr).text(),
-		identity.exited,
-	]);
-	invariant(identityExit === 0 && identityError === "", "backend Git identity is unavailable");
+	const identityOutput = new TextDecoder("utf-8", { fatal: true }).decode(
+		await runGit(executable, root, ["rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"]),
+	);
 	const [inspectedRoot, commit, tree, ...extra] = identityOutput.trim().split("\n");
 	invariant(extra.length === 0 && inspectedRoot !== undefined && commit !== undefined && tree !== undefined, "backend Git identity is malformed");
-	await assertRootIdentity();
-	const statusProcess = Bun.spawn([executable, ...GIT_CONFIG_OVERRIDES, "-C", root, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], {
-		env: environment,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const [status, statusError, statusExit] = await Promise.all([
-		new Response(statusProcess.stdout).text(),
-		new Response(statusProcess.stderr).text(),
-		statusProcess.exited,
-	]);
-	invariant(statusExit === 0 && statusError === "", "backend Git status is unavailable");
-	await assertRootIdentity();
-	return { root: inspectedRoot, commit, tree, status };
+	invariant(await realpath(inspectedRoot) === await realpath(root), "backend Git root does not match");
+	await assertHeadTreeMatchesWorktree(executable, root, assertRootIdentity);
+	return { root: inspectedRoot, commit, tree, status: "" };
 };
 
 export async function verifyBackendIdentity(
