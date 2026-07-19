@@ -43,6 +43,7 @@ describe("resolveBreadboardRunConfig", () => {
 				startupTimeoutMs: 5000,
 				requestTimeoutMs: 9000,
 				workspaceId,
+				sessionConfigPath: "/usr/bin/false",
 			},
 		});
 		expect(config.mode).toBe("local-external");
@@ -50,12 +51,14 @@ describe("resolveBreadboardRunConfig", () => {
 		expect(config.startupTimeoutMs).toBe(4000);
 		expect(config.requestTimeoutMs).toBe(9000);
 		expect(config.workspaceId).toBe(workspaceId);
+		expect(config.sessionConfigPath).toBe("/usr/bin/false");
 		expect(config.sources).toMatchObject({
 			mode: "cli",
 			endpoint: "cli",
 			startupTimeoutMs: "environment",
 			requestTimeoutMs: "selected-config",
 			workspaceId: "selected-config",
+			sessionConfigPath: "selected-config",
 		});
 	});
 
@@ -91,6 +94,7 @@ describe("resolveBreadboardRunConfig", () => {
 		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "remote", engineUrl: "https://engine.example" }, environment: { BREADBOARD_API_TOKEN: "synthetic secret value" } })).code).toBe("invalid_auth");
 		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off" }, selectedConfig: { requestTimeoutMs: "nope" } })).code).toBe("invalid_timeout");
 		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off" }, selectedConfig: { engineMod: "remote" } as never })).code).toBe("invalid_selected_config");
+		expect(configError(() => resolveBreadboardRunConfig({ ...baseInput, cli: { engineMode: "off" }, selectedConfig: { sessionConfigPath: " unsafe " } })).code).toBe("invalid_session_config");
 	});
 
 	test("binds remote HTTPS authentication and fails unsupported trust inputs closed", () => {

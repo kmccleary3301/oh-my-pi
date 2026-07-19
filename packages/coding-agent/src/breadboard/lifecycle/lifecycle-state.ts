@@ -96,6 +96,7 @@ export interface LifecycleReadyHandle {
 	readonly mode: Exclude<BreadboardEngineMode, "off">;
 	readonly binding: LifecycleEngineBinding;
 	readonly lifecycleClient: BoundLifecycleE4Client;
+	readonly requestFetch: typeof fetch;
 	readonly registration: {
 		readonly id: string;
 		readonly generation: number;

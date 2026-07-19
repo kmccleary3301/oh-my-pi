@@ -6,10 +6,10 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
-import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { CanonicalE4ClientError, createCanonicalE4Client, projectFailureEvidence } from "@breadboard/sdk";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryExists,
@@ -23,6 +23,16 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
+import { CanonicalE4SessionPort } from "./breadboard/canonical-e4-session-port";
+import { validateBreadboardInteractiveLaunch } from "./breadboard/interactive-launch-policy";
+import { restoreLifecycleTerminal, writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
+import { dispatchLifecycleAction, LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
+import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
+import {
+	BreadboardRunConfigError,
+	loadSelectedBreadboardConfig,
+	resolveBreadboardRunConfig,
+} from "./breadboard/lifecycle/run-config";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -54,10 +64,9 @@ import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
-import type { MCPManager } from "./mcp";
-import { InteractiveMode } from "./modes/interactive-mode";
+import { BreadboardInteractiveSessionMode } from "./modes/breadboard-interactive-session-mode";
+import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
-import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
@@ -73,23 +82,11 @@ import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
-import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
-import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
 import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
-import type { LspStartupServerInfo } from "./tools";
-import {
-	getChangelogPath,
-	parseChangelog,
-	parseChangelogVersion,
-	readLastChangelogVersion,
-	selectStartupChangelog,
-	writeLastChangelogVersion,
-} from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
-import { withTimeoutSignal } from "./utils/fetch-timeout";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
@@ -101,29 +98,6 @@ type RunRpcMode = (
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
-}
-
-async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
-	if (!settings.get("startup.checkUpdate")) {
-		return;
-	}
-	try {
-		const response = await fetch("https://registry.npmjs.org/@oh-my-pi/pi-coding-agent/latest", {
-			signal: withTimeoutSignal(5_000),
-		});
-		if (!response.ok) return undefined;
-
-		const data = (await response.json()) as { version?: string };
-		const latestVersion = data.version;
-
-		if (latestVersion && Bun.semver.order(latestVersion, currentVersion) > 0) {
-			return latestVersion;
-		}
-
-		return undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 // Todo settings are caller-controlled in protocol modes. Do not host-default them:
@@ -397,130 +371,6 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	};
 }
 
-async function runInteractiveMode(
-	session: AgentSession,
-	version: string,
-	changelogMarkdown: string | undefined,
-	notifs: (InteractiveModeNotify | null)[],
-	versionCheckPromise: Promise<string | undefined>,
-	initialMessages: string[],
-	setExtensionUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
-	lspServers: LspStartupServerInfo[] | undefined,
-	mcpManager: MCPManager | undefined,
-	resuming: boolean,
-	forceSetupWizard: boolean,
-	showStartupSplash: boolean,
-	eventBus?: EventBus,
-	initialMessage?: string,
-	initialImages?: ImageContent[],
-	joinLink?: string,
-): Promise<void> {
-	const mode = new InteractiveMode(
-		session,
-		version,
-		changelogMarkdown,
-		setExtensionUIContext,
-		lspServers,
-		mcpManager,
-		eventBus,
-	);
-
-	// Cold-launch gate: the full setup wizard (every scene + the overlay and
-	// their TUI/OAuth/search/theme deps) is heavy, yet the common case only needs
-	// to know whether the stored setup version is current. Lazy-load the wizard
-	// barrel only when setup is stale, forced, or the explicit startup splash
-	// setting needs the shared setup splash renderer.
-	const storedSetupVersion = settings.get("setupVersion");
-	const setupWizard =
-		forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
-			? await import("./modes/setup-wizard")
-			: undefined;
-	const setupScenes = setupWizard
-		? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
-				resuming,
-				isTTY: process.stdin.isTTY && process.stdout.isTTY,
-				setupWizardEnabled: settings.get("startup.setupWizard"),
-				force: forceSetupWizard,
-			})
-		: [];
-	const playStartupSplash = showStartupSplash && setupScenes.length === 0;
-
-	await mode.init({
-		suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
-		clearInitialTerminalHistory: true,
-	});
-
-	if (setupWizard && playStartupSplash) {
-		await setupWizard.runStartupSplash(mode);
-	}
-
-	if (setupWizard && setupScenes.length > 0) {
-		await setupWizard.runSetupWizard(mode, setupScenes);
-	}
-
-	versionCheckPromise
-		.then(newVersion => {
-			if (!settings.get("startup.checkUpdate")) {
-				return;
-			}
-			if (newVersion) {
-				mode.showNewVersionNotification(newVersion);
-			}
-		})
-		.catch(() => {});
-
-	// Cold-launch cleanup: the first paint already clears native history, and this
-	// replay replaces the welcome/startup frame with the resumed/new transcript.
-	// Every in-process session load also uses `clearTerminalHistory`; cold launch
-	// follows the same clean-cutover path instead of preserving a previous run's
-	// transcript above the fresh one.
-	mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: true });
-
-	for (const notify of notifs) {
-		if (!notify) {
-			continue;
-		}
-		if (notify.kind === "warn") {
-			mode.showWarning(notify.message);
-		} else if (notify.kind === "error") {
-			mode.showError(notify.message);
-		} else if (notify.kind === "info") {
-			mode.showStatus(notify.message);
-		}
-	}
-
-	// `omp join <link>`: dispatch through the same builtin path as a typed
-	// `/join` so collab guards and error rendering stay in one place.
-	if (joinLink !== undefined) {
-		await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
-	}
-
-	if (initialMessage !== undefined) {
-		try {
-			using _keepalive = new EventLoopKeepalive();
-			await session.prompt(initialMessage, { images: initialImages });
-		} catch (error: unknown) {
-			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-			mode.showError(errorMessage);
-		}
-	}
-
-	for (const message of initialMessages) {
-		try {
-			using _keepalive = new EventLoopKeepalive();
-			await session.prompt(message);
-		} catch (error: unknown) {
-			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-			mode.showError(errorMessage);
-		}
-	}
-
-	while (true) {
-		const input = await mode.getUserInput();
-		await submitInteractiveInput(mode, session, input);
-	}
-}
-
 type SessionPromptResult = "accepted" | "declined" | "unavailable";
 
 type SessionPrompt = (session: SessionInfo) => Promise<SessionPromptResult>;
@@ -607,35 +457,6 @@ async function moveMissingCwdSessionIfNeeded(
 	const manager = await SessionManager.open(session.path, sessionDir, undefined, { initialCwd: sourceCwd });
 	await manager.moveTo(cwd, sessionDir);
 	return { status: "moved", manager };
-}
-
-async function getChangelogForDisplay(parsed: Args): Promise<string | undefined> {
-	if (parsed.continue || parsed.resume) {
-		return undefined;
-	}
-
-	const lastVersion = await readLastChangelogVersion();
-	const parsedLastVersion = parseChangelogVersion(lastVersion);
-	if (!parsedLastVersion) {
-		await writeLastChangelogVersion(VERSION);
-		return undefined;
-	}
-	if (lastVersion === VERSION) {
-		// Steady state: user already saw the current version's changelog. Skip the file read + parse.
-		return undefined;
-	}
-
-	const changelogPath = getChangelogPath();
-	const entries = await parseChangelog(changelogPath);
-	const startupChangelog = selectStartupChangelog(entries, lastVersion, VERSION);
-	if (startupChangelog.persistCurrentVersion) {
-		await writeLastChangelogVersion(VERSION);
-	}
-	if (startupChangelog.markdown) {
-		return startupChangelog.markdown;
-	}
-
-	return undefined;
 }
 
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
@@ -1037,49 +858,127 @@ interface RunRootCommandDependencies {
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
+async function runBreadboardInteractiveProduct(parsed: Args, pipedInput: string | undefined): Promise<void> {
+	const validation = validateBreadboardInteractiveLaunch(parsed, pipedInput);
+	if (validation !== null) {
+		process.stderr.write(`BreadBoard launch error: ${validation}\n`);
+		process.exitCode = 1;
+		return;
+	}
 
-async function runBreadboardLifecyclePreflight(parsed: Args): Promise<boolean> {
-	// Intentionally lazy: launch help/version/export and other non-session exits must not load lifecycle process code.
-	const runConfig = await import("./breadboard/lifecycle/run-config");
 	try {
-		const selectedConfig = await runConfig.loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
-		const config = runConfig.resolveBreadboardRunConfig({
+		const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
+		const config = resolveBreadboardRunConfig({
 			cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
 			selectedConfig,
 			workspacePath: getProjectDir(),
 		});
-		const [{ dispatchLifecycleAction, LifecycleSupervisor }, { LocalAuthorityStore }, presenter] =
-			await Promise.all([
-				import("./breadboard/lifecycle/lifecycle-supervisor"),
-				import("./breadboard/lifecycle/local-authority-store"),
-				import("./breadboard/lifecycle/lifecycle-presenter"),
-			]);
-		const store = config.mode === "local-owned"
-			? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
-			: undefined;
+		const target =
+			typeof parsed.resume === "string"
+				? { kind: "attach" as const, sessionId: parsed.resume }
+				: config.sessionConfigPath === undefined
+					? null
+					: { kind: "create" as const, request: { configPath: config.sessionConfigPath } };
+		if (target === null) {
+			process.stderr.write(
+				"BreadBoard configuration error [invalid_session_config/sessionConfigPath]: a selected sessionConfigPath is required to create a session.\n",
+			);
+			process.exitCode = 1;
+			return;
+		}
+
+		// The governed interactive path owns lifecycle composition directly.
+		const store =
+			config.mode === "local-owned"
+				? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
+				: undefined;
+		const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
+		const connected = await supervisor.connect();
+		if (connected.kind !== "ready") {
+			process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
+			const closed = await supervisor.close({ consumerClosed: true });
+			if (closed.kind === "failure") {
+				process.exitCode = writeLifecyclePresentation(closed).exitCode || 1;
+			}
+			return;
+		}
+		const sessionMode = new BreadboardInteractiveSessionMode(
+			new CanonicalE4SessionPort(
+				createCanonicalE4Client({
+					baseUrl: connected.handle.binding.endpoint,
+					requestTimeoutMs: config.requestTimeoutMs,
+					fetch: connected.handle.requestFetch,
+				}),
+			),
+			target,
+		);
+		try {
+			await sessionMode.run();
+		} catch (error) {
+			if (error instanceof CanonicalE4ClientError) {
+				const evidence = projectFailureEvidence(error.failure);
+				const code =
+					"code" in evidence.details && evidence.details.code !== null ? `/${evidence.details.code}` : "";
+				const sessionId = sessionMode.controller?.runtime.sessionId;
+				const recovery = sessionId === undefined ? "" : ` Session: ${sessionId}.`;
+				process.stderr.write(`BreadBoard session failed [${evidence.details.kind}${code}].${recovery}\n`);
+			} else {
+				process.stderr.write("BreadBoard session failed unexpectedly.\n");
+			}
+			process.exitCode = 1;
+		} finally {
+			const closed = await supervisor.close({ consumerClosed: true });
+			if (closed.kind === "failure") {
+				process.exitCode = writeLifecyclePresentation(closed).exitCode || 1;
+			}
+		}
+	} catch (error) {
+		const message =
+			error instanceof BreadboardRunConfigError
+				? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
+				: "BreadBoard lifecycle failed unexpectedly.";
+		process.stderr.write(`${message}\n`);
+		process.exitCode = 1;
+	}
+}
+
+async function runBreadboardLifecyclePreflight(parsed: Args): Promise<boolean> {
+	try {
+		const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
+		const config = resolveBreadboardRunConfig({
+			cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
+			selectedConfig,
+			workspacePath: getProjectDir(),
+		});
+		// Platform lifecycle authority is shared with the governed interactive path.
+		const store =
+			config.mode === "local-owned"
+				? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
+				: undefined;
 		const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
 		const execution = await dispatchLifecycleAction(supervisor, "connect", {
 			closeReady: true,
-			restoreTerminal: presenter.restoreLifecycleTerminal,
+			restoreTerminal: restoreLifecycleTerminal,
 		});
-		const presentation = presenter.writeLifecyclePresentation(execution.result);
+		const presentation = writeLifecyclePresentation(execution.result);
 		let exitCode: number = presentation.exitCode;
 		if (execution.result.kind === "ready") {
 			process.stderr.write(
-				"BreadBoard lifecycle is ready, but the governed interactive session slice is not installed in this packet.\n",
+				"BreadBoard lifecycle is ready, but this launch mode is outside the governed interactive session slice.\n",
 			);
 			exitCode = 1;
 		}
 		if (execution.closeResult?.kind === "failure") {
-			exitCode = presenter.writeLifecyclePresentation(execution.closeResult).exitCode || 1;
+			exitCode = writeLifecyclePresentation(execution.closeResult).exitCode || 1;
 		}
 		if (execution.signal !== undefined) exitCode = execution.signal === "SIGINT" ? 130 : 143;
 		process.exitCode = exitCode;
 		return true;
 	} catch (error) {
-		const message = error instanceof runConfig.BreadboardRunConfigError
-			? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
-			: "BreadBoard lifecycle failed unexpectedly.";
+		const message =
+			error instanceof BreadboardRunConfigError
+				? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
+				: "BreadBoard lifecycle failed unexpectedly.";
 		process.stderr.write(`${message}\n`);
 		process.exitCode = 1;
 		return true;
@@ -1100,12 +999,6 @@ export async function runRootCommand(
 	// Initialize theme early with defaults (CLI commands need symbols)
 	// Will be re-initialized with user preferences later
 	await logger.time("initTheme:initial", initTheme);
-
-	const notifs: (InteractiveModeNotify | null)[] = [];
-
-	// Create AuthStorage and ModelRegistry upfront
-	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
-	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 
 	if (parsedArgs.version) {
 		writeStartupNotice(parsedArgs, `${VERSION}\n`);
@@ -1132,26 +1025,17 @@ export async function runRootCommand(
 		process.exit(1);
 	}
 
-	// Kick off plugin-root preload in parallel with the remaining startup work.
-	// Awaited later (before extension/skill discovery in createAgentSession needs it).
-	const home = os.homedir();
-	const pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
-			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
-			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
-	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
-	// warning before we reach the await site below.
-	pluginPreloadPromise.catch(() => {});
-
-	// Register CLI-provided extension package paths (`--extension`, `--hook`) so
-	// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
-	// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
-	// `--no-extensions` short-circuits both the factory load and the sub-discovery.
-	if (!parsedArgs.noExtensions) {
-		const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
-		if (cliExtensions.length > 0) {
-			injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir());
-		}
+	const mode = parsedArgs.mode || "text";
+	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
+	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	if (isInteractive) {
+		stopStartupWatchdog();
+		stopThemeWatcher();
+		await runBreadboardInteractiveProduct(parsedArgs, pipedInput);
+		return;
 	}
 
 	let cwd = getProjectDir();
@@ -1177,15 +1061,6 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
-	const mode = parsedArgs.mode || "text";
-	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
-	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
-	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
-
-	// Initialize discovery system with settings for provider persistence
-	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
 	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
 	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
@@ -1224,6 +1099,31 @@ export async function runRootCommand(
 		settingsInstance.get("theme.dark"),
 		settingsInstance.get("theme.light"),
 	);
+
+	if (!isInteractive && (await runBreadboardLifecyclePreflight(parsedArgs))) {
+		stopStartupWatchdog();
+		stopThemeWatcher();
+		return;
+	}
+
+	// Native OMP provider/session discovery is outside the governed BreadBoard
+	// interactive slice. Do not run it until excluded launch modes have failed
+	// closed through lifecycle preflight.
+	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
+	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
+	const home = os.homedir();
+	const pluginPreloadPromise =
+		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
+			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
+	pluginPreloadPromise.catch(() => {});
+	if (!parsedArgs.noExtensions) {
+		const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
+		if (cliExtensions.length > 0) {
+			injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir());
+		}
+	}
+	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
 	let scopedModels: ScopedModel[] = [];
 	const modelPatterns = parsedArgs.models ?? settingsInstance.get("enabledModels");
@@ -1338,11 +1238,7 @@ export async function runRootCommand(
 				sessionId: sessionManager.getSessionId(),
 				sessionFile: sessionManager.getSessionFile(),
 			});
-			if (isInteractive) {
-				notifs.push({ kind: "warn", message: pendingToolWarning });
-			} else {
-				process.stderr.write(`${chalk.yellow(`${pendingToolWarning}\n`)}`);
-			}
+			process.stderr.write(`${chalk.yellow(`${pendingToolWarning}\n`)}`);
 		}
 	}
 
@@ -1466,22 +1362,7 @@ export async function runRootCommand(
 			stdinContent: pipedInput,
 		});
 
-		const showStartupSplash = shouldShowStartupSplash({
-			configured: settingsInstance.get("startup.showSplash"),
-			isInteractive,
-			resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
-			quiet: settingsInstance.get("startup.quiet"),
-			timing: Boolean($env.PI_TIMING),
-			stdinIsTTY: process.stdin.isTTY,
-			stdoutIsTTY: process.stdout.isTTY,
-		});
-		if (await runBreadboardLifecyclePreflight(parsedArgs)) {
-			stopStartupWatchdog();
-			stopThemeWatcher();
-			return;
-		}
-
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
+		const { session, setToolUIContext, modelFallbackMessage } = await createSession({
 			...sessionOptions,
 			eventBus,
 			preloadedExtensions: extensionsResult,
@@ -1508,14 +1389,7 @@ export async function runRootCommand(
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
 
-		if (modelFallbackMessage) {
-			notifs.push({ kind: "warn", message: modelFallbackMessage });
-		}
-
 		const modelRegistryError = modelRegistry.getError();
-		if (modelRegistryError) {
-			notifs.push({ kind: "error", message: modelRegistryError.message });
-		}
 
 		if (!isInteractive && !session.model) {
 			if (modelRegistryError) {
@@ -1537,48 +1411,6 @@ export async function runRootCommand(
 			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 			stopStartupWatchdog();
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus);
-		} else if (isInteractive) {
-			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
-			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
-
-			const modelScopeNotification = buildModelScopeNotification(
-				scopedModels,
-				settingsInstance.get("startup.quiet"),
-			);
-			if (modelScopeNotification) {
-				// Routed through the TUI (not stdout): the startup capture owns the
-				// terminal in raw mode here, and the TUI's first clearScrollback paint
-				// would wipe a pre-TUI line anyway.
-				notifs.push(modelScopeNotification);
-			}
-
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-				if (logger.shouldExitAfterTimings()) {
-					process.exit(0);
-				}
-			}
-
-			stopStartupWatchdog();
-			logger.endTiming();
-			await runInteractiveMode(
-				session,
-				VERSION,
-				changelogMarkdown,
-				notifs,
-				versionCheckPromise,
-				initialArgs.messages,
-				setToolUIContext,
-				lspServers,
-				mcpManager,
-				Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
-				deps.forceSetupWizard === true,
-				showStartupSplash,
-				eventBus,
-				initialMessage,
-				initialImages,
-				parsedArgs.join,
-			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 			stopStartupWatchdog();

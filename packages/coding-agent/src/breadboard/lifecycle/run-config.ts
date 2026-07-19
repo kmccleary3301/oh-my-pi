@@ -32,6 +32,7 @@ export interface BreadboardRunConfig {
 	readonly auth?: BreadboardAuth;
 	readonly tls?: BreadboardTls;
 	readonly engineArtifact?: EngineArtifact;
+	readonly sessionConfigPath?: string;
 	readonly workspaceId: `workspace:v1:sha256:${string}`;
 	readonly startupTimeoutMs: number;
 	readonly requestTimeoutMs: number;
@@ -49,7 +50,8 @@ export type RunConfigField =
 	| "workspaceId"
 	| "startupTimeoutMs"
 	| "requestTimeoutMs"
-	| "ownerExitPolicy";
+	| "ownerExitPolicy"
+	| "sessionConfigPath";
 
 export interface SelectedBreadboardConfig {
 	readonly engineMode?: unknown;
@@ -61,6 +63,7 @@ export interface SelectedBreadboardConfig {
 	readonly startupTimeoutMs?: unknown;
 	readonly requestTimeoutMs?: unknown;
 	readonly ownerExitPolicy?: unknown;
+	readonly sessionConfigPath?: unknown;
 }
 
 export interface ResolveBreadboardRunConfigInput {
@@ -83,6 +86,7 @@ export type RunConfigErrorCode =
 	| "invalid_workspace"
 	| "invalid_timeout"
 	| "invalid_exit_policy"
+	| "invalid_session_config"
 	| "mode_endpoint_conflict"
 	| "mode_auth_conflict"
 	| "missing_endpoint"
@@ -117,6 +121,7 @@ const SELECTED_CONFIG_FIELDS = new Set([
 	"startupTimeoutMs",
 	"requestTimeoutMs",
 	"ownerExitPolicy",
+	"sessionConfigPath",
 ]);
 
 
@@ -312,6 +317,14 @@ function canonicalWorkspace(path: string, canonicalize?: (path: string) => strin
 	return `workspace:v1:sha256:${createHash("sha256").update("breadboard-workspace-v1\0").update(canonical).digest("hex")}`;
 }
 
+function parseSessionConfigPath(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || value.length === 0 || value !== value.trim() || value.includes("\0")) {
+		fail("invalid_session_config", "sessionConfigPath", "session config path must be a non-empty path without surrounding whitespace");
+	}
+	return value;
+}
+
 function freezeConfig(config: BreadboardRunConfig): BreadboardRunConfig {
 	Object.freeze(config.sources);
 	if (config.auth) Object.freeze(config.auth);
@@ -326,6 +339,10 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	for (const key of Object.keys(selected)) {
 		if (!SELECTED_CONFIG_FIELDS.has(key)) fail("invalid_selected_config", "mode", "selected BreadBoard configuration contains an unsupported field");
 	}
+
+	const sessionConfigPath = parseSessionConfigPath(
+		hasOwn(selected, "sessionConfigPath") ? selected.sessionConfigPath : undefined,
+	);
 
 	const cliMode = input.cli?.engineMode;
 	const envMode = environment.BREADBOARD_ENGINE_MODE;
@@ -430,6 +447,7 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 		startupTimeoutMs: startupChoice.source,
 		requestTimeoutMs: requestChoice.source,
 		ownerExitPolicy: mode === "local-owned" ? exitChoice.source : "derived-default",
+		sessionConfigPath: sessionConfigPath === undefined ? "derived-default" : "selected-config",
 	};
 	const safeDigestInput = JSON.stringify({
 		mode,
@@ -450,6 +468,9 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 		startupTimeoutMs,
 		requestTimeoutMs,
 		ownerExitPolicy: mode === "local-owned" ? ownerExitPolicy : undefined,
+		sessionConfigPathSha256: sessionConfigPath === undefined
+			? undefined
+			: `sha256:${createHash("sha256").update("breadboard-session-config-path-v1\0").update(sessionConfigPath).digest("hex")}`,
 		sources,
 	});
 	const configHash = createHash("sha256").update("breadboard-run-config-v2\0").update(safeDigestInput);
@@ -459,6 +480,7 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 		...(authChoice.value === undefined ? {} : { auth: authChoice.value }),
 		...(tls === undefined ? {} : { tls }),
 		...(artifactChoice.value === undefined ? {} : { engineArtifact: artifactChoice.value }),
+		...(sessionConfigPath === undefined ? {} : { sessionConfigPath }),
 		workspaceId: workspaceChoice.value as `workspace:v1:sha256:${string}`,
 		startupTimeoutMs,
 		requestTimeoutMs,

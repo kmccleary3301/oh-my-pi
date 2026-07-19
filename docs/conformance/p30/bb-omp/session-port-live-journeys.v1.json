@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "p30-bb-omp-session-port-live-journeys-v1",
+  "ticket": "bb-89n.16",
+  "capturedAtUtc": "2026-07-19T01:13:04Z",
+  "cleanOmpBaseCommit": "3047c27c332c5629c8e063283d349384c10c9a56",
+  "backendCommit": "1ba697903653f8ef6ba83102c06e916a9fd2ea9e",
+  "canonicalClientCommit": "bc4f5ce85d10194b3c39eead916d753f5b821e6",
+  "canonicalSdk": {
+    "package": "@breadboard/sdk@0.2.2",
+    "artifactSha256": "2e7dbd6dd1f655c431ecd56e833e7b3c3598c8b8bb1f6e62649204368cedffe2"
+  },
+  "secretSafety": "No credentials, request headers, cookies, raw secret values, or assistant payload text are recorded.",
+  "journeys": [
+    {
+      "id": "P30-SESSION-NEW-TURN-RECONNECT",
+      "sessionId": "8328204d-5ac1-4a96-aabc-d1f2998f968b",
+      "inputId": "input-8c6751d3-365f-4359-8f5e-d4096849f329",
+      "turnId": "turn-8278570c-1896-4ec3-86fd-10b47853b284",
+      "submitDisposition": "started",
+      "terminalOutcome": "completed",
+      "terminalEventSequence": 24,
+      "nativeProductCreate": "passed",
+      "nativeProductAttachObserve": "passed",
+      "localClose": "passed-without-session-delete",
+      "reconnectProof": "Consumed accepted bb-89n.14 canonical nonce/reconnect gate; live attach replay restored the same completed terminal without duplicate application."
+    },
+    {
+      "id": "P30-SESSION-TARGETED-CANCEL",
+      "sessionId": "eefafeac-d033-47d6-9795-e078c4b090a0",
+      "activeTurnId": "turn-325c99d0-c146-4ce6-aabb-418d9bdf8511",
+      "cancelledInputId": "input-9be50b9e-6b77-49d1-b4af-aad458a3df90",
+      "cancelledTurnId": "turn-3ed30c4b-0766-46b8-a8f5-7238d591ab50",
+      "cancelledTurnStarted": false,
+      "cancelledTurnOutcome": "cancelled",
+      "queuedTurnCountAfterCancel": 0,
+      "activeTurnPreserved": true,
+      "localClose": "passed-without-session-delete"
+    }
+  ]
+}

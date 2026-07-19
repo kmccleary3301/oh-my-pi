@@ -326,6 +326,47 @@ describe("LifecycleSupervisor mode authority", () => {
 		}
 	});
 
+	test("ready handle exposes an authenticated request transport without exposing the token", async () => {
+		const originalFetch = globalThis.fetch;
+		let observedAuthorization: string | null = null;
+		let observedCustomHeader: string | null = null;
+		globalThis.fetch = Object.assign(
+			async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+				const headers = new Headers(init?.headers);
+				observedAuthorization = headers.get("authorization");
+				observedCustomHeader = headers.get("x-product");
+				return new Response(null, { status: 204 });
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		try {
+			const config = resolveBreadboardRunConfig({
+				...common,
+				cli: { engineMode: "remote", engineUrl: "https://engine.example" },
+				selectedConfig: { auth: { kind: "keychain-reference", reference: "test-token" } },
+			});
+			const binding = bindingFor(99, "external_launch_abcdefghijklmnopqrstuvwxyz", {
+				endpoint: "https://engine.example",
+				launch: { launchId: "external_launch_abcdefghijklmnopqrstuvwxyz", source: "external_unmanaged" },
+			});
+			const supervisor = new LifecycleSupervisor(config, {
+				resolveRemoteSecurity: async () => ({ bearerToken: "resolved-token" }),
+				createClient: () => ({ handshake: async () => boundClient(binding, []) }),
+			});
+			const result = await supervisor.connect();
+			expect(result.kind).toBe("ready");
+			if (result.kind !== "ready") throw new Error("expected ready lifecycle result");
+			expect(result.handle).not.toHaveProperty("bearerToken");
+			await result.handle.requestFetch("https://engine.example/v1/sessions", {
+				headers: { "x-product": "breadboard" },
+			});
+			expect([observedAuthorization, observedCustomHeader].join("|")).toBe("Bearer resolved-token|breadboard");
+			expect((await supervisor.close({ consumerClosed: true })).kind).toBe("detached");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test("default child process environment is an exact minimal allowlist", () => {
 		process.env.BREADBOARD_HOSTILE_PARENT_SECRET = "must-not-cross";
 		try {

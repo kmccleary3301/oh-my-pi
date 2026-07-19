@@ -62,6 +62,24 @@ export interface ResolvedRemoteSecurity {
 	readonly privateKeyPem?: string;
 }
 
+function createAuthenticatedRequestFetch(
+	security: { readonly bearerToken?: string; readonly fetch?: typeof fetch },
+): typeof fetch {
+	const transport = security.fetch ?? globalThis.fetch;
+	if (security.bearerToken === undefined) return transport;
+	const authorization = `Bearer ${security.bearerToken}`;
+	const authenticatedFetch = (
+		input: Parameters<typeof fetch>[0],
+		init?: Parameters<typeof fetch>[1],
+	): Promise<Response> => {
+		const headers = new Headers(input instanceof Request ? input.headers : undefined);
+		new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+		headers.set("authorization", authorization);
+		return transport(input, { ...init, headers });
+	};
+	return Object.assign(authenticatedFetch, { preconnect: transport.preconnect });
+}
+
 export interface LifecycleSupervisorDependencies {
 	readonly store?: LocalAuthorityStore;
 	readonly process?: LifecycleProcessAdapter;
@@ -89,6 +107,7 @@ export type LifecycleAction = "connect" | "start" | "status" | "stop" | "restart
 
 interface ReadyContext {
 	readonly client: BoundLifecycleE4Client;
+	readonly requestFetch: typeof fetch;
 	readonly binding: LifecycleEngineBinding;
 	readonly registration: ClientRegistrationResponse & { readonly result: "registered" };
 	readonly clientInstanceId: string;
@@ -582,6 +601,8 @@ abstract class ModeStrategy {
 		this.stateChanged = dependencies.stateChanged ?? (() => undefined);
 	}
 
+	protected requestFetch: typeof fetch = globalThis.fetch;
+
 	abstract connect(): Promise<LifecycleResult>;
 	async start(): Promise<LifecycleResult> {
 		return lifecycleFailure(this.config.mode, "failed", "mode_forbidden");
@@ -628,6 +649,7 @@ abstract class ModeStrategy {
 	protected async unboundClient(): Promise<LifecycleE4Client> {
 		if (!this.config.endpoint) throw new Error("resolved lifecycle endpoint is missing");
 		const security = await this.clientSecurity();
+		this.requestFetch = createAuthenticatedRequestFetch(security);
 		return this.createClient({ baseUrl: this.config.endpoint, timeoutMs: this.config.requestTimeoutMs, ...security });
 	}
 
@@ -666,7 +688,14 @@ abstract class ModeStrategy {
 			registrationCredential: this.registrationCredential,
 			signal: this.abortController.signal,
 		});
-		return { client, binding: client.binding, registration, clientInstanceId: this.clientInstanceId, registrationCredential: this.registrationCredential };
+		return {
+			client,
+			requestFetch: this.requestFetch,
+			binding: client.binding,
+			registration,
+			clientInstanceId: this.clientInstanceId,
+			registrationCredential: this.registrationCredential,
+		};
 	}
 
 	protected startLeaseRenewal(context: ReadyContext): void {
@@ -708,6 +737,7 @@ abstract class ModeStrategy {
 			mode: this.config.mode as Exclude<BreadboardRunConfig["mode"], "off">,
 			binding: context.binding,
 			lifecycleClient: context.client,
+			requestFetch: context.requestFetch,
 			registration: Object.freeze({
 				id: context.registration.registrationId,
 				generation: context.registration.registrationGeneration,
