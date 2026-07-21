@@ -354,17 +354,20 @@ export class BreadboardInteractiveSessionController {
 		this.errorContainer.disposeChildren();
 		this.errorContainer.addChild(new ErrorBannerComponent(failureText(failure)));
 		this.editor.disableSubmit = failure.kind === "protocol" || failure.kind === "resume-gap";
+		this.ui.requestRender();
 	}
 
 	#showProjectorError(error: SessionProjectorError): void {
 		this.errorContainer.disposeChildren();
 		this.errorContainer.addChild(new ErrorBannerComponent(projectorErrorText(error)));
 		this.editor.disableSubmit = true;
+		this.ui.requestRender();
 	}
 
 	#setStatus(text: string): void {
 		this.statusContainer.disposeChildren();
 		this.statusContainer.addChild(new Text(theme.fg("dim", text), 1, 0));
+		this.ui.requestRender();
 	}
 
 	#appendUserRow(inputId: string, text: string): void {
@@ -429,6 +432,7 @@ export class BreadboardInteractiveSessionController {
 			case "duplicate":
 				break;
 		}
+		this.ui.requestRender();
 	}
 
 	#releaseSubmission(turnId: string): void {

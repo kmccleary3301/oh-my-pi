@@ -53,6 +53,7 @@ COPY --parents \
     tsconfig.base.json tsconfig.json \
     Cargo.toml Cargo.lock rust-toolchain.toml \
     packages/*/package.json \
+    packages/coding-agent/vendor/breadboard-sdk-0.2.2.tgz \
     packages/tsconfig.workspace.json \
     python/robomp/web/package.json \
     crates/*/Cargo.toml \
@@ -173,6 +174,7 @@ COPY --parents \
     patches/*.patch \
     tsconfig.base.json tsconfig.json \
     packages/*/package.json \
+    packages/coding-agent/vendor/breadboard-sdk-0.2.2.tgz \
     packages/tsconfig.workspace.json \
     python/robomp/web/package.json \
     /pi/

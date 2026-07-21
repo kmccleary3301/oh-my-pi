@@ -185,24 +185,62 @@ const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
 
-const libsystem = dlopen("/usr/lib/libSystem.B.dylib", {
-	flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-	openat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-	renameat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
-	unlinkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
-	__error: { args: [], returns: FFIType.ptr },
-});
+function loadNativeSystem() {
+	const symbols = {
+		flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+		openat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+		renameat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+		unlinkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+	} as const;
+	if (process.platform === "darwin") {
+		const library = dlopen("/usr/lib/libSystem.B.dylib", {
+			...symbols,
+			__error: { args: [], returns: FFIType.ptr },
+		});
+		return {
+			flock: library.symbols.flock,
+			openat: library.symbols.openat,
+			renameat: library.symbols.renameat,
+			unlinkat: library.symbols.unlinkat,
+			errnoPointer: library.symbols.__error,
+		};
+	}
+	if (process.platform === "linux") {
+		const library = dlopen("libc.so.6", {
+			...symbols,
+			__errno_location: { args: [], returns: FFIType.ptr },
+		});
+		return {
+			flock: library.symbols.flock,
+			openat: library.symbols.openat,
+			renameat: library.symbols.renameat,
+			unlinkat: library.symbols.unlinkat,
+			errnoPointer: library.symbols.__errno_location,
+		};
+	}
+	return null;
+}
 
-const libproc = dlopen("/usr/lib/libproc.dylib", {
-	proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
-});
+const nativeSystem = loadNativeSystem();
+
+function requireNativeSystem(): NonNullable<typeof nativeSystem> {
+	if (nativeSystem === null) throw new Error(`Local authority storage is unsupported on ${process.platform}`);
+	return nativeSystem;
+}
+
+const libproc =
+	process.platform === "darwin"
+		? dlopen("/usr/lib/libproc.dylib", {
+				proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+			})
+		: null;
 
 function endpointKey(endpoint: string): string {
 	return createHash("sha256").update(endpoint).digest("hex");
 }
 
 function darwinProcessStartToken(pid: number): string | null {
-	if (process.platform !== "darwin" || !Number.isSafeInteger(pid) || pid < 1) return null;
+	if (libproc === null || !Number.isSafeInteger(pid) || pid < 1) return null;
 	const info = new Uint8Array(136);
 	const size = libproc.symbols.proc_pidinfo(pid, 3, 0, ptr(info), info.byteLength);
 	const view = new DataView(info.buffer);
@@ -332,7 +370,7 @@ function isErrno(error: unknown, code: string): boolean {
 }
 
 function systemError(operation: string, name: string): NodeJS.ErrnoException {
-	const pointer = libsystem.symbols.__error();
+	const pointer = requireNativeSystem().errnoPointer();
 	if (pointer === null) throw new Error(`${operation} failed without errno for ${name}`);
 	const errno = new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true);
 	const error = new Error(`${operation} failed for ${name}`) as NodeJS.ErrnoException;
@@ -636,7 +674,7 @@ export class LocalAuthorityStore {
 		await this.#assertRootIdentity();
 		const nameBuffer = cPath(name);
 		const rootFd = this.#rootFd();
-		const fd = Number(libsystem.symbols.openat(rootFd, ptr(nameBuffer), flags, mode));
+		const fd = Number(requireNativeSystem().openat(rootFd, ptr(nameBuffer), flags, mode));
 		if (fd < 0) throw systemError(`openat(fd=${rootFd},flags=${flags},mode=${mode})`, name);
 		try {
 			if (createdMode !== undefined) fchmodSync(fd, createdMode);
@@ -655,7 +693,7 @@ export class LocalAuthorityStore {
 		await this.#assertRootIdentity();
 		const fromBuffer = cPath(from);
 		const toBuffer = cPath(to);
-		if (Number(libsystem.symbols.renameat(this.#rootFd(), ptr(fromBuffer), this.#rootFd(), ptr(toBuffer))) !== 0) {
+		if (Number(requireNativeSystem().renameat(this.#rootFd(), ptr(fromBuffer), this.#rootFd(), ptr(toBuffer))) !== 0) {
 			throw systemError("renameat", from);
 		}
 		await this.#assertRootIdentity();
@@ -666,7 +704,7 @@ export class LocalAuthorityStore {
 		await this.seams.beforeUnlink?.(join(this.root, name));
 		await this.#assertRootIdentity();
 		const nameBuffer = cPath(name);
-		if (Number(libsystem.symbols.unlinkat(this.#rootFd(), ptr(nameBuffer), 0)) !== 0) {
+		if (Number(requireNativeSystem().unlinkat(this.#rootFd(), ptr(nameBuffer), 0)) !== 0) {
 			const error = systemError("unlinkat", name);
 			if (!force || !isErrno(error, "ENOENT")) throw error;
 		}
@@ -735,7 +773,7 @@ export class LocalAuthorityStore {
 					throw new LocalAuthorityStoreError("lock_integrity", "authority lock ownership or link integrity is invalid");
 				}
 				fchmodSync(fd, 0o600);
-				acquired = libsystem.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0;
+				acquired = requireNativeSystem().flock(fd, LOCK_EX | LOCK_NB) === 0;
 				if (!acquired) {
 					if (this.#now() - started >= timeoutMs) throw new LocalAuthorityStoreError("lock_timeout", "authority lock could not be acquired");
 				} else {
@@ -765,7 +803,7 @@ export class LocalAuthorityStore {
 					return result;
 				}
 			} finally {
-				if (acquired) libsystem.symbols.flock(fd, LOCK_UN);
+				if (acquired) requireNativeSystem().flock(fd, LOCK_UN);
 				closeSync(fd);
 			}
 			await this.#sleep(delay);

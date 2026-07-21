@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it, spyOn } from "bun:test";
 import {
 	type CancellationReceipt,
 	type CancellationRequestId,
@@ -227,11 +227,15 @@ describe("BreadboardInteractiveSessionController", () => {
 				event("turn_completed", 6, ExactEmptyPayload.value),
 			],
 		});
+		const requestRender = spyOn(controller.ui, "requestRender");
+		requestRender.mockClear();
 		const observing = controller.observe();
 		await transport.eventsDelivered;
 		expect(controller.assistantRows.size).toBe(1);
 		expect([...controller.assistantRows.values()][0]?.text).toBe("hello");
 		expect([...controller.assistantRows.values()][0]?.finalized).toBe(true);
+		expect(requestRender).toHaveBeenCalled();
+		requestRender.mockRestore();
 		await controller.close();
 		await observing;
 	});
