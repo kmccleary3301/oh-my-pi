@@ -7,6 +7,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { fetchCodexModels } from "@oh-my-pi/pi-catalog/discovery/codex";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
+import { openaiCodexModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/special";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
 describe("Codex model discovery", () => {
@@ -98,6 +99,82 @@ describe("Codex model discovery", () => {
 		expect(terra).toMatchObject({ preferWebsockets: true, useResponsesLite: true });
 		const legacy = result?.models.find(model => model.id === "gpt-5.5");
 		expect(legacy?.useResponsesLite).toBeUndefined();
+	});
+
+	it("falls back to the 372K window for GPT-5.6 SKUs when upstream omits context_window (#5705)", async () => {
+		const fetchFn: typeof fetch = Object.assign(
+			async () =>
+				new Response(
+					JSON.stringify({
+						models: [
+							{
+								slug: "gpt-5.6-sol",
+								display_name: "GPT-5.6-Sol",
+								default_reasoning_level: "medium",
+								supported_reasoning_levels: ["low", "medium", "high"],
+								input_modalities: ["text", "image"],
+								supported_in_api: true,
+							},
+							{
+								slug: "gpt-5.5",
+								display_name: "GPT-5.5",
+								default_reasoning_level: "high",
+								supported_reasoning_levels: ["low", "high"],
+								input_modalities: ["text"],
+								supported_in_api: true,
+							},
+						],
+					}),
+				),
+			{ preconnect() {} },
+		);
+		const result = await fetchCodexModels({
+			accessToken: "test-token",
+			baseUrl: "https://codex.example/backend-api",
+			clientVersion: "0.99.0",
+			fetchFn,
+		});
+
+		const sol = result?.models.find(model => model.id === "gpt-5.6-sol");
+		expect(sol?.contextWindow).toBe(372_000);
+		const legacy = result?.models.find(model => model.id === "gpt-5.5");
+		expect(legacy?.contextWindow).toBe(272_000);
+	});
+
+	it("uses the discovered account catalog as authoritative", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-codex-authoritative-"));
+		const staticOnlyModel: ModelSpec<"openai-codex-responses"> = {
+			id: "unsupported-static",
+			name: "Unsupported static model",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		const discoveredModel: ModelSpec<"openai-codex-responses"> = {
+			...staticOnlyModel,
+			id: "account-supported",
+			name: "Account-supported model",
+		};
+		try {
+			const result = await resolveProviderModels(
+				{
+					...openaiCodexModelManagerOptions(),
+					staticModels: [staticOnlyModel],
+					cacheDbPath: path.join(tempDir, "models.db"),
+					fetchDynamicModels: async () => [discoveredModel],
+				},
+				"online",
+			);
+
+			expect(result.models.map(model => model.id)).toEqual(["account-supported"]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("ignores pre-V2 Codex discovery cache rows", async () => {

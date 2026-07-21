@@ -7,7 +7,7 @@ const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
 
 /**
- * Adaptive ("smart") `job` poll-wait ladder (ms). A tight poll loop climbs
+ * Adaptive ("smart") `hub` poll-wait ladder (ms). A tight poll loop climbs
  * these rungs so each immediate re-poll backs off and stops spending turns on
  * "still running" frames; the floor (first rung) is the shortest wait and the
  * top rung is the longest a smart poll will ever block. Only used when
@@ -37,6 +37,8 @@ export interface AsyncJob {
 	promise: Promise<void>;
 	resultText?: string;
 	errorText?: string;
+	/** Latest tool-render details reported by the running job. */
+	latestDetails?: Record<string, unknown>;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "Main",
 	 * "AuthLoader"). Used by scoped cancel/list APIs so a subagent's teardown
@@ -205,6 +207,7 @@ export class AsyncJobManager {
 		};
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
+			if (details) job.latestDetails = details;
 			if (!options?.onProgress) return;
 			try {
 				await options.onProgress(text, details);
@@ -327,7 +330,7 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Compute the next adaptive ("smart") wait (ms) for a blocking `job` poll by
+	 * Compute the next adaptive ("smart") wait (ms) for a blocking `hub` wait by
 	 * the given owner. Consecutive polls — those starting within
 	 * POLL_ESCALATION_RESET_MS of the previous poll returning — climb
 	 * POLL_WAIT_LADDER_MS so a tight wait loop backs off; a longer gap means the

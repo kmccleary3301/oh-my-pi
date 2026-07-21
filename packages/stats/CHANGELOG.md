@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [17.0.6] - 2026-07-20
+
+### Changed
+
+- Clarified overview token accounting by separating uncached input from cache reads and showing the conversation-token total used by the agent breakdown.
+
+## [17.0.5] - 2026-07-18
+
+### Fixed
+
+- Fixed an EADDRINUSE error by properly reusing the live stats dashboard on the requested port and reclaiming stale listeners (#5970).
+
+## [17.0.2] - 2026-07-17
+
+### Fixed
+
+- Fixed the Recent Errors list to honor the selected dashboard time range before returning the newest 50 failures.
+
 ## [16.4.7] - 2026-07-12
 
 ### Fixed

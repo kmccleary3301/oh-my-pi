@@ -8,6 +8,7 @@ Settings are stored as plain YAML mappings. Every key, its type, default, and en
 - For custom model definitions in `models.yml`, see [Models](./models.md).
 - For instruction files discovered into the agent context (`AGENTS.md`, `.omp/`, etc.), see [Context files](./context-files.md).
 - For the full catalog of environment variables, see [Environment variables](./environment-variables.md).
+- For prompt words that activate specialized per-turn behavior, see [Magic keywords](./magic-keywords.md).
 
 ## Where settings live
 
@@ -121,6 +122,7 @@ Environment variables are **not** a single settings layer. Each is read by the f
 | `OMP_AUTH_BROKER_URL` | `auth.broker.url` | Env value takes precedence over config. |
 | `OMP_AUTH_BROKER_TOKEN` | `auth.broker.token` | Env value takes precedence over config. |
 | `PI_CODING_AGENT_DIR` | (relocates agent dir) | Moves `config.yml`, `agent.db`, and the whole agent base. |
+| `PI_CONFIG_FILES` | CLI config overlays | Platform path-list (`:` on Unix, `;` on Windows); files load in order before `--config` overlays. |
 
 Provider API keys are resolved separately (stored auth, OAuth, `models.yml`, environment, and `.env` files); see [Providers](./providers.md) and the full [Environment variables](./environment-variables.md) reference.
 
@@ -215,6 +217,10 @@ Use `--config` for a temporary layer that should not persist:
 omp --config ./local/ci-settings.yml "check this failure"
 omp --config ./base.yml --config ./experiment.yml "try this model"
 ```
+
+`--config` is accepted by the default launch command, `acp`, and `models`.
+
+Wrappers may instead set `PI_CONFIG_FILES` to a platform-delimited path list (`:` on Unix, `;` on Windows). Environment overlays load in listed order before explicit `--config` overlays.
 
 Overlay paths are resolved relative to the process working directory (and `~` is expanded). Each overlay must parse as a YAML mapping; a missing file, invalid YAML, or a top-level array/scalar is a hard error — it does **not** silently fall back to lower-precedence settings.
 
@@ -432,7 +438,6 @@ tools:
   approval:
     bash: prompt
     edit: allow
-  discoveryMode: auto
   maxTimeout: 0
   intentTracing: true
 ```
@@ -441,8 +446,6 @@ tools:
 |---|---|---|---|
 | `tools.approvalMode` | enum | `yolo` | `always-ask` (auto-approve read-only), `write` (auto-approve read + workspace-write), `yolo` (auto-approve all tiers). `--approval-mode` and `--auto-approve`/`--yolo` override per run. |
 | `tools.approval` | record | `{}` | Per-tool policy keyed by tool name; each value is `allow`, `deny`, or `prompt`. e.g. `omp config set tools.approval '{"bash":"prompt"}'`. |
-| `tools.discoveryMode` | enum | `auto` | `auto`, `off`, `mcp-only`, `all`. Controls dynamic tool discovery. |
-| `tools.essentialOverride` | array | `[]` | Tool names kept available even when tools are narrowed. |
 | `tools.maxTimeout` | number | `0` | Max tool runtime in seconds; `0` = no cap. |
 | `tools.intentTracing` | boolean | `true` | Record per-call intent strings. |
 | `tools.outputMaxColumns` | number | `768` | Per-line byte cap for streaming output; `0` disables. |

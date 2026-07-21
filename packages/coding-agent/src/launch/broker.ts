@@ -3,7 +3,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
-import { isEexist, isEnoent, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
+import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText } from "@oh-my-pi/pi-utils";
+import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
 import { workerEnvFromParent } from "../subprocess/worker-client";
 import { daemonBrokerEndpoint } from "./paths";
@@ -24,6 +25,7 @@ import {
 	parseDaemonSpec,
 	parseDaemonWireRequest,
 } from "./protocol";
+import { resolveDaemonSpawnOptions } from "./spawn-options";
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -36,6 +38,10 @@ const PID_FILE = "broker.pid";
 const META_FILE = "meta.json";
 const LOG_FILE = "output.log";
 const PREVIOUS_LOG_FILE = "output.previous.log";
+const DAEMON_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
+	platform: process.platform,
+	hostHasInheritableConsole: hostHasInheritableConsole(),
+});
 
 const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 	SIGINT: os.constants.signals.SIGINT,
@@ -83,9 +89,6 @@ interface DaemonLogRead {
 
 function quoteShellArg(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-function quoteCmdArg(value: string): string {
-	return `"${value.replaceAll('"', '""')}"`;
 }
 
 function terminalState(state: DaemonSnapshot["state"]): boolean {
@@ -434,6 +437,13 @@ class DaemonBroker {
 		if (spec.detached && spec.pty) {
 			throw new Error("A detached daemon cannot allocate a PTY");
 		}
+		if (
+			spec.pty &&
+			process.platform === "win32" &&
+			[".bat", ".cmd"].includes(path.extname(spec.application).toLowerCase())
+		) {
+			throw new Error('Windows batch files require application "cmd.exe" with the batch path after "/c"');
+		}
 		const existing = this.#records.get(spec.name);
 		if (existing) await this.#refreshDetached(existing);
 		if (existing && !terminalState(existing.snapshot.state)) {
@@ -520,53 +530,60 @@ class DaemonBroker {
 	}
 
 	async #launchPty(record: ManagedDaemon, generation: number): Promise<void> {
-		const pidPath = path.join(record.dir, "process.pid");
-		await fs.rm(pidPath, { force: true });
-		const argv = [record.spec.application, ...record.spec.args];
-		const command =
-			process.platform === "win32"
-				? argv.map(quoteCmdArg).join(" ")
-				: [`printf '%s' "$$" > ${quoteShellArg(pidPath)}`, `exec ${argv.map(quoteShellArg).join(" ")}`].join("; ");
 		const session = new PtySession();
 		record.pty = session;
-		const shell = process.platform === "win32" ? process.env.COMSPEC : process.env.SHELL;
-		void session
-			.start(
-				{
-					command,
-					cwd: record.spec.cwd,
-					env: workerEnvFromParent({ TERM: "xterm-256color", ...record.spec.env }),
-					cols: DAEMON_PTY_COLUMNS,
-					rows: DAEMON_PTY_ROWS,
-					shell,
-				},
-				(error, chunk) => {
-					if (generation !== record.generation) return;
-					if (error) record.log?.append(`PTY output error: ${error.message}\n`);
-					if (chunk) this.#onOutput(record, generation, chunk);
-				},
-			)
-			.then(result => this.#onPtyExit(record, generation, result))
-			.catch(error =>
-				this.#settle(record, generation, undefined, error instanceof Error ? error.message : String(error)),
-			);
-
-		if (process.platform === "win32") return;
-		const deadline = Date.now() + 5_000;
-		const pidFile = Bun.file(pidPath);
-		while (Date.now() < deadline && generation === record.generation) {
-			try {
-				const pid = Number.parseInt((await pidFile.text()).trim(), 10);
-				if (Number.isSafeInteger(pid) && pid > 0) {
-					record.snapshot.pid = pid;
-					this.#persist(record);
-					return;
-				}
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
+		const options = {
+			cwd: record.spec.cwd,
+			env: workerEnvFromParent({ TERM: "xterm-256color", ...record.spec.env }),
+			cols: DAEMON_PTY_COLUMNS,
+			rows: DAEMON_PTY_ROWS,
+		};
+		const onChunk = (error: Error | null, chunk: string): void => {
+			if (generation !== record.generation) return;
+			if (error) record.log?.append(`PTY output error: ${error.message}\n`);
+			if (chunk) this.#onOutput(record, generation, chunk);
+		};
+		const started = Promise.withResolvers<number | undefined>();
+		const onStart = (error: Error | null, pid: number): void => {
+			if (error) {
+				record.log?.append(`PTY startup callback failed: ${error.message}\n`);
+				started.resolve(undefined);
+				return;
 			}
-			if (terminalState(record.snapshot.state)) return;
-			await Bun.sleep(20);
+			started.resolve(Number.isSafeInteger(pid) && pid > 0 ? pid : undefined);
+		};
+		let run: Promise<PtyRunResult>;
+		if (process.platform === "win32") {
+			run = session.startArgv(
+				{
+					application: record.spec.application,
+					args: record.spec.args,
+					...options,
+				},
+				onChunk,
+				onStart,
+			);
+		} else {
+			const argv = [record.spec.application, ...record.spec.args];
+			const command = `exec ${argv.map(quoteShellArg).join(" ")}`;
+			const shell = procmgr.getShellConfig().shell;
+			run = session.start({ command, shell, ...options }, onChunk, onStart);
+		}
+		void run.then(
+			async result => {
+				await this.#onPtyExit(record, generation, result);
+				started.resolve(undefined);
+			},
+			async error => {
+				await this.#settle(record, generation, undefined, error instanceof Error ? error.message : String(error));
+				started.resolve(undefined);
+			},
+		);
+
+		const pid = await started.promise;
+		if (pid !== undefined && generation === record.generation) {
+			record.snapshot.pid = pid;
+			this.#persist(record);
 		}
 	}
 
@@ -577,7 +594,7 @@ class DaemonBroker {
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
-			detached: true,
+			...DAEMON_SPAWN_OPTIONS,
 		});
 		record.process = process;
 		record.input = process.stdin;
@@ -600,7 +617,7 @@ class DaemonBroker {
 				cwd: record.spec.cwd,
 				env: workerEnvFromParent(record.spec.env),
 				stdio: ["ignore", output.fd, output.fd],
-				detached: true,
+				...DAEMON_SPAWN_OPTIONS,
 			});
 			record.process = process;
 			record.snapshot.pid = process.pid;

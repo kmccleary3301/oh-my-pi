@@ -231,6 +231,30 @@ function hasBillableCost(cost: ModelSpec["cost"]): boolean {
 	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
 }
 
+function applyUmansPricingFallback(models: readonly ModelSpec[], modelsDevModels: readonly ModelSpec[]): ModelSpec[] {
+	const paygCosts = new Map<string, ModelSpec["cost"]>();
+	for (const model of modelsDevModels) {
+		if (model.provider === "umans" && hasBillableCost(model.cost)) {
+			paygCosts.set(model.id, model.cost);
+		}
+	}
+
+	// The public endpoint exposes this technical alias for Umans Flash, but
+	// models.dev publishes pricing only for the recommended `umans-flash` id.
+	const flashCost = paygCosts.get("umans-flash");
+	if (flashCost) {
+		paygCosts.set("umans-qwen3.6-35b-a3b", flashCost);
+	}
+
+	return models.map(model => {
+		if (model.provider !== "umans" || hasBillableCost(model.cost)) {
+			return model;
+		}
+		const cost = paygCosts.get(model.id);
+		return cost ? { ...model, cost: { ...cost } } : model;
+	});
+}
+
 function applyCodexPricingFallback(models: readonly ModelSpec[]): ModelSpec[] {
 	const openAIModels = new Map(
 		models
@@ -524,19 +548,25 @@ async function generateModels() {
 	allModels.push(...buildFireworksFastSeed());
 
 	const specialDiscoverySources = [
-		{ label: "Antigravity", fetch: fetchAntigravityModels },
-		{ label: "Codex", fetch: fetchCodexDiscoveryModels },
+		{ label: "Antigravity", providerId: "google-antigravity", authoritative: false, fetch: fetchAntigravityModels },
+		{ label: "Codex", providerId: "openai-codex", authoritative: true, fetch: fetchCodexDiscoveryModels },
 	] as const;
 	const specialDiscoveries = await Promise.all(
 		specialDiscoverySources.map(async source => ({
 			label: source.label,
+			providerId: source.providerId,
+			authoritative: source.authoritative,
 			models: await source.fetch(),
 		})),
 	);
+	const authoritativeSpecialDiscoveryProviders = new Set<string>();
 	for (const discovery of specialDiscoveries) {
 		if (discovery.models.length > 0) {
 			console.log(`Added ${discovery.models.length} models from ${discovery.label} discovery`);
 			allModels.push(...discovery.models);
+			if (discovery.authoritative) {
+				authoritativeSpecialDiscoveryProviders.add(discovery.providerId);
+			}
 		}
 	}
 
@@ -563,6 +593,7 @@ async function generateModels() {
 				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
 				!RETIRED_PROVIDERS.has(model.provider) &&
 				!authoritativeCatalogProviders.has(model.provider) &&
+				!authoritativeSpecialDiscoveryProviders.has(model.provider) &&
 				!modelsDevSnapshotExcludedProviders.has(model.provider)
 			) {
 				allModels.push(model);
@@ -571,6 +602,7 @@ async function generateModels() {
 	}
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
+	allModels = applyUmansPricingFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyKimiMaxTokensCap(allModels);

@@ -84,8 +84,16 @@ export declare class Process {
 /** Stateful PTY session for interactive stdin/stdout passthrough. */
 export declare class PtySession {
   constructor()
-  /** Start a PTY command and stream output chunks via callback. */
-  start(options: PtyStartOptions, onChunk?: ((error: Error | null, chunk: string) => void) | undefined | null): Promise<PtyRunResult>
+  /**
+   * Start a shell command, stream output chunks, and report the spawned child
+   * PID.
+   */
+  start(options: PtyStartOptions, onChunk?: ((error: Error | null, chunk: string) => void) | undefined | null, onStart?: ((error: Error | null, pid: number) => void) | undefined | null): Promise<PtyRunResult>
+  /**
+   * Start an executable with separate arguments, stream output chunks, and
+   * report the spawned child PID.
+   */
+  startArgv(options: PtyArgvStartOptions, onChunk?: ((error: Error | null, chunk: string) => void) | undefined | null, onStart?: ((error: Error | null, pid: number) => void) | undefined | null): Promise<PtyRunResult>
   /** Write raw input bytes to PTY stdin. */
   write(data: string): void
   /** Resize the active PTY. */
@@ -170,7 +178,7 @@ export declare function __ompInstallTokioRuntime(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV16_5_0(): void
+export declare function __piNativesV17_0_7(): void
 
 /**
  * Apply ast-grep rewrite rules to matching files; honors `dryRun` and returns
@@ -1248,6 +1256,26 @@ export interface ProcessWaitOptions {
   timeoutMs?: number
   /** Abort signal for cancelling the wait. */
   signal?: unknown
+}
+
+/** Options for running an executable and argument vector in a PTY session. */
+export interface PtyArgvStartOptions {
+  /** Executable name or path. */
+  application: string
+  /** Arguments passed directly to the executable. */
+  args: Array<string>
+  /** Working directory for command execution. */
+  cwd?: string
+  /** Environment variables for this command. */
+  env?: Record<string, string>
+  /** Timeout in milliseconds before cancelling. */
+  timeoutMs?: number
+  /** Abort signal for cancelling the operation. */
+  signal?: unknown
+  /** PTY column count. */
+  cols?: number
+  /** PTY row count. */
+  rows?: number
 }
 
 /** Result of a PTY command run. */

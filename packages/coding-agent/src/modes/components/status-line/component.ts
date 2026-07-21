@@ -11,13 +11,13 @@ import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/activ
 import { type ActiveRepoContext, resolveActiveRepoContextSync } from "../../../utils/active-repo-context";
 import * as git from "../../../utils/git";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
+import { calculateTokensPerSecond } from "../../../utils/token-rate";
 import { sanitizeStatusText } from "../../shared";
 import { theme } from "../../theme/theme";
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { getPreset } from "./presets";
 import { renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
-import { calculateTokensPerSecond } from "./token-rate";
 import type {
 	CollabStatus,
 	EffectiveStatusLineSettings,
@@ -273,9 +273,16 @@ export class StatusLineComponent implements Component {
 	 */
 	#activeMeters: WeakMap<AgentSession, ActiveMeter> = new WeakMap();
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
-	#loopModeStatus: { enabled: boolean } | null = null;
+	#loopModeStatus: SegmentContext["loopMode"] = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#vibeModeStatus: { enabled: boolean } | null = null;
+	/**
+	 * Injected aggregator that returns the aggregate tok/s of this session's
+	 * live vibe worker sessions, or null when no workers are streaming. Kept as
+	 * a callback so the render layer doesn't import the heavy vibe/task
+	 * dependency graph; interactive-mode wires it to VibeSessionRegistry.
+	 */
+	#vibeWorkerTokenRate: (() => number | null) | null = null;
 	#collabStatus: CollabStatus | null = null;
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
@@ -496,7 +503,7 @@ export class StatusLineComponent implements Component {
 		this.#planModeStatus = status ?? null;
 	}
 
-	setLoopModeStatus(status: { enabled: boolean } | undefined): void {
+	setLoopModeStatus(status: NonNullable<SegmentContext["loopMode"]> | undefined): void {
 		this.#loopModeStatus = status ?? null;
 	}
 
@@ -506,6 +513,17 @@ export class StatusLineComponent implements Component {
 
 	setVibeModeStatus(status: { enabled: boolean } | undefined): void {
 		this.#vibeModeStatus = status ?? null;
+	}
+
+	/**
+	 * Inject the aggregator that returns the aggregate tok/s of this session's
+	 * live vibe worker sessions (null when no workers are streaming). Wired by
+	 * interactive-mode, which owns the VibeSessionRegistry coupling, so the
+	 * render layer stays off the heavy vibe/task dependency graph. Pass
+	 * `undefined` to clear.
+	 */
+	setVibeWorkerTokenRateProvider(provider: (() => number | null) | undefined): void {
+		this.#vibeWorkerTokenRate = provider ?? null;
 	}
 
 	setCollabStatus(status: CollabStatus | null): void {
@@ -747,6 +765,31 @@ export class StatusLineComponent implements Component {
 	}
 
 	#getTokensPerSecond(): number | null {
+		// Aggregate tok/s across the main session AND every live vibe worker.
+		// In vibe mode the director is often idle while workers stream, so the
+		// main session's own rate alone would show a stale/zero value while
+		// parallel work is actively generating tokens.
+		const workerRate = this.#getVibeWorkerTokensPerSecond();
+		if (workerRate !== null) {
+			// At least one worker is streaming — add the director's live rate
+			// only when it is itself streaming (a finalized last-turn rate would
+			// double-count and overstate throughput).
+			const mainRate = this.session.isStreaming ? calculateTokensPerSecond(this.session.state.messages, true) : 0;
+			return (mainRate ?? 0) + workerRate;
+		}
+
+		// No workers streaming — fall back to the main session's own rate with
+		// its sticky per-assistant-message cache so the badge doesn't flicker
+		// off in the brief gap between stream end and the finalized message.
+		return this.#getMainSessionTokensPerSecond();
+	}
+
+	/**
+	 * Main session's tok/s with sticky caching keyed on the last assistant
+	 * message timestamp. Preserves the pre-aggregation behavior when no vibe
+	 * workers are active.
+	 */
+	#getMainSessionTokensPerSecond(): number | null {
 		let lastAssistantTimestamp: number | null = null;
 		for (let i = this.session.state.messages.length - 1; i >= 0; i--) {
 			const message = this.session.state.messages[i];
@@ -776,11 +819,31 @@ export class StatusLineComponent implements Component {
 		return null;
 	}
 
+	/**
+	 * Aggregate tok/s across every live vibe worker session owned by this
+	 * session. Returns null when no workers are streaming (so the main
+	 * session's own rate shines through unchanged). The aggregation itself is
+	 * injected via {@link setVibeWorkerTokenRateProvider} to keep this render
+	 * layer off the heavy vibe/task dependency graph.
+	 */
+	#getVibeWorkerTokensPerSecond(): number | null {
+		return this.#vibeWorkerTokenRate?.() ?? null;
+	}
+
 	#getUsageContextKey(session: AgentSession): string {
 		const activeProvider = session.state.model?.provider ?? session.model?.provider ?? "";
 		if (!activeProvider) return "";
 		const identity = session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId);
-		return [activeProvider, identity?.accountId ?? "", identity?.email ?? "", identity?.projectId ?? ""].join("\0");
+		// orgId is part of the key: rotating between two same-email Anthropic
+		// subscriptions must invalidate the cached usage immediately instead of
+		// showing the previous org's quota for the rest of the cache TTL.
+		return [
+			activeProvider,
+			identity?.accountId ?? "",
+			identity?.email ?? "",
+			identity?.projectId ?? "",
+			identity?.orgId ?? "",
+		].join("\0");
 	}
 
 	/**
@@ -1325,10 +1388,8 @@ export class StatusLineComponent implements Component {
 			return [];
 		}
 
-		const sortedStatuses = Array.from(this.#hookStatuses.entries())
+		return Array.from(this.#hookStatuses.entries())
 			.sort(([a], [b]) => a.localeCompare(b))
-			.map(([, text]) => sanitizeStatusText(text));
-		const hookLine = sortedStatuses.join(" ");
-		return [truncateToWidth(hookLine, width)];
+			.map(([, text]) => truncateToWidth(sanitizeStatusText(text), width));
 	}
 }
