@@ -151,6 +151,23 @@ describe("AgentSession auto-compaction progress guard", () => {
 		};
 	}
 
+	function activateOngoingGoal(id: string): void {
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id,
+				objective: "finish the ongoing work",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+	}
+
 	/** Build a context-overflow assistant turn (input exceeds the 200k window). */
 	function overflowAssistant(content = [{ type: "text" as const, text: "" }]) {
 		return {
@@ -389,9 +406,9 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
-	it("auto-continues (no warning) when compaction creates headroom", async () => {
-		// The auto-continue path runs #scheduleAutoContinuePrompt → #promptWithMessage
-		// → agent.prompt. Stub both prompt and continue so no real agent loop runs.
+	it("does not auto-continue after compaction of a terminal text answer with no queued work", async () => {
+		// A successful threshold compaction must not reopen the primary loop after
+		// the model has already produced a terminal text answer.
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		// Residual context drops well under the threshold: real reduction happened.
@@ -411,14 +428,37 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await compactionDone;
 		await session.waitForIdle();
 
-		// Headroom was created, so the guard scheduled the agent-authored
-		// continuation prompt and stayed silent.
+		expect(promptSpy).not.toHaveBeenCalled();
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(0);
+	});
+
+	it("auto-continues after compaction while an active goal still needs work", async () => {
+		activateOngoingGoal("headroom");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const notices = collectNotices();
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
 	});
 
 	it("rebases the in-flight prompt snapshot so mid-run compaction is not misread as a dead-end", async () => {
+		activateOngoingGoal("in-flight-snapshot");
 		// Regression: the pending context snapshot is set once per prompt and
 		// lives for the whole run. A fresh compaction entry hides every earlier
 		// usage anchor from getContextBreakdown, which then fell back to the
@@ -1063,6 +1103,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 	}
 
 	it("auto-continues when residual sits at the recovery band but the trigger was already sub-band", async () => {
+		activateOngoingGoal("recovery-band");
 		// Regression for the #3412 review: when stale/tool-output pruning already
 		// dropped context under the recovery band BEFORE this pass, the trigger
 		// (postMaintenanceContextTokens) is itself sub-band. The old guard returned
@@ -1157,6 +1198,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 	});
 
 	it("auto-continues (no warning) when a shake rescue frees the oversized tail", async () => {
+		activateOngoingGoal("shake-rescue");
 		// The escalation contract: compaction cut at the only turn boundary but the
 		// kept tail (e.g. a huge tool result) still sits over the recovery band. The
 		// guard now runs an elide shake INSIDE that tail; once it frees enough, the
@@ -1241,6 +1283,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 	});
 
 	it("auto-continues (no warning) when the image-drop tier frees an image-only tail", async () => {
+		activateOngoingGoal("image-drop-rescue");
 		// Elide cannot touch image content (collectShakeRegions skips image-only
 		// tool results and user-message images), so the rescue's second tier drops
 		// attached images — the automated `/shake images` remedy — and re-tests
@@ -1294,5 +1337,100 @@ describe("AgentSession auto-compaction progress guard", () => {
 			.filter((e): e is CompactionEntry => e.type === "compaction")
 			.at(-1);
 		expect(compactionEntry?.warning).toBeUndefined();
+	});
+
+	it("re-prepares and compacts after a shake rescue frees the un-summarizable tail", async () => {
+		// Issue #4786: the kept region is a single oversized recent turn, so the
+		// first prepareCompaction returns undefined (nothing on the summarizable
+		// side) and summary compaction cannot start. The dead-end runs the elide
+		// shake rescue INSIDE the tail; once it frees enough, prepareCompaction is
+		// retried on the elided branch, now succeeds, and the pass falls through to
+		// a normal (hook-supplied) compaction that creates headroom and — with an
+		// active goal still needing work — auto-continues instead of looping the
+		// no-progress warning.
+		activateOngoingGoal("rescue-refit");
+		const branch = sessionManager.getBranch();
+		const firstKeptEntryId = branch[branch.length - 1].id;
+		if (!firstKeptEntryId) throw new Error("seeded entry has no id");
+		let shaken = false;
+		const preparation: compactionModule.CompactionPreparation = {
+			firstKeptEntryId,
+			messagesToSummarize: [{ role: "user", content: "old", timestamp: Date.now() }],
+			turnPrefixMessages: [],
+			recentMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 190000,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: session.settings.getGroup("compaction"),
+		};
+		vi.spyOn(compactionModule, "prepareCompaction").mockImplementation(() => (shaken ? preparation : undefined));
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		// Residual is over the band until the rescue elides the tail, then drops.
+		vi.spyOn(session, "getContextUsage").mockImplementation(() =>
+			shaken
+				? { tokens: 1000, contextWindow: 200000, percent: 0.5 }
+				: { tokens: 190000, contextWindow: 200000, percent: 95 },
+		);
+		const shakeSpy = vi.spyOn(session, "shake").mockImplementation(async () => {
+			shaken = true;
+			return { mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 160000, artifactId: "art-1" };
+		});
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end" && event.result) onCompactionDone();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(0);
+		const recovery = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes("dead-end recovery"));
+		expect(recovery.length).toBe(1);
+	});
+
+	it("still warns once when a no-preparation dead-end cannot be shaken", async () => {
+		// prepareCompaction returns undefined AND the oversized tail has nothing
+		// elide-eligible: the rescue frees nothing, prepareCompaction still returns
+		// undefined, and the guard MUST pause with a single no-progress warning
+		// (not loop) instead of re-firing on the same oversized tail.
+		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 190000, contextWindow: 200000, percent: 95 });
+		const shakeSpy = vi
+			.spyOn(session, "shake")
+			.mockResolvedValue({ mode: "elide", toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 });
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).not.toHaveBeenCalled();
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(1);
+		expect(noProgress[0].level).toBe("warning");
 	});
 });

@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added a per-message token estimation cache to optimize performance by reusing token counts for settled message history, with automatic cache invalidation on message mutation.
+
+### Changed
+
+- Improved tool execution control by making tool interruptibility resolvable per call, allowing side-effecting operations to complete while passive waits can yield to queued steering.
+
+## [17.0.2] - 2026-07-17
+
+### Fixed
+
+- Improved error visibility in interactive clients by surfacing provider stream failures through the assistant message lifecycle, preventing silent loading spinners.
+- Fixed an issue where Cursor provider contexts omitted host-supplied MCP tools from main and side-channel requests.
+
+## [17.0.0] - 2026-07-15
+
+### Breaking Changes
+
+- Replaced the irc, job, and launch tools with a unified hub tool.
+- Removed the tool discovery system (including the search-tool-bm25 tool) and its associated configuration settings (tools.discoveryMode, tools.essentialOverride, mcp.discoveryMode, and mcp.discoveryDefaultServers).
+- Removed the resolve tool; plan approval and preview actions now use writes to the xd://propose virtual device path.
+
+### Added
+
+- Introduced the xd:// virtual device protocol for mounting tools as URLs readable/writable via read/write tools, configurable via the new tools.xdev setting (defaults to true).
+- Added the hub tool, consolidating agent peer messaging, background job control, and supervised long-running processes.
+- Added the edit.enforceSeenLines configuration setting (defaults to false) to optionally reject edits on lines that have not been fully displayed.
+- Added the ToolLoadMode type and an optional satisfies predicate to SoftToolRequirement to support compliance checks against specific invocation shapes (such as writing to a virtual device path).
+
+## [16.5.2] - 2026-07-14
+
+### Fixed
+
+- Improved session deadline abort signals to carry structured cancellation reasons, enabling timeout-aware tools to correctly classify deadline cancellations.
+- Fixed an issue where completed tool executions were incorrectly marked as skipped (clobbering their actual results) if a user message was queued while the tool was in flight.
+
+## [16.5.1] - 2026-07-14
+
+### Fixed
+
+- Fixed compatibility with Copilot gpt-5.6 models by correcting token escaping in compaction summaries.
+
 ## [16.5.0] - 2026-07-13
 
 ### Added

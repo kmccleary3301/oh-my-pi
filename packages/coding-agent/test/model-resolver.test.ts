@@ -10,6 +10,7 @@ import {
 	parseModelString,
 	pickDefaultAvailableModel,
 	resolveAgentModelPatterns,
+	resolveAgentPrewalkPattern,
 	resolveAllowedModels,
 	resolveCliModel,
 	resolveModelFromString,
@@ -140,6 +141,54 @@ const mockMaxSuffixModels: Model<Api>[] = [
 		cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 8192,
+	}),
+	buildModel({
+		id: "coding-router:low",
+		name: "NanoGPT Coding Router Low",
+		api: "openai-completions",
+		provider: "nanogpt",
+		baseUrl: "https://nano-gpt.com/api/v1",
+		reasoning: true,
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+		},
+		input: ["text"],
+		cost: { input: 0.14, output: 0.28, cacheRead: 0.028, cacheWrite: 0 },
+		contextWindow: 128000,
+		maxTokens: 8192,
+	}),
+];
+
+// Sibling models where one id is a prefix of the other AND the longer id embeds
+// a thinking-tier token (`-highspeed` contains `high`). Regression fixture for
+// the fuzzy match swallowing a `:high` thinking suffix into the longer id.
+const mockThinkingSuffixSiblingModels: Model<"openai-completions">[] = [
+	buildModel({
+		id: "kimi-for-coding",
+		name: "K2.7 Code",
+		api: "openai-completions",
+		provider: "kimi-code",
+		baseUrl: "https://api.kimi.com/coding/v1",
+		reasoning: true,
+		thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32000,
+	}),
+	buildModel({
+		id: "kimi-for-coding-highspeed",
+		name: "K2.7 Code Highspeed",
+		api: "openai-completions",
+		provider: "kimi-code",
+		baseUrl: "https://api.kimi.com/coding/v1",
+		reasoning: true,
+		thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32000,
 	}),
 ];
 
@@ -462,12 +511,43 @@ describe("parseModelPattern", () => {
 			expect(result.warning).toBeUndefined();
 		});
 
+		test("fuzzy selectors preserve literal models ending in a thinking-level suffix", () => {
+			const result = parseModelPattern("router:low", mockMaxSuffixModels);
+			expect(result.model?.id).toBe("coding-router:low");
+			expect(result.thinkingLevel).toBeUndefined();
+			expect(result.explicitThinkingLevel).toBe(false);
+		});
+
 		test("literal model ids ending in auto win over the auto sentinel alias", () => {
 			const result = parseModelPattern("example/runtime:auto", mockAutoSuffixModels);
 			expect(result.model?.id).toBe("runtime:auto");
 			expect(result.thinkingLevel).toBeUndefined();
 			expect(result.explicitThinkingLevel).toBe(false);
 			expect(result.warning).toBeUndefined();
+		});
+
+		test("thinking suffix is stripped before fuzzy match, never absorbed into a longer sibling id", () => {
+			// `kimi-for-coding:high` must resolve to the standard model at high effort,
+			// not fuzzy-match `kimi-for-coding-highspeed` (issue #5151).
+			const result = parseModelPattern("kimi-code/kimi-for-coding:high", mockThinkingSuffixSiblingModels);
+			expect(result.model?.id).toBe("kimi-for-coding");
+			expect(result.thinkingLevel).toBe(Effort.High);
+			expect(result.explicitThinkingLevel).toBe(true);
+			expect(result.warning).toBeUndefined();
+		});
+
+		test("bare id thinking suffix is stripped before fuzzy match against a longer sibling", () => {
+			const result = parseModelPattern("kimi-for-coding:high", mockThinkingSuffixSiblingModels);
+			expect(result.model?.id).toBe("kimi-for-coding");
+			expect(result.thinkingLevel).toBe(Effort.High);
+			expect(result.explicitThinkingLevel).toBe(true);
+		});
+
+		test("the longer sibling still resolves exactly with its own thinking suffix", () => {
+			const result = parseModelPattern("kimi-code/kimi-for-coding-highspeed:high", mockThinkingSuffixSiblingModels);
+			expect(result.model?.id).toBe("kimi-for-coding-highspeed");
+			expect(result.thinkingLevel).toBe(Effort.High);
+			expect(result.explicitThinkingLevel).toBe(true);
 		});
 	});
 
@@ -736,6 +816,33 @@ describe("resolveModelRoleValue", () => {
 		expect(result.explicitThinkingLevel).toBe(true);
 	});
 });
+describe("resolveAgentPrewalkPattern", () => {
+	test("agent definition alone decides: true → default target, pattern → custom, false/absent → off", () => {
+		expect(resolveAgentPrewalkPattern({ agentPrewalk: true })).toBe("@smol");
+		expect(resolveAgentPrewalkPattern({ agentPrewalk: "@very-smol" })).toBe("@very-smol");
+		expect(resolveAgentPrewalkPattern({ agentPrewalk: false })).toBeUndefined();
+		expect(resolveAgentPrewalkPattern({})).toBeUndefined();
+	});
+
+	test("settings override wins over the agent definition", () => {
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "off", agentPrewalk: true })).toBeUndefined();
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "off", agentPrewalk: "@very-smol" })).toBeUndefined();
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "on", agentPrewalk: false })).toBe("@smol");
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "openai/gpt-4o", agentPrewalk: false })).toBe(
+			"openai/gpt-4o",
+		);
+	});
+
+	test("override 'on' keeps the agent's custom target when one is defined", () => {
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "on", agentPrewalk: "@very-smol" })).toBe("@very-smol");
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "on" })).toBe("@smol");
+	});
+
+	test("blank override falls through to the agent definition", () => {
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "  ", agentPrewalk: true })).toBe("@smol");
+		expect(resolveAgentPrewalkPattern({ settingsOverride: "", agentPrewalk: false })).toBeUndefined();
+	});
+});
 describe("resolveAgentModelPatterns", () => {
 	test("falls back to the active session model when @task is unset", () => {
 		const settings = Settings.isolated({
@@ -897,6 +1004,157 @@ describe("resolveCliModel", () => {
 		expect(result.error).toBeUndefined();
 		expect(result.model?.provider).toBe("openai");
 		expect(result.model?.id).toBe("gpt-4o");
+	});
+
+	test("resolves bare configured role names from --model", () => {
+		const registry = {
+			getAll: () => allModels,
+		};
+		const settings = Settings.isolated({
+			modelRoles: { task: "openai/gpt-4o" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openai");
+		expect(result.model?.id).toBe("gpt-4o");
+	});
+
+	test("resolves bare configured role names with thinking suffixes", () => {
+		const registry = {
+			getAll: () => allModels,
+		};
+		const settings = Settings.isolated({
+			modelRoles: { task: "anthropic/claude-sonnet-4-5" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task:high",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.id).toBe("claude-sonnet-4-5");
+		expect(result.thinkingLevel).toBe(Effort.High);
+		expect(result.configuredPatterns).toEqual(["anthropic/claude-sonnet-4-5:high"]);
+	});
+
+	test("preserves configured role fallback selectors for deferred resolution", () => {
+		const registry = {
+			getAll: () => allModels,
+		};
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: "openrouter/z-ai/glm-4.7@cerebras,anthropic/claude-sonnet-4-5",
+			},
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.configuredPatterns).toEqual(["openrouter/z-ai/glm-4.7@cerebras", "anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("reports when a configured role matches after unresolved candidates", () => {
+		const registry = {
+			getAll: () => allModels,
+		};
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: "runtime-provider/runtime-model,anthropic/claude-sonnet-4-5",
+			},
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model?.provider).toBe("anthropic");
+		expect(result.configuredPatternIndex).toBe(1);
+		expect(result.configuredPatterns).toEqual(["runtime-provider/runtime-model", "anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("does not fuzzy-match unresolved configured roles", () => {
+		const registry = {
+			getAll: () => allModels,
+		};
+		const settings = Settings.isolated({
+			modelRoles: { sonnet: "runtime-provider/runtime-model" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "sonnet",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.configuredPatterns).toEqual(["runtime-provider/runtime-model"]);
+		expect(result.error).toContain('Model "sonnet" not found');
+	});
+
+	test("keeps unknown --model names on the not-found path", () => {
+		const registry = {
+			getAll: () => allModels,
+		};
+
+		const result = resolveCliModel({
+			cliModel: "not-a-model",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain('Model "not-a-model" not found');
+	});
+
+	test("prefers an exact model name over a same-named configured role", () => {
+		const exactModel = buildModel({
+			id: "task",
+			name: "Task",
+			api: "anthropic-messages",
+			provider: "openai",
+			baseUrl: "https://api.openai.com",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 5, output: 15, cacheRead: 0.5, cacheWrite: 5 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+		});
+		const registry = {
+			getAll: () => [...allModels, exactModel],
+		};
+		const settings = Settings.isolated({
+			modelRoles: { task: "anthropic/claude-sonnet-4-5" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model).toBe(exactModel);
+		const suffixed = resolveCliModel({
+			cliModel: "task:high",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(suffixed.error).toBeUndefined();
+		expect(suffixed.model).toBe(exactModel);
+		expect(suffixed.thinkingLevel).toBe(Effort.High);
 	});
 
 	test("resolves configured custom, legacy, and default role aliases from --model", () => {

@@ -10,7 +10,7 @@ import type {
 	AgentToolUpdateCallback,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
-import type { Component } from "@oh-my-pi/pi-tui";
+import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 
@@ -19,6 +19,7 @@ import { normalizeToLF } from "../edit/normalize";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
+import { couldBecomeXdUrl, parseXdUrl } from "../internal-urls/xd-protocol";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
@@ -35,7 +36,7 @@ import {
 	writeArchive,
 } from "../utils/zip";
 import { routeWriteThroughBridge } from "./acp-bridge";
-import { truncateForPrompt } from "./approval";
+import { resolveToolTier, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -66,6 +67,8 @@ import {
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
 } from "./render-utils";
+import { dispatchReportIssueDevice, REPORT_ISSUE_DEVICE_NAME, renderReportIssueDeviceCall } from "./report-tool-issue";
+import { dispatchResolutionDevice, isResolutionDeviceName, renderResolutionDeviceCall } from "./resolve";
 import {
 	deleteRowByKey,
 	deleteRowByRowId,
@@ -78,32 +81,102 @@ import {
 } from "./sqlite-reader";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+import { renderXdevCall, renderXdevResult, type XdevDispatch } from "./xdev";
 
 const LOOSE_HASHLINE_HEADER_RE = /^\s*\[[^#\r\n]+#[^ \t\r\n]*\]\s*$/;
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
 
 const BULK_DIRECTIVE_RE = /^#?(\d+)\s*[:=]\s*(@ours|@theirs|@base|@both)$/;
+/**
+ * The head of a per-id directive line — `<id>:` / `<id>=` (optionally `#`-prefixed),
+ * regardless of whether its value is a valid `@side` token. Used only to sharpen the
+ * error message when a directive block is malformed (e.g. `15: some literal text`).
+ */
+const BULK_DIRECTIVE_HEAD_RE = /^#?\d+\s*[:=]/;
+
+function truncateDirectiveLine(line: string): string {
+	return line.length > 60 ? `${line.slice(0, 57)}…` : line;
+}
 
 /**
  * Parse `conflict://*` per-id directive content: every non-empty line must be
- * `<id>: @side` (also accepted: `#<id> = @side`). Returns `null` when the
- * content is not directive-shaped (→ uniform bulk mode); throws on duplicate
- * ids so a typo never silently drops a resolution.
+ * `<id>: @side` (also accepted: `#<id> = @side`), where `@side` is one of
+ * `@ours` / `@theirs` / `@base` / `@both`.
+ *
+ * Returns `null` only when NO line is directive-shaped (→ uniform bulk mode).
+ * Throws on duplicate ids, and — critically — on a *partial* directive block:
+ * content that mixes valid `<id>: @side` lines with lines that aren't. Without
+ * that guard a per-id write carrying any non-token value (a literal or
+ * multi-line replacement, e.g. `15: <multi-line content>`) fell through to
+ * uniform bulk mode, which pasted the raw directive text verbatim into every
+ * block and still reported success. Per-id bulk is token-only; literal or
+ * multi-line replacements must go through individual `conflict://<N>` writes.
  */
 function parseBulkDirectives(content: string): Map<number, string> | null {
 	const map = new Map<number, string>();
+	const stray: string[] = [];
+	let sawDirective = false;
 	for (const raw of content.split("\n")) {
 		const line = raw.trim();
 		if (line.length === 0) continue;
 		const match = line.match(BULK_DIRECTIVE_RE);
-		if (!match) return null;
+		if (!match) {
+			stray.push(line);
+			continue;
+		}
+		sawDirective = true;
 		const id = Number.parseInt(match[1], 10);
 		if (map.has(id)) {
 			throw new ToolError(`Bulk directive lists conflict #${id} twice — each id may appear once.`);
 		}
 		map.set(id, match[2]);
 	}
-	return map.size > 0 ? map : null;
+	// No directive lines at all → not a per-id block; caller uses uniform mode.
+	if (!sawDirective) return null;
+	if (stray.length > 0) {
+		const sample = stray[0]!;
+		const tokenHint = BULK_DIRECTIVE_HEAD_RE.test(sample)
+			? `Per-id bulk only accepts the tokens @ours/@theirs/@base/@both — one side per id, single line. `
+			: "";
+		throw new ToolError(
+			`Malformed \`conflict://*\` per-id block: ${stray.length} line(s) are not \`<id>: @side\` directives (first: \`${truncateDirectiveLine(sample)}\`). ` +
+				tokenHint +
+				`Literal or multi-line replacement content isn't supported in a per-id block — resolve those blocks with individual \`write({ path: "conflict://<N>", content })\` calls (you can issue several at once). ` +
+				`For a pure pick-a-side pass, make every non-empty line \`<id>: @ours\` (or @theirs/@base/@both).`,
+		);
+	}
+	return map;
+}
+
+/**
+ * Resolve per-id directives, preferring the pre-strip `raw` content and falling
+ * back to the hashline-stripped `stripped` content.
+ *
+ * Raw is preferred because the `<id>:` directive heads look exactly like
+ * hashline `LINE:` prefixes and would be eaten by stripping. When the two
+ * contents are identical (hashline mode off) a single parse decides everything,
+ * so a malformed-block error propagates straight through — the previous
+ * `?? parseBulkDirectives(...)` chain would have swallowed it and silently
+ * degraded to uniform bulk mode, pasting the raw directive text into every
+ * block. When they differ, a malformed raw block still defers to a *clean*
+ * stripped block, but otherwise surfaces its error rather than degrading.
+ */
+function resolveBulkDirectives(raw: string, stripped: string): Map<number, string> | null {
+	if (raw === stripped) return parseBulkDirectives(raw);
+	let rawResult: Map<number, string> | null;
+	try {
+		rawResult = parseBulkDirectives(raw);
+	} catch (rawError) {
+		let fallback: Map<number, string> | null = null;
+		try {
+			fallback = parseBulkDirectives(stripped);
+		} catch {
+			fallback = null;
+		}
+		if (fallback) return fallback;
+		throw rawError;
+	}
+	return rawResult ?? parseBulkDirectives(stripped);
 }
 
 const writeSchema = type({
@@ -122,6 +195,8 @@ export interface WriteToolDetails {
 	/** Absolute filesystem path the write resolved to. Used by the renderer to wrap
 	 * the (possibly cwd-relative) header path in an OSC 8 `file://` hyperlink. */
 	resolvedPath?: string;
+	/** Set when the write dispatched an `xd://` tool device; drives renderer delegation. */
+	xdev?: XdevDispatch;
 }
 
 /**
@@ -315,6 +390,36 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
 		// wrapped `[ssh://h/x#ABCD]` can't dodge scheme detection and the tier checks below.
 		const path = unwrapHashlineHeaderPath(rawPath);
+		// xd:// device writes execute the mounted tool — take its approval tier.
+		// The resolution devices (xd://resolve, xd://reject, xd://propose)
+		// finalize a staged, already-previewed action, so they stay at read tier.
+		const xdevTarget = parseXdUrl(path);
+		if (xdevTarget) {
+			if (xdevTarget.name === REPORT_ISSUE_DEVICE_NAME) return "write";
+			if (xdevTarget.name && isResolutionDeviceName(xdevTarget.name)) return "read";
+			const inst = xdevTarget.name ? this.session.xdevRegistry?.get(xdevTarget.name) : undefined;
+			if (!inst) return "exec";
+			// Decode the device JSON payload and evaluate the mounted tool's own
+			// approval (which may be argument-dependent, e.g. ast_edit is read-tier
+			// for internal-URL paths, debug is read-tier for inspection actions).
+			// Malformed JSON, non-object payloads, missing content, and approval
+			// functions that reject schema-invalid objects stay exec so the gate
+			// fails closed — the dispatch itself rejects invalid arguments too.
+			const rawContent = (args as Partial<WriteParams>).content;
+			if (typeof rawContent !== "string") return "exec";
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(rawContent);
+			} catch {
+				return "exec";
+			}
+			if (!isRecord(parsed)) return "exec";
+			try {
+				return resolveToolTier(inst, parsed);
+			} catch {
+				return "exec";
+			}
+		}
 		// Remote SSH writes open an outbound connection and run a remote shell —
 		// gate them like the exec-tier `ssh` tool, ahead of the handler-write
 		// logic. Substring match also covers selector-suffixed targets.
@@ -716,7 +821,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// winner — one call instead of one write per conflict. Parsed from the
 		// PRE-strip content: hashline prefix stripping would otherwise eat the
 		// `<id>: ` heads as echoed line numbers.
-		const directives = parseBulkDirectives(rawContent) ?? parseBulkDirectives(replacementContent);
+		const directives = resolveBulkDirectives(rawContent, replacementContent);
 		if (directives) {
 			const known = new Set(allEntries.map(entry => entry.id));
 			const unknown = [...directives.keys()].filter(id => !known.has(id));
@@ -887,20 +992,75 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
 				const handler = internalRouter.getHandler(scheme);
 				if (handler?.write) {
-					// Handler-owned writes (vault:// notes, host URIs) mutate user
-					// data outside the local sandbox — plan mode must reject them.
-					enforcePlanModeWrite(this.session, path, { op: "update" });
-					emitWriteProgress(onUpdate, cleanContent, path);
-					await handler.write(parsed, cleanContent, { cwd: this.session.cwd, signal });
+					// Handler-owned writes mutate user data outside the local
+					// sandbox. xd:// dispatches retain each wrapped tool's tier.
+					if (scheme !== "xd") {
+						enforcePlanModeWrite(this.session, path, { op: "update" });
+						emitWriteProgress(onUpdate, cleanContent, path);
+					}
+					let xdResult: AgentToolResult<WriteToolDetails> | undefined;
+					await internalRouter.write(path, cleanContent, {
+						cwd: this.session.cwd,
+						signal,
+						xd: {
+							write: async (name, deviceContent) => {
+								if (name === REPORT_ISSUE_DEVICE_NAME) {
+									const { result, xdev } = await dispatchReportIssueDevice(this.session, deviceContent);
+									xdResult = {
+										content: result.content,
+										details: { xdev },
+										isError: result.isError,
+										useless: result.useless,
+									};
+									return;
+								}
+								if (name && isResolutionDeviceName(name)) {
+									const { result, xdev } = await dispatchResolutionDevice(this.session, name, deviceContent);
+									xdResult = {
+										content: result.content,
+										details: { xdev },
+										isError: result.isError,
+										useless: result.useless,
+									};
+									return;
+								}
+								const registry = this.session.xdevRegistry;
+								if (!registry || registry.size === 0) {
+									throw new ToolError("xd:// is not mounted in this session.");
+								}
+								if (!name) {
+									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${registry.listing()}`);
+								}
+								const { result, xdev } = await registry.dispatch(
+									name,
+									deviceContent,
+									_toolCallId,
+									signal,
+									onUpdate as AgentToolUpdateCallback,
+									// The write tool's own gate just resolved approval at this
+									// device's tier (see #approval above) — mark it so a wrapped
+									// inner tool does not prompt a second time.
+									context ? { ...context, xdevApproved: true } : undefined,
+								);
+								xdResult = {
+									content: result.content,
+									details: { xdev },
+									isError: result.isError,
+									useless: result.useless,
+								};
+							},
+						},
+					});
+					if (xdResult) return xdResult;
 					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
 					if (stripped) {
 						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 					}
 					return { content: [{ type: "text", text: resultText }], details: {} };
 				}
-				// Schemes without a `write` hook fall through to existing logic
-				// (local:// resolves to a backing file via plan-mode-guard) or are
-				// rejected downstream when no backing file exists.
+				if (scheme !== "local") await internalRouter.write(path, cleanContent);
+				// local:// is backed by the session-local artifact sandbox and is
+				// resolved by resolvePlanPath below so write/read share the same root.
 			}
 
 			const conflictUri = parseConflictUri(path);
@@ -1181,10 +1341,33 @@ function renderContentPreview(
 	});
 }
 
+/** Render context for the write tool: resolves an `xd://`-mounted tool so its live renderer drives device dispatch previews. */
+export interface WriteRenderContext {
+	resolveXdevMounted?: (name: string) => AgentTool | undefined;
+}
+
 export const writeToolRenderer = {
-	renderCall(args: WriteRenderArgs, options: RenderResultOptions, uiTheme: Theme): Component {
+	renderCall(
+		args: WriteRenderArgs,
+		options: RenderResultOptions & { renderContext?: WriteRenderContext },
+		uiTheme: Theme,
+	): Component | undefined {
 		const rawPath =
 			typeof args.file_path === "string" ? args.file_path : typeof args.path === "string" ? args.path : "";
+		// Render NOTHING until the streamed path arrives and provably is not an
+		// xd:// device; xd:// writes then delegate to the mounted tool's renderer.
+		// A present-but-malformed path (array/object from a bad provider parse)
+		// is definitively not xd:// — fall through to the legacy frame.
+		if (args.path === undefined && args.file_path === undefined) return undefined;
+		if (rawPath && couldBecomeXdUrl(rawPath)) {
+			const xdev = parseXdUrl(rawPath);
+			// The path string is settled once the content field started streaming.
+			const pathSettled = args.content !== undefined;
+			if (!xdev?.name || !pathSettled) return undefined;
+			if (isResolutionDeviceName(xdev.name)) return renderResolutionDeviceCall(xdev.name, args.content, uiTheme);
+			if (xdev.name === REPORT_ISSUE_DEVICE_NAME) return renderReportIssueDeviceCall(args.content, uiTheme);
+			return renderXdevCall(xdev.name, args.content, options, uiTheme, options.renderContext?.resolveXdevMounted);
+		}
 		const filePath = shortenPath(rawPath);
 		const lang = rawPath ? (getLanguageFromPath(rawPath) ?? "text") : "text";
 		const langIcon = uiTheme.fg("muted", uiTheme.getLangIcon(lang));
@@ -1227,10 +1410,18 @@ export const writeToolRenderer = {
 
 	renderResult(
 		result: { content: Array<{ type: string; text?: string }>; details?: WriteToolDetails; isError?: boolean },
-		options: RenderResultOptions,
+		options: RenderResultOptions & { renderContext?: WriteRenderContext },
 		uiTheme: Theme,
 		args?: WriteRenderArgs,
 	): Component {
+		// xd:// dispatch results render as the mounted tool's own result.
+		const xdev = result.details?.xdev;
+		if (xdev) {
+			const delegated = renderXdevResult(xdev, result, options, uiTheme, options.renderContext?.resolveXdevMounted);
+			if (delegated) return delegated;
+			const text = result.content?.find(c => c.type === "text")?.text ?? "";
+			return new Text(uiTheme.fg("toolOutput", replaceTabs(text)), 0, 0);
+		}
 		const rawPath =
 			typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
 		const filePath = shortenPath(rawPath);

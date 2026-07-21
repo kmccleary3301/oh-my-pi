@@ -87,6 +87,7 @@ lederniermagicien
 loftiskg
 lyc-aon
 m3ridian-zero
+maatheusgois-dd
 makomakogo
 masonc15
 mathews-tom
@@ -139,6 +140,7 @@ vmcall
 voidchecksum
 voiys
 watzon
+will-bogusz will-bogusz
 wodenjay
 wolfiesch
 xaviergmail

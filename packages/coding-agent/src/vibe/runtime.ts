@@ -11,7 +11,7 @@
  *
  * Every turn runs as an AsyncJobManager job, so a completed turn self-delivers
  * into the director's conversation exactly like an async `task` result, and
- * `vibe_wait` can block on the first settling turn with `job`-poll semantics.
+ * `vibe_wait` can block on the first settling turn with `hub`-wait semantics.
  */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -33,6 +33,7 @@ import { type AgentDefinition, type AgentProgress, oneLineLabel, type SingleResu
 import type { ToolSession } from "../tools";
 import { formatDuration } from "../tools/render-utils";
 import { ToolError } from "../tools/tool-errors";
+import { calculateTokensPerSecond } from "../utils/token-rate";
 
 /** The two worker CLI flavors the director drives. */
 export type VibeCli = "fast" | "good";
@@ -207,6 +208,26 @@ export class VibeSessionRegistry {
 		VibeSessionRegistry.#global = undefined;
 	}
 
+	/**
+	 * Insert a bare worker record without the spawn/job machinery. Test-only —
+	 * lets {@link aggregateVibeWorkerTokensPerSecond} be exercised against a
+	 * fake roster + AgentRegistry session without driving a real turn.
+	 */
+	registerRecordForTests(record: { id: string; cli?: VibeCli; ownerId: string; state?: VibeSessionState }): void {
+		this.#records.set(record.id, {
+			id: record.id,
+			cli: record.cli ?? "fast",
+			ownerId: record.ownerId,
+			agent: getBundledAgent("sonic")!,
+			state: record.state ?? "running",
+			createdAt: Date.now(),
+			lastActivityAt: Date.now(),
+			queue: [],
+			turnCount: 0,
+			killed: false,
+		});
+	}
+
 	readonly #records = new Map<string, VibeRecord>();
 
 	#manager(session: ToolSession): AsyncJobManager {
@@ -357,7 +378,7 @@ export class VibeSessionRegistry {
 
 	/**
 	 * Block until one watched session's in-flight turn settles, the timeout
-	 * elapses, or `signal` aborts — `job` poll semantics. Settled turns are
+	 * elapses, or `signal` aborts — `hub` wait semantics. Settled turns are
 	 * acknowledged against the job manager so their results are not delivered
 	 * a second time as async follow-ups.
 	 */
@@ -707,4 +728,33 @@ export class VibeSessionRegistry {
 		if (failed) throw new VibeTurnError(text);
 		return text;
 	}
+}
+
+/**
+ * Aggregate tok/s across every live vibe worker session owned by `ownerId`.
+ * Returns null when no workers are streaming (so callers can fall back to
+ * their own rate unchanged). The director is often idle while workers stream,
+ * so without this aggregation the status-line tok/s badge would show a stale
+ * value while parallel work is actively generating tokens.
+ *
+ * Reads each worker's last assistant message via {@link calculateTokensPerSecond}
+ * — the same leaf calculator the main status line uses — so worker rates are
+ * computed identically to the main session's rate.
+ */
+export function aggregateVibeWorkerTokensPerSecond(ownerId: string): number | null {
+	const ids = VibeSessionRegistry.global().listIds(ownerId);
+	if (ids.length === 0) return null;
+	let total = 0;
+	let any = false;
+	const registry = AgentRegistry.global();
+	for (const id of ids) {
+		const workerSession = registry.get(id)?.session;
+		if (!workerSession?.isStreaming) continue;
+		const rate = calculateTokensPerSecond(workerSession.state.messages, true);
+		if (rate !== null) {
+			total += rate;
+			any = true;
+		}
+	}
+	return any ? total : null;
 }

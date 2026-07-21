@@ -623,11 +623,18 @@ function findExactModelReferenceMatch(modelReference: string, availableModels: M
  * 4. provider-scoped fuzzy match,
  * 5. substring match with the alias-vs-dated pick.
  * Returns the matched model or undefined if no match found.
+ *
+ * `exactOnly` stops after the exact phases (1-3), skipping the fuzzy/substring
+ * fallbacks (4-5). Callers use it to resolve the full selector exactly before
+ * a trailing `:<level>` thinking suffix is split off, so the suffix can never
+ * be fuzzily absorbed into a longer sibling id (e.g. `kimi-for-coding:high`
+ * must not match `kimi-for-coding-highspeed`).
  */
 function matchModel(
 	modelPattern: string,
 	availableModels: Model<Api>[],
 	context: ModelPreferenceContext,
+	options?: { exactOnly?: boolean },
 ): Model<Api> | undefined {
 	const exactRefMatch = findExactModelReferenceMatch(modelPattern, availableModels);
 	if (exactRefMatch) {
@@ -662,6 +669,14 @@ function matchModel(
 			const preferred = bareAlias ? aliasMatches.filter(m => bareAlias.providers.includes(m.provider)) : [];
 			return pickPreferredModel(preferred.length > 0 ? preferred : aliasMatches, context);
 		}
+	}
+
+	// Exact phases exhausted. Fuzzy/substring fallbacks (below) subsequence-match
+	// the whole pattern and would let a trailing `:<level>` thinking suffix bleed
+	// into a longer sibling id; callers that still hold an unstripped suffix ask
+	// for exact-only so the suffix is split off before any fuzzy attempt.
+	if (options?.exactOnly) {
+		return undefined;
 	}
 	// Check for provider/modelId format — fuzzy match within provider only.
 	const slashIndex = modelPattern.indexOf("/");
@@ -766,17 +781,33 @@ function parseModelPatternWithContext(
 	context: ModelPreferenceContext,
 	options?: { allowInvalidThinkingSelectorFallback?: boolean },
 ): ParsedModelResult {
-	// Try exact match first
-	const exactMatch = matchModel(pattern, availableModels, context);
+	// Exact match on the full pattern first (no fuzzy): a literal id that
+	// contains a colon (`coding-router:max`) wins over any suffix split.
+	const exactMatch = matchModel(pattern, availableModels, context, { exactOnly: true });
 	if (exactMatch) {
 		return { model: exactMatch, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
 
-	// No match - try stripping a valid thinking suffix and recursing.
-	// `max` is accepted only after the full pattern failed, so literal model IDs
-	// ending in `:max` keep winning over the thinking suffix.
+	// Prefer a fuzzy match whose actual id ends in the suffix, preserving
+	// shorthand selectors for literal tier models such as `router:low`. Other
+	// fuzzy results (e.g. `kimi-for-coding-highspeed`) cannot absorb the suffix.
 	const { base, level } = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
 	if (level) {
+		const literalSuffixMatch = matchModel(pattern, availableModels, context);
+		if (literalSuffixMatch?.id.toLowerCase().endsWith(`:${level}`)) {
+			return {
+				model: literalSuffixMatch,
+				thinkingLevel: undefined,
+				warning: undefined,
+				explicitThinkingLevel: false,
+			};
+		}
+
+		// Strip a valid thinking suffix and recurse before accepting any other
+		// fuzzy match, so `:<level>` cannot be absorbed into a longer sibling
+		// id (e.g. `kimi-for-coding:high` must not match
+		// `kimi-for-coding-highspeed`). `max` is accepted only after the exact
+		// match above failed, so literal model IDs ending in `:max` keep winning.
 		const result = parseModelPatternWithContext(base, availableModels, context, options);
 		if (result.model) {
 			// Only use this thinking level if no warning from inner recursion
@@ -789,6 +820,13 @@ function parseModelPatternWithContext(
 			};
 		}
 		return result;
+	}
+
+	// No valid thinking suffix: fall back to fuzzy/substring matching on the
+	// whole pattern.
+	const fallbackMatch = matchModel(pattern, availableModels, context);
+	if (fallbackMatch) {
+		return { model: fallbackMatch, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
 
 	const lastColonIndex = pattern.lastIndexOf(":");
@@ -859,6 +897,10 @@ export function parseModelPattern(
 const DEFAULT_MODEL_ROLE = "default";
 const MODEL_ROLE_ALIAS_PREFIXES = [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX];
 
+export interface ModelRoleLookup {
+	getModelRole(role: ModelRole | string): string | undefined;
+}
+
 function isModelRole(role: string): role is ModelRole {
 	return (MODEL_ROLE_IDS as string[]).includes(role);
 }
@@ -875,7 +917,7 @@ function modelRoleAliasPrefixLength(value: string): number | undefined {
 	return MODEL_ROLE_ALIAS_PREFIXES.find(prefix => value.startsWith(prefix))?.length;
 }
 
-function getModelRoleAlias(value: string, settings?: Settings): string | undefined {
+function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | undefined {
 	const normalized = value.trim();
 	const prefixLength = modelRoleAliasPrefixLength(normalized);
 	if (prefixLength === undefined) return undefined;
@@ -931,7 +973,7 @@ function resolveDefaultInheritedPatterns(
 	role: ModelRole,
 	configuredDefault: string | undefined,
 	roleDefaults: string[],
-	settings: Settings | undefined,
+	settings: ModelRoleLookup | undefined,
 	visited: Set<string>,
 ): string[] {
 	if (!shouldInheritDefaultBeforePriority(role) || !configuredDefault) return [];
@@ -969,7 +1011,7 @@ function resolveDefaultInheritedPatterns(
 
 function resolveConfiguredRolePattern(
 	value: string,
-	settings?: Settings,
+	settings?: ModelRoleLookup,
 	visited: Set<string> = new Set(),
 ): string[] | undefined {
 	const normalized = value.trim();
@@ -1006,7 +1048,7 @@ function resolveConfiguredRolePattern(
 /**
  * Expand a role alias like "@smol" to the configured model string.
  */
-export function expandRoleAlias(value: string, settings?: Settings): string {
+export function expandRoleAlias(value: string, settings?: ModelRoleLookup): string {
 	const normalized = value.trim();
 	if (normalized === DEFAULT_MODEL_ROLE) {
 		return settings?.getModelRole("default") ?? value;
@@ -1016,7 +1058,10 @@ export function expandRoleAlias(value: string, settings?: Settings): string {
 	return resolved ?? value;
 }
 
-export function resolveConfiguredModelPatterns(value: string | string[] | undefined, settings?: Settings): string[] {
+export function resolveConfiguredModelPatterns(
+	value: string | string[] | undefined,
+	settings?: ModelRoleLookup,
+): string[] {
 	const patterns = normalizeModelPatternList(value);
 	return patterns.flatMap(pattern => {
 		const resolved = resolveConfiguredRolePattern(pattern, settings);
@@ -1055,6 +1100,37 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
 	return resolveConfiguredModelPatterns(fallback, settings);
 }
+/** Default prewalk hand-off target when no explicit target is configured. */
+export const DEFAULT_PREWALK_TARGET = "@smol";
+
+export interface AgentPrewalkResolutionOptions {
+	/** `task.agentPrewalk` settings value for this agent: `"on"`, `"off"`, or a model pattern. */
+	settingsOverride?: string;
+	/** Agent definition `prewalk` frontmatter: `true` = default target, string = custom target pattern. */
+	agentPrewalk?: boolean | string;
+}
+
+/**
+ * Effective prewalk target pattern for a subagent, or `undefined` when prewalk
+ * is disabled. The settings override decides enablement first ("off" wins,
+ * "on" enables with the agent's own target or {@link DEFAULT_PREWALK_TARGET},
+ * any other value is a custom target pattern); otherwise the agent
+ * definition's `prewalk` field applies. Role aliases in the returned pattern
+ * are expanded later by {@link resolveModelOverride}.
+ */
+export function resolveAgentPrewalkPattern(options: AgentPrewalkResolutionOptions): string | undefined {
+	const agentPattern =
+		typeof options.agentPrewalk === "string" && options.agentPrewalk.trim() ? options.agentPrewalk.trim() : undefined;
+	const override = options.settingsOverride?.trim();
+	if (override) {
+		const lowered = override.toLowerCase();
+		if (lowered === "off" || lowered === "false") return undefined;
+		if (lowered === "on" || lowered === "true") return agentPattern ?? DEFAULT_PREWALK_TARGET;
+		return override;
+	}
+	if (options.agentPrewalk === true) return DEFAULT_PREWALK_TARGET;
+	return agentPattern;
+}
 
 /**
  * Resolve a model role value into a concrete model and thinking metadata.
@@ -1062,6 +1138,8 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 export interface ResolvedModelRoleValue {
 	model: Model<Api> | undefined;
 	thinkingLevel?: ConfiguredThinkingLevel;
+	/** matchedPatternIndex identifies the first configured pattern that matched an available model. */
+	matchedPatternIndex?: number;
 	explicitThinkingLevel: boolean;
 	warning: string | undefined;
 }
@@ -1069,7 +1147,7 @@ export interface ResolvedModelRoleValue {
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],
-	options?: { settings?: Settings; matchPreferences?: ModelMatchPreferences },
+	options?: { settings?: Settings; roleLookup?: ModelRoleLookup; matchPreferences?: ModelMatchPreferences },
 ): ResolvedModelRoleValue {
 	if (!roleValue) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -1080,7 +1158,7 @@ export function resolveModelRoleValue(
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
 
-	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.settings);
+	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.roleLookup ?? options?.settings);
 	if (!effectivePatterns || effectivePatterns.length === 0) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
@@ -1091,11 +1169,12 @@ export function resolveModelRoleValue(
 	// models) once and reuse it across every fallback pattern instead of
 	// rebuilding it per pattern inside parseModelPattern.
 	const preferenceContext = buildPreferenceContext(availableModels, matchPreferences);
-	for (const effectivePattern of effectivePatterns) {
+	for (const [patternIndex, effectivePattern] of effectivePatterns.entries()) {
 		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext);
 		if (resolved.model) {
 			return {
 				model: resolved.model,
+				matchedPatternIndex: patternIndex,
 				thinkingLevel: resolved.explicitThinkingLevel
 					? resolved.thinkingLevel === AUTO_THINKING
 						? AUTO_THINKING
@@ -1209,20 +1288,27 @@ export function resolveModelOverride(
 	modelPatterns: string[],
 	modelRegistry: ModelLookupRegistry,
 	settings?: Settings,
-): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean } {
+): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean; warning?: string } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
 	const availableModels = modelRegistry.getAvailable();
 	const matchPreferences = getModelMatchPreferences(settings);
+	let warning: string | undefined;
 	for (const pattern of modelPatterns) {
-		const { model, thinkingLevel, explicitThinkingLevel } = resolveModelRoleValue(pattern, availableModels, {
+		const {
+			model,
+			thinkingLevel,
+			explicitThinkingLevel,
+			warning: patternWarning,
+		} = resolveModelRoleValue(pattern, availableModels, {
 			settings,
 			matchPreferences,
 		});
 		if (model) {
-			return { model, thinkingLevel, explicitThinkingLevel };
+			return { model, thinkingLevel, explicitThinkingLevel, warning: patternWarning };
 		}
+		if (!warning && patternWarning) warning = patternWarning;
 	}
-	return { explicitThinkingLevel: false };
+	return { explicitThinkingLevel: false, warning };
 }
 
 /**
@@ -1235,6 +1321,11 @@ export function resolveModelOverride(
  * silently routing to a provider the user can't actually call (e.g.
  * `modelRoles.task` pointing at an unqualified id whose only available
  * provider variant has no configured credentials — see #985).
+ *
+ * `sessionId` is forwarded to `getApiKey` so that session-sticky OAuth
+ * credentials resolve correctly during the pre-flight auth check. Without it,
+ * providers with multiple OAuth accounts may return `undefined` even though
+ * the credential is usable once the subagent session starts — see #5325.
  *
  * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
  * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
@@ -1251,18 +1342,20 @@ export async function resolveModelOverrideWithAuthFallback(
 	parentActiveModelPattern: string | undefined,
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
+	sessionId?: string,
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
 	authFallbackUsed: boolean;
+	warning?: string;
 }> {
 	const primary = resolveModelOverride(modelPatterns, modelRegistry, settings);
 	if (!primary.model || !parentActiveModelPattern) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
-	const primaryKey = await modelRegistry.getApiKey(primary.model);
+	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
 	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}
@@ -1274,12 +1367,12 @@ export async function resolveModelOverrideWithAuthFallback(
 	if (modelsAreEqual(fallback.model, primary.model)) {
 		return { ...primary, authFallbackUsed: false };
 	}
-	const fallbackKey = await modelRegistry.getApiKey(fallback.model);
+	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
 	if (!isAuthenticated(fallbackKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
-	return { ...fallback, authFallbackUsed: true };
+	return { ...fallback, authFallbackUsed: true, warning: primary.warning ?? fallback.warning };
 }
 
 /**
@@ -1508,6 +1601,10 @@ export function filterAvailableModelsByEnabledPatterns(
 
 export interface ResolveCliModelResult {
 	model: Model<Api> | undefined;
+	/** configuredPatterns is the full configured fallback chain when the selector resolves through a role. */
+	configuredPatterns?: string[];
+	/** configuredPatternIndex identifies the configured role pattern that matched an available model. */
+	configuredPatternIndex?: number;
 	selector?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	warning: string | undefined;
@@ -1516,6 +1613,8 @@ export interface ResolveCliModelResult {
 
 /**
  * Resolve a single model from CLI flags.
+ *
+ * Exact model names take precedence over configured role names.
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
@@ -1538,19 +1637,6 @@ export function resolveCliModel(options: {
 			warning: undefined,
 			error: "No models available. Check your installation or add models to models.json.",
 		};
-	}
-
-	if (!cliProvider && modelRoleAliasPrefixLength(cliModel) !== undefined) {
-		const resolved = resolveModelRoleValue(cliModel, availableModels, { settings, matchPreferences: preferences });
-		if (resolved.model) {
-			return {
-				model: resolved.model,
-				selector: formatModelString(resolved.model),
-				thinkingLevel: resolved.thinkingLevel,
-				warning: resolved.warning,
-				error: undefined,
-			};
-		}
 	}
 
 	const providerMap = new Map<string, string>();
@@ -1591,6 +1677,73 @@ export function resolveCliModel(options: {
 				thinkingLevel: undefined,
 				error: undefined,
 			};
+		}
+		const { base: exactBase, level: exactThinkingLevel } = splitThinkingSuffix(
+			trimmedModel,
+			-1,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
+		if (exactThinkingLevel) {
+			let exactSuffixed = findExactModelReferenceMatch(exactBase, availableModels);
+			if (!exactSuffixed) {
+				const lowerExactBase = exactBase.toLowerCase();
+				exactSuffixed = availableModels.find(
+					model =>
+						model.id.toLowerCase() === lowerExactBase ||
+						`${model.provider}/${model.id}`.toLowerCase() === lowerExactBase,
+				);
+			}
+			if (exactSuffixed) {
+				return {
+					model: exactSuffixed,
+					selector: formatModelString(exactSuffixed),
+					warning: undefined,
+					thinkingLevel: exactThinkingLevel,
+					error: undefined,
+				};
+			}
+		}
+	}
+	let configuredPatterns: string[] | undefined;
+	if (!cliProvider) {
+		const { base: bareRoleName, level: bareRoleThinkingLevel } = splitThinkingSuffix(
+			trimmedModel,
+			-1,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
+		const roleSelector =
+			modelRoleAliasPrefixLength(trimmedModel) !== undefined
+				? trimmedModel
+				: settings?.getModelRole(bareRoleName) !== undefined
+					? `${formatModelRoleAlias(bareRoleName)}${bareRoleThinkingLevel ? `:${bareRoleThinkingLevel}` : ""}`
+					: undefined;
+		if (roleSelector) {
+			configuredPatterns = resolveConfiguredModelPatterns([roleSelector], settings);
+			const resolved = resolveModelRoleValue(roleSelector, availableModels, {
+				settings,
+				matchPreferences: preferences,
+			});
+			if (resolved.model) {
+				return {
+					model: resolved.model,
+					selector: formatModelString(resolved.model),
+					configuredPatterns,
+					configuredPatternIndex: resolved.matchedPatternIndex,
+					thinkingLevel: resolved.thinkingLevel,
+					warning: resolved.warning,
+					error: undefined,
+				};
+			}
+			if (configuredPatterns && configuredPatterns.length > 0) {
+				return {
+					model: undefined,
+					configuredPatterns,
+					selector: undefined,
+					thinkingLevel: undefined,
+					warning: resolved.warning,
+					error: `Model "${trimmedModel}" not found. Run "omp models" to see available models.`,
+				};
+			}
 		}
 	}
 
@@ -1635,6 +1788,7 @@ export function resolveCliModel(options: {
 		const display = provider ? `${provider}/${pattern}` : cliModel;
 		return {
 			model: undefined,
+			configuredPatterns,
 			selector: undefined,
 			thinkingLevel: undefined,
 			warning,
