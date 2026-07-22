@@ -1,21 +1,23 @@
 import { expect, test } from "bun:test";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { type AddressInfo, createServer } from "node:net";
 import { resolve } from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
-import { createLifecycleE4Client, LifecycleE4ClientError, type BoundLifecycleE4Client } from "@breadboard/sdk";
+import { type BoundLifecycleE4Client, createLifecycleE4Client, LifecycleE4ClientError } from "@breadboard/sdk";
 import { type BreadboardSdkProvenance, openVerifiedBackendSnapshot } from "../scripts/verify-breadboard-sdk-provenance";
 import { retryAmbiguousReplay } from "./helpers/retry-ambiguous-replay";
 
 const packageRoot = resolve(import.meta.dir, "..");
-const provenance = JSON.parse(await readFile(resolve(packageRoot, "breadboard-sdk-provenance.json"), "utf8")) as BreadboardSdkProvenance;
+const provenance = JSON.parse(
+	await readFile(resolve(packageRoot, "breadboard-sdk-provenance.json"), "utf8"),
+) as BreadboardSdkProvenance;
 const backendRoot = process.env[provenance.backendRootEnvironmentVariable];
-const backendPython = process.env.BREADBOARD_P30_BACKEND_PYTHON ?? (backendRoot === undefined
-	? undefined
-	: resolve(backendRoot, ".venv/bin/python"));
+const backendPython =
+	process.env.BREADBOARD_P30_BACKEND_PYTHON ??
+	(backendRoot === undefined ? undefined : resolve(backendRoot, ".venv/bin/python"));
 const expectedSessionContract = {
 	contractId: "p30-e4-session-v1" as const,
 	schemaSha256: "sha256:5757652c22d6aa2eb7a1cc8be1a40021d3f6a15df18d69ca22dc1916a400dbd4" as const,
@@ -28,7 +30,14 @@ interface SafeFetchFailure {
 	readonly code: string | null;
 	readonly causeName: string | null;
 	readonly causeCode: string | null;
-	readonly messageClass: "aborted" | "connection_closed" | "connection_refused" | "connection_reset" | "fetch_failed" | "timeout" | "transport_other";
+	readonly messageClass:
+		| "aborted"
+		| "connection_closed"
+		| "connection_refused"
+		| "connection_reset"
+		| "fetch_failed"
+		| "timeout"
+		| "transport_other";
 }
 
 interface IntegrationDiagnosticState {
@@ -41,17 +50,26 @@ function safeErrorAtom(value: unknown): string | null {
 }
 
 function classifyFetchFailure(error: unknown): SafeFetchFailure {
-	const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
-	const cause = typeof record.cause === "object" && record.cause !== null ? record.cause as Record<string, unknown> : {};
-	const message = [record.message, cause.message].filter(value => typeof value === "string").join(" ").toLowerCase();
-	const messageClass: SafeFetchFailure["messageClass"] =
-		message.includes("abort") ? "aborted"
-			: message.includes("timed out") || message.includes("timeout") ? "timeout"
-				: message.includes("refused") ? "connection_refused"
-					: message.includes("reset") ? "connection_reset"
-						: message.includes("closed") || message.includes("socket") ? "connection_closed"
-							: message.includes("fetch failed") ? "fetch_failed"
-								: "transport_other";
+	const record = typeof error === "object" && error !== null ? (error as Record<string, unknown>) : {};
+	const cause =
+		typeof record.cause === "object" && record.cause !== null ? (record.cause as Record<string, unknown>) : {};
+	const message = [record.message, cause.message]
+		.filter(value => typeof value === "string")
+		.join(" ")
+		.toLowerCase();
+	const messageClass: SafeFetchFailure["messageClass"] = message.includes("abort")
+		? "aborted"
+		: message.includes("timed out") || message.includes("timeout")
+			? "timeout"
+			: message.includes("refused")
+				? "connection_refused"
+				: message.includes("reset")
+					? "connection_reset"
+					: message.includes("closed") || message.includes("socket")
+						? "connection_closed"
+						: message.includes("fetch failed")
+							? "fetch_failed"
+							: "transport_other";
 	return {
 		name: safeErrorAtom(record.name),
 		code: safeErrorAtom(record.code),
@@ -77,11 +95,11 @@ function diagnosticFetchFor(state: IntegrationDiagnosticState): typeof fetch {
 }
 
 function safeThrownError(error: unknown): { readonly name: string | null; readonly lifecycleKind: string | null } {
-	const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
-	const failure = typeof record.failure === "object" && record.failure !== null ? record.failure as Record<string, unknown> : {};
+	const record = typeof error === "object" && error !== null ? (error as Record<string, unknown>) : {};
+	const failure =
+		typeof record.failure === "object" && record.failure !== null ? (record.failure as Record<string, unknown>) : {};
 	return { name: safeErrorAtom(record.name), lifecycleKind: safeErrorAtom(failure.kind) };
 }
-
 
 async function unusedPort(): Promise<number> {
 	const server = createServer();
@@ -106,7 +124,11 @@ async function waitForBackend(baseUrl: string, child: ChildProcess, stderr: () =
 	throw new Error(`backend readiness timed out: ${stderr()}`);
 }
 
-async function boundDroppingOneResponse(baseUrl: string, pathname: string, baseFetch: typeof fetch): Promise<BoundLifecycleE4Client> {
+async function boundDroppingOneResponse(
+	baseUrl: string,
+	pathname: string,
+	baseFetch: typeof fetch,
+): Promise<BoundLifecycleE4Client> {
 	let drop = true;
 	const droppingFetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
 		const response = await baseFetch(input, init);
@@ -132,7 +154,6 @@ async function readChildOutput(stream: Readable | null): Promise<string> {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
-
 async function waitForRegistrationExpiry(
 	bound: BoundLifecycleE4Client,
 	ownerGeneration: number,
@@ -147,7 +168,7 @@ async function waitForRegistrationExpiry(
 	// renew exactly once while the requester is live, then make no lifecycle calls through expiry.
 	while (Date.now() < renewAt) await Bun.sleep(Math.min(100, renewAt - Date.now()));
 	if (Date.now() >= expiresAt) throw new Error("registration expired before safe owner renewal");
-	const renewedOwner = await bound.renewOwner({ ownerGeneration, ownerCredential });
+	const renewedOwner = await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration, ownerCredential }));
 	const ownerExpiryMarginSeconds = renewedOwner.expiresAtUnix - expiresAtUnix;
 	if (ownerExpiryMarginSeconds < 15) throw new Error(`owner expiry margin too small: ${ownerExpiryMarginSeconds}s`);
 	while (Date.now() <= expiresAt) {
@@ -181,11 +202,17 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			},
 			stdio: ["ignore", "ignore", "pipe", "pipe"],
 		});
-		backend.stderr?.on("data", chunk => { stderrText += String(chunk); });
+		backend.stderr?.on("data", chunk => {
+			stderrText += String(chunk);
+		});
 		const bootstrapPipe = backend.stdio[3] as Writable;
 		bootstrapPipe.end(bootstrapCredential);
 		await waitForBackend(baseUrl, backend, () => stderrText);
-		const bound = await createLifecycleE4Client({ baseUrl, expectedSessionContract, fetch: diagnosticFetch }).handshake();
+		const bound = await createLifecycleE4Client({
+			baseUrl,
+			expectedSessionContract,
+			fetch: diagnosticFetch,
+		}).handshake();
 		const owner = await bound.acquireOwner({
 			expectedOwnerGeneration: 0,
 			bootstrapCredential,
@@ -201,34 +228,52 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			registrationCredential: requesterCredential,
 		});
 		const controlRequestId = authorityId();
-		const controller = spawn(process.execPath, [resolve(import.meta.dir, "fixtures/breadboard-drain-controller.ts")], {
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		controller.stdin?.end(JSON.stringify({
-			baseUrl,
-			ownerGeneration: owner.ownerGeneration,
-			ownerCredential,
-			controlRequestId,
-			registrationId: requester.registrationId,
-			requesterRegistrationGeneration: requester.registrationGeneration,
-			requesterClientInstanceId,
-			registrationCredential: requesterCredential,
-			expectedAdmissionEpoch: requester.admissionEpoch,
-		}));
+		const controller = spawn(
+			process.execPath,
+			[resolve(import.meta.dir, "fixtures/breadboard-drain-controller.ts")],
+			{
+				stdio: ["pipe", "pipe", "pipe"],
+			},
+		);
+		controller.stdin?.end(
+			JSON.stringify({
+				baseUrl,
+				ownerGeneration: owner.ownerGeneration,
+				ownerCredential,
+				controlRequestId,
+				registrationId: requester.registrationId,
+				requesterRegistrationGeneration: requester.registrationGeneration,
+				requesterClientInstanceId,
+				registrationCredential: requesterCredential,
+				expectedAdmissionEpoch: requester.admissionEpoch,
+			}),
+		);
 		const [controllerStdout, controllerStderr, controllerExit] = await Promise.all([
 			readChildOutput(controller.stdout),
 			readChildOutput(controller.stderr),
 			once(controller, "exit"),
 		]);
 		expect(controllerExit[0], controllerStderr).toBe(0);
-		const committed = JSON.parse(controllerStdout) as { result: string; drainGeneration: number; admissionEpoch: number };
+		const committed = JSON.parse(controllerStdout) as {
+			result: string;
+			drainGeneration: number;
+			admissionEpoch: number;
+		};
 		expect(committed.result).toBe("draining");
 
-		expect({ leaseTtlSeconds: requester.leaseTtlSeconds, renewalIntervalSeconds: requester.renewalIntervalSeconds }).toEqual({
+		expect({
+			leaseTtlSeconds: requester.leaseTtlSeconds,
+			renewalIntervalSeconds: requester.renewalIntervalSeconds,
+		}).toEqual({
 			leaseTtlSeconds: 30,
 			renewalIntervalSeconds: 10,
 		});
-		const requesterExpiry = await waitForRegistrationExpiry(bound, owner.ownerGeneration, ownerCredential, requester.expiresAtUnix);
+		const requesterExpiry = await waitForRegistrationExpiry(
+			bound,
+			owner.ownerGeneration,
+			ownerCredential,
+			requester.expiresAtUnix,
+		);
 
 		const replacementCredential = authorityId();
 		const replacementClientInstanceId = clientId("replacement");
@@ -247,7 +292,7 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			registrationCredential: replacementCredential,
 		});
 		expect(replacementRetry.admissionEpoch).toBe(replacement.admissionEpoch);
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 
 		const lostBeginInput = {
 			ownerGeneration: owner.ownerGeneration,
@@ -264,22 +309,44 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 		const recoveredBegin = await retryAmbiguousReplay(() => lostBegin.beginControlDrain(lostBeginInput));
 		expect(recoveredBegin.result).toBe("draining");
 
-		const lostRejection = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/graceful-result", diagnosticFetch);
-		const rejectionInput = { ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: recoveredBegin.drainGeneration, outcome: "definitive_rejection" as const };
+		const lostRejection = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/graceful-result",
+			diagnosticFetch,
+		);
+		const rejectionInput = {
+			ownerGeneration: owner.ownerGeneration,
+			ownerCredential,
+			drainGeneration: recoveredBegin.drainGeneration,
+			outcome: "definitive_rejection" as const,
+		};
 		await expect(lostRejection.recordGracefulControl(rejectionInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const rejectionExpiry = await waitForRegistrationExpiry(bound, owner.ownerGeneration, ownerCredential, replacementRetry.expiresAtUnix);
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		const rejectionExpiry = await waitForRegistrationExpiry(
+			bound,
+			owner.ownerGeneration,
+			ownerCredential,
+			replacementRetry.expiresAtUnix,
+		);
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 		const recoveredRejection = await retryAmbiguousReplay(() => lostRejection.recordGracefulControl(rejectionInput));
 		expect(recoveredRejection.result).toBe("rollback_permitted");
-		const rejectionRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback", diagnosticFetch);
+		const rejectionRollback = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/drain-rollback",
+			diagnosticFetch,
+		);
 		const rejectionRollbackInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
 			drainGeneration: recoveredBegin.drainGeneration,
 		};
-		await expect(rejectionRollback.rollbackDrain(rejectionRollbackInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		expect((await retryAmbiguousReplay(() => rejectionRollback.rollbackDrain(rejectionRollbackInput))).result).toBe("rolled_back");
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		await expect(rejectionRollback.rollbackDrain(rejectionRollbackInput)).rejects.toBeInstanceOf(
+			LifecycleE4ClientError,
+		);
+		expect((await retryAmbiguousReplay(() => rejectionRollback.rollbackDrain(rejectionRollbackInput))).result).toBe(
+			"rolled_back",
+		);
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 
 		const abandonedCredential = authorityId();
 		const abandonedClientInstanceId = clientId("abandoned");
@@ -299,13 +366,20 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			registrationCredential: abandonedCredential,
 			expectedAdmissionEpoch: abandonedRegistration.admissionEpoch,
 		});
-		const pending = await bound.recordGracefulControl({ ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: pendingBegin.drainGeneration, outcome: "timeout" });
+		const pending = await bound.recordGracefulControl({
+			ownerGeneration: owner.ownerGeneration,
+			ownerCredential,
+			drainGeneration: pendingBegin.drainGeneration,
+			outcome: "timeout",
+		});
 		expect(pending.result).toBe("hard_signal_decision_pending");
 		const abandonedExpiresAt = abandonedRegistration.expiresAtUnix * 1_000;
 		const hardSignalPrepareAt = abandonedExpiresAt - 8_000;
 		while (Date.now() < hardSignalPrepareAt) await Bun.sleep(Math.min(100, hardSignalPrepareAt - Date.now()));
 		const abandonedWaitStartedAt = Date.now();
-		const abandonedOwnerRenewal = await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		const abandonedOwnerRenewal = await retryAmbiguousReplay(() =>
+			bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }),
+		);
 		const authorization = await bound.prepareHardSignal({
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
@@ -313,7 +387,8 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			pid: bound.binding.process.pid,
 			osProcessStartToken: bound.binding.process.osProcessStartToken,
 		});
-		const abandonedOwnerExpiryMarginSeconds = abandonedOwnerRenewal.expiresAtUnix - abandonedRegistration.expiresAtUnix;
+		const abandonedOwnerExpiryMarginSeconds =
+			abandonedOwnerRenewal.expiresAtUnix - abandonedRegistration.expiresAtUnix;
 		const authorizationExpiryMarginSeconds = authorization.expiresAtUnix - abandonedRegistration.expiresAtUnix;
 		expect(abandonedOwnerExpiryMarginSeconds).toBeGreaterThanOrEqual(15);
 		expect(authorizationExpiryMarginSeconds).toBeGreaterThanOrEqual(15);
@@ -329,18 +404,33 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 		while (Date.now() < authorizationRenewAt) {
 			await Bun.sleep(Math.min(100, authorizationRenewAt - Date.now()));
 		}
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 		const authorizationExpiryDeadline = authorizationExpiresAt + 2_000;
 		while (Date.now() <= authorizationExpiresAt) {
-			if (Date.now() > authorizationExpiryDeadline) throw new Error("hard-signal authorization expiry deadline exceeded");
+			if (Date.now() > authorizationExpiryDeadline)
+				throw new Error("hard-signal authorization expiry deadline exceeded");
 			await Bun.sleep(Math.min(100, Math.max(1, authorizationExpiresAt - Date.now() + 1)));
 		}
-		const lostAbandoned = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/outcome", diagnosticFetch);
-		const abandonedInput = { ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: pendingBegin.drainGeneration, authorizationId: authorization.authorizationId, outcome: "abandoned" as const };
-		await expect(lostAbandoned.recordHardSignalOutcome(abandonedInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredAbandoned = await retryAmbiguousReplay(() => lostAbandoned.recordHardSignalOutcome(abandonedInput));
+		const lostAbandoned = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/hard-signal/outcome",
+			diagnosticFetch,
+		);
+		const abandonedInput = {
+			ownerGeneration: owner.ownerGeneration,
+			ownerCredential,
+			drainGeneration: pendingBegin.drainGeneration,
+			authorizationId: authorization.authorizationId,
+			outcome: "abandoned" as const,
+		};
+		await expect(lostAbandoned.recordHardSignalOutcome(abandonedInput)).rejects.toBeInstanceOf(
+			LifecycleE4ClientError,
+		);
+		const recoveredAbandoned = await retryAmbiguousReplay(() =>
+			lostAbandoned.recordHardSignalOutcome(abandonedInput),
+		);
 		expect(recoveredAbandoned.result).toBe("rolled_back");
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 
 		const expiredPrepareCredential = authorityId();
 		const expiredPrepareClientInstanceId = clientId("expired-prepare");
@@ -367,7 +457,11 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			outcome: "timeout",
 		});
 		expect(expiredPreparePending.result).toBe("hard_signal_decision_pending");
-		const lostPrepare = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/prepare", diagnosticFetch);
+		const lostPrepare = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/hard-signal/prepare",
+			diagnosticFetch,
+		);
 		const expiredPrepareInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
@@ -379,23 +473,35 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 		await expect(lostPrepare.prepareHardSignal(expiredPrepareInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
 		const expiredPrepareDeadline = expiredPrepareStartedAt + 33_000;
 		while (Date.now() <= expiredPrepareDeadline) {
-			await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+			await retryAmbiguousReplay(() =>
+				bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }),
+			);
 			await Bun.sleep(Math.min(5_000, Math.max(1, expiredPrepareDeadline - Date.now() + 1)));
 		}
-		await expect(retryAmbiguousReplay(() => lostPrepare.prepareHardSignal(expiredPrepareInput))).rejects.toMatchObject({
+		await expect(
+			retryAmbiguousReplay(() => lostPrepare.prepareHardSignal(expiredPrepareInput)),
+		).rejects.toMatchObject({
 			failure: { kind: "hard-signal-authorization-expired" },
 		});
-		const lostExpiredRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback", diagnosticFetch);
+		const lostExpiredRollback = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/drain-rollback",
+			diagnosticFetch,
+		);
 		const expiredRollbackInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
 			drainGeneration: expiredPrepareBegin.drainGeneration,
 		};
-		await expect(lostExpiredRollback.rollbackDrain(expiredRollbackInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredExpiredRollback = await retryAmbiguousReplay(() => lostExpiredRollback.rollbackDrain(expiredRollbackInput));
+		await expect(lostExpiredRollback.rollbackDrain(expiredRollbackInput)).rejects.toBeInstanceOf(
+			LifecycleE4ClientError,
+		);
+		const recoveredExpiredRollback = await retryAmbiguousReplay(() =>
+			lostExpiredRollback.rollbackDrain(expiredRollbackInput),
+		);
 		expect(recoveredExpiredRollback.result).toBe("rolled_back");
 		const expiredPrepareRecoveryMs = Date.now() - expiredPrepareStartedAt;
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 
 		const rollbackCredential = authorityId();
 		const rollbackClientInstanceId = clientId("rollback");
@@ -422,9 +528,22 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			outcome: "definitive_rejection",
 		});
 		expect(rollbackPermitted.result).toBe("rollback_permitted");
-		const rollbackExpiry = await waitForRegistrationExpiry(bound, owner.ownerGeneration, ownerCredential, rollbackRegistration.expiresAtUnix);
-		const lostRollback = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/drain-rollback", diagnosticFetch);
-		const rollbackInput = { ownerGeneration: owner.ownerGeneration, ownerCredential, drainGeneration: rollbackBegin.drainGeneration };
+		const rollbackExpiry = await waitForRegistrationExpiry(
+			bound,
+			owner.ownerGeneration,
+			ownerCredential,
+			rollbackRegistration.expiresAtUnix,
+		);
+		const lostRollback = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/drain-rollback",
+			diagnosticFetch,
+		);
+		const rollbackInput = {
+			ownerGeneration: owner.ownerGeneration,
+			ownerCredential,
+			drainGeneration: rollbackBegin.drainGeneration,
+		};
 		await expect(lostRollback.rollbackDrain(rollbackInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
 		const recoveredRollback = await retryAmbiguousReplay(() => lostRollback.rollbackDrain(rollbackInput));
 		expect(recoveredRollback.result).toBe("rolled_back");
@@ -444,16 +563,18 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 		expect(Object.values(ownerExpiryMarginsSeconds).every(margin => margin >= 15)).toBe(true);
 		expect(expiredPrepareRecoveryMs).toBeGreaterThanOrEqual(33_000);
 		expect(expiredPrepareRecoveryMs).toBeLessThanOrEqual(40_000);
-		process.stdout.write(`${JSON.stringify({
-			leaseTtlSeconds: requester.leaseTtlSeconds,
-			renewalIntervalSeconds: requester.renewalIntervalSeconds,
-			expiryWaitsMs,
-			ownerExpiryMarginsSeconds,
-			expiredPrepareRecoveryMs,
-			finalAdmissionEpoch: recoveredRollback.admissionEpoch,
-		})}\n`);
+		process.stdout.write(
+			`${JSON.stringify({
+				leaseTtlSeconds: requester.leaseTtlSeconds,
+				renewalIntervalSeconds: requester.renewalIntervalSeconds,
+				expiryWaitsMs,
+				ownerExpiryMarginsSeconds,
+				expiredPrepareRecoveryMs,
+				finalAdmissionEpoch: recoveredRollback.admissionEpoch,
+			})}\n`,
+		);
 
-		await bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential });
+		await retryAmbiguousReplay(() => bound.renewOwner({ ownerGeneration: owner.ownerGeneration, ownerCredential }));
 		const hostileCredential = authorityId();
 		const hostileClientInstanceId = clientId("hostile");
 		const hostileRegistration = await bound.registerClient({
@@ -470,9 +591,28 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			requesterClientInstanceId: hostileClientInstanceId,
 			registrationCredential: hostileCredential,
 		};
-		await expect(bound.beginControlDrain({ ...hostileBase, controlRequestId: authorityId(), expectedAdmissionEpoch: recoveredRollback.admissionEpoch - 1 })).rejects.toMatchObject({ failure: { kind: "drain-conflict" } });
-		await expect(bound.beginControlDrain({ ...hostileBase, controlRequestId: authorityId(), registrationCredential: authorityId(), expectedAdmissionEpoch: recoveredRollback.admissionEpoch })).rejects.toMatchObject({ failure: { kind: "auth" } });
-		await expect(bound.beginControlDrain({ ...hostileBase, controlRequestId: "unsafe", expectedAdmissionEpoch: recoveredRollback.admissionEpoch })).rejects.toMatchObject({ failure: { kind: "protocol" } });
+		await expect(
+			bound.beginControlDrain({
+				...hostileBase,
+				controlRequestId: authorityId(),
+				expectedAdmissionEpoch: recoveredRollback.admissionEpoch - 1,
+			}),
+		).rejects.toMatchObject({ failure: { kind: "drain-conflict" } });
+		await expect(
+			bound.beginControlDrain({
+				...hostileBase,
+				controlRequestId: authorityId(),
+				registrationCredential: authorityId(),
+				expectedAdmissionEpoch: recoveredRollback.admissionEpoch,
+			}),
+		).rejects.toMatchObject({ failure: { kind: "auth" } });
+		await expect(
+			bound.beginControlDrain({
+				...hostileBase,
+				controlRequestId: "unsafe",
+				expectedAdmissionEpoch: recoveredRollback.admissionEpoch,
+			}),
+		).rejects.toMatchObject({ failure: { kind: "protocol" } });
 		const detachedHostile = await bound.detachClient({
 			registrationId: hostileRegistration.registrationId,
 			registrationGeneration: hostileRegistration.registrationGeneration,
@@ -504,12 +644,16 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			registrationCredential: committedCredential,
 			expectedAdmissionEpoch: committedRegistration.admissionEpoch,
 		});
-		expect((await bound.recordGracefulControl({
-			ownerGeneration: owner.ownerGeneration,
-			ownerCredential,
-			drainGeneration: committedBegin.drainGeneration,
-			outcome: "timeout",
-		})).result).toBe("hard_signal_decision_pending");
+		expect(
+			(
+				await bound.recordGracefulControl({
+					ownerGeneration: owner.ownerGeneration,
+					ownerCredential,
+					drainGeneration: committedBegin.drainGeneration,
+					outcome: "timeout",
+				})
+			).result,
+		).toBe("hard_signal_decision_pending");
 		const committedPrepareInput = {
 			ownerGeneration: owner.ownerGeneration,
 			ownerCredential,
@@ -517,9 +661,17 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			pid: bound.binding.process.pid,
 			osProcessStartToken: bound.binding.process.osProcessStartToken,
 		};
-		const lostCommittedPrepare = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/prepare", diagnosticFetch);
-		await expect(lostCommittedPrepare.prepareHardSignal(committedPrepareInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const recoveredPreparation = await retryAmbiguousReplay(() => lostCommittedPrepare.prepareHardSignal(committedPrepareInput));
+		const lostCommittedPrepare = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/hard-signal/prepare",
+			diagnosticFetch,
+		);
+		await expect(lostCommittedPrepare.prepareHardSignal(committedPrepareInput)).rejects.toBeInstanceOf(
+			LifecycleE4ClientError,
+		);
+		const recoveredPreparation = await retryAmbiguousReplay(() =>
+			lostCommittedPrepare.prepareHardSignal(committedPrepareInput),
+		);
 		expect(recoveredPreparation).toMatchObject({
 			result: "prepared",
 			signalPermitted: false,
@@ -529,19 +681,29 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			...committedPrepareInput,
 			authorizationId: recoveredPreparation.authorizationId,
 		};
-		await expect(bound.commitHardSignal({
-			...committedInput,
-			ownerGeneration: owner.ownerGeneration + 1,
-		})).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		await expect(bound.commitHardSignal({
-			...committedInput,
-			authorizationId: authorityId(),
-		})).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		await expect(bound.commitHardSignal({
-			...committedInput,
-			authorizationId: "unsafe",
-		})).rejects.toBeInstanceOf(LifecycleE4ClientError);
-		const lostCommit = await boundDroppingOneResponse(baseUrl, "/v1/engine/control/hard-signal/commit", diagnosticFetch);
+		await expect(
+			bound.commitHardSignal({
+				...committedInput,
+				ownerGeneration: owner.ownerGeneration + 1,
+			}),
+		).rejects.toBeInstanceOf(LifecycleE4ClientError);
+		await expect(
+			bound.commitHardSignal({
+				...committedInput,
+				authorizationId: authorityId(),
+			}),
+		).rejects.toBeInstanceOf(LifecycleE4ClientError);
+		await expect(
+			bound.commitHardSignal({
+				...committedInput,
+				authorizationId: "unsafe",
+			}),
+		).rejects.toBeInstanceOf(LifecycleE4ClientError);
+		const lostCommit = await boundDroppingOneResponse(
+			baseUrl,
+			"/v1/engine/control/hard-signal/commit",
+			diagnosticFetch,
+		);
 		await expect(lostCommit.commitHardSignal(committedInput)).rejects.toBeInstanceOf(LifecycleE4ClientError);
 		const recoveredPermit = await retryAmbiguousReplay(() => lostCommit.commitHardSignal(committedInput));
 		expect(recoveredPermit).toMatchObject({
@@ -550,38 +712,45 @@ test("real backend rolls back an expired cross-process drain exactly once and re
 			authorizationId: recoveredPreparation.authorizationId,
 			drainGeneration: committedBegin.drainGeneration,
 		});
-		process.stdout.write(`${JSON.stringify({
-			hardSignalCommitReplay: {
-				prepareResult: recoveredPreparation.result,
-				prepareSignalPermitted: recoveredPreparation.signalPermitted,
-				commitResult: recoveredPermit.result,
-				commitSignalPermitted: recoveredPermit.signalPermitted,
-				drainGeneration: recoveredPermit.drainGeneration,
-			},
-			backendRuntime: {
-				python: backendPython,
-				sourceRoot: "private-verified-snapshot",
-				commit: verifiedBackend.commit,
-				tree: verifiedBackend.tree,
-			},
-		})}\n`);
+		process.stdout.write(
+			`${JSON.stringify({
+				hardSignalCommitReplay: {
+					prepareResult: recoveredPreparation.result,
+					prepareSignalPermitted: recoveredPreparation.signalPermitted,
+					commitResult: recoveredPermit.result,
+					commitSignalPermitted: recoveredPermit.signalPermitted,
+					drainGeneration: recoveredPermit.drainGeneration,
+				},
+				backendRuntime: {
+					python: backendPython,
+					sourceRoot: "private-verified-snapshot",
+					commit: verifiedBackend.commit,
+					tree: verifiedBackend.tree,
+				},
+			})}\n`,
+		);
 	} catch (error) {
 		const stderrBytes = Buffer.from(stderrText, "utf8");
-		process.stderr.write(`[bb89n34-diagnostic]${JSON.stringify({
-			schemaVersion: "bb89n34.v7.integration-diagnostic.v1",
-			phase: diagnosticState.phase,
-			backend: backend === undefined ? null : {
-				exitCode: backend.exitCode,
-				signalCode: backend.signalCode,
-				killed: backend.killed,
-			},
-			stderr: {
-				byteCount: stderrBytes.byteLength,
-				sha256: createHash("sha256").update(stderrBytes).digest("hex"),
-			},
-			fetchFailure: diagnosticState.fetchFailure,
-			thrown: safeThrownError(error),
-		})}\n`);
+		process.stderr.write(
+			`[bb89n34-diagnostic]${JSON.stringify({
+				schemaVersion: "bb89n34.v7.integration-diagnostic.v1",
+				phase: diagnosticState.phase,
+				backend:
+					backend === undefined
+						? null
+						: {
+								exitCode: backend.exitCode,
+								signalCode: backend.signalCode,
+								killed: backend.killed,
+							},
+				stderr: {
+					byteCount: stderrBytes.byteLength,
+					sha256: createHash("sha256").update(stderrBytes).digest("hex"),
+				},
+				fetchFailure: diagnosticState.fetchFailure,
+				thrown: safeThrownError(error),
+			})}\n`,
+		);
 		throw error;
 	} finally {
 		bootstrapCredential.fill(0);

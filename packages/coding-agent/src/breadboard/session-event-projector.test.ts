@@ -284,7 +284,7 @@ describe("SessionEventProjector", () => {
 						{
 							id: "call-1",
 							type: "function",
-							function: { name: "list_dir", arguments: "{\"path\":\".\"}" },
+							function: { name: "list_dir", arguments: '{"path":"."}' },
 						},
 					],
 				},
@@ -295,7 +295,7 @@ describe("SessionEventProjector", () => {
 				call: {
 					id: "call-1",
 					type: "function",
-					function: { name: "list_dir", arguments: "{\"path\":\".\"}" },
+					function: { name: "list_dir", arguments: '{"path":"."}' },
 				},
 			}),
 			wireEvent(5, "tool_result", {
@@ -376,6 +376,117 @@ describe("SessionEventProjector", () => {
 		});
 		expect(projector.state.frozen).toBe(false);
 	});
+	test("redacts sensitive tool state independently of renderer consumers", async () => {
+		const projector = new SessionEventProjector(sessionId);
+		register(projector);
+		await applyAll(projector, [firstInput, started]);
+		const called = await projector.apply(
+			wireEvent(3, "tool_call", {
+				call_id: "call-secret",
+				tool: "fetch",
+				arguments: { authorization: "Bearer sk-canary-never-project-123456" },
+			}),
+		);
+		const completedCall = await projector.apply(
+			wireEvent(4, "tool_result", {
+				call_id: "call-secret",
+				tool: "fetch",
+				status: "ok",
+				error: false,
+				result: { token: "sk-canary-result-never-project-123456" },
+				artifact_ref: null,
+			}),
+		);
+
+		const projected = [...projector.state.toolCalls.values()][0];
+		expect(projected?.arguments).toBe("[redacted]");
+		expect(projected?.result).toBe("[redacted]");
+		expect(JSON.stringify([called.effect, completedCall.effect, [...projector.state.toolCalls]])).not.toContain(
+			"never-project",
+		);
+	});
+
+	test("rejects terminal turns with unresolved tool, permission, or task children", async () => {
+		const withTool = new SessionEventProjector(sessionId);
+		register(withTool);
+		await applyAll(withTool, [
+			firstInput,
+			started,
+			wireEvent(3, "tool_call", { call_id: "call-pending", tool: "edit", arguments: {} }),
+		]);
+		const failedWithTool = await withTool.apply(
+			wireEvent(4, "turn_failed", { error: { code: "turn_execution_failed", message: "[redacted]" } }),
+		);
+		expect(failedWithTool.error).toMatchObject({ code: "terminal_with_pending_tool_call" });
+
+		const withPermission = new SessionEventProjector(sessionId);
+		register(withPermission);
+		await applyAll(withPermission, [
+			firstInput,
+			started,
+			wireEvent(3, "permission_request", {
+				request_id: "permission-pending",
+				tool: "edit",
+				kind: "write",
+				rewindable: true,
+			}),
+		]);
+		const cancelledWithPermission = await withPermission.apply(
+			wireEvent(4, "turn_cancelled", { reason: "user_requested" }),
+		);
+		expect(cancelledWithPermission.error).toMatchObject({ code: "terminal_with_pending_permission" });
+
+		const withTask = new SessionEventProjector(sessionId);
+		register(withTask);
+		await applyAll(withTask, [
+			firstInput,
+			started,
+			wireEvent(3, "task_event", {
+				task_id: "task-pending",
+				kind: "subagent_spawned",
+				status: "running",
+			}),
+		]);
+		const failedWithTask = await withTask.apply(
+			wireEvent(4, "turn_failed", { error: { code: "turn_execution_failed", message: "[redacted]" } }),
+		);
+		expect(failedWithTask.error).toMatchObject({ code: "terminal_with_pending_task" });
+	});
+
+	test("rejects tool, permission, and runtime events after a terminal turn", async () => {
+		const lateEvents: Array<{ event: LoggedSessionEvent; code: string }> = [
+			{
+				event: wireEvent(7, "tool_result", {
+					call_id: "call-complete",
+					tool: "edit",
+					status: "ok",
+					error: false,
+					result: {},
+					artifact_ref: null,
+				}),
+				code: "tool_result_outside_active_turn",
+			},
+			{
+				event: wireEvent(7, "permission_response", {
+					request_id: "permission-complete",
+					decision: "allow",
+				}),
+				code: "permission_outside_active_turn",
+			},
+			{
+				event: wireEvent(7, "assistant.reasoning.delta", { text: "late" }),
+				code: "runtime_event_outside_active_turn",
+			},
+		];
+
+		for (const late of lateEvents) {
+			const projector = new SessionEventProjector(sessionId);
+			register(projector);
+			await applyAll(projector, [firstInput, started, deltaA, deltaB, completed, terminal]);
+			const result = await projector.apply(late.event);
+			expect(result.error).toMatchObject({ code: late.code });
+		}
+	});
 	test("projects todo snapshots through a dedicated native effect", async () => {
 		const projector = new SessionEventProjector(sessionId);
 		const effects = [];
@@ -428,9 +539,7 @@ describe("SessionEventProjector", () => {
 	test("fails closed when the backend reports an unsupported runtime family", async () => {
 		const projector = new SessionEventProjector(sessionId);
 		await applyAll(projector, [firstInput, started]);
-		const result = await projector.apply(
-			wireEvent(3, "error", { code: "unsupported_runtime_event_family" }),
-		);
+		const result = await projector.apply(wireEvent(3, "error", { code: "unsupported_runtime_event_family" }));
 		expect(result.status).toBe("rejected");
 		expect(result.error).toMatchObject({ kind: "unsupported-event-family", eventKind: "runtime_error_observed" });
 		expect(projector.state.frozen).toBe(true);

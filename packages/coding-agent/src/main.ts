@@ -26,14 +26,15 @@ import {
 import chalk from "chalk";
 import { CanonicalE4SessionPort } from "./breadboard/canonical-e4-session-port";
 import { validateBreadboardInteractiveLaunch } from "./breadboard/interactive-launch-policy";
-import { restoreLifecycleTerminal, writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
-import { dispatchLifecycleAction, LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
+import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
+import { LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
 import {
 	BreadboardRunConfigError,
 	loadSelectedBreadboardConfig,
 	resolveBreadboardRunConfig,
 } from "./breadboard/lifecycle/run-config";
+import { resolveNativeLaunchPolicy } from "./breadboard/native-launch-policy";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -1013,48 +1014,6 @@ async function runBreadboardInteractiveProduct(parsed: Args, pipedInput: string 
 	}
 }
 
-async function runBreadboardLifecyclePreflight(parsed: Args): Promise<boolean> {
-	try {
-		const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
-		const config = resolveBreadboardRunConfig({
-			cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
-			selectedConfig,
-			workspacePath: getProjectDir(),
-		});
-		// Platform lifecycle authority is shared with the governed interactive path.
-		const store =
-			config.mode === "local-owned"
-				? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
-				: undefined;
-		const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
-		const execution = await dispatchLifecycleAction(supervisor, "connect", {
-			closeReady: true,
-			restoreTerminal: restoreLifecycleTerminal,
-		});
-		const presentation = writeLifecyclePresentation(execution.result);
-		let exitCode: number = presentation.exitCode;
-		if (execution.result.kind === "ready") {
-			process.stderr.write(
-				"BreadBoard lifecycle is ready, but this launch mode is outside the governed interactive session slice.\n",
-			);
-			exitCode = 1;
-		}
-		if (execution.closeResult?.kind === "failure") {
-			exitCode = writeLifecyclePresentation(execution.closeResult).exitCode || 1;
-		}
-		if (execution.signal !== undefined) exitCode = execution.signal === "SIGINT" ? 130 : 143;
-		process.exitCode = exitCode;
-		return true;
-	} catch (error) {
-		const message =
-			error instanceof BreadboardRunConfigError
-				? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
-				: "BreadBoard lifecycle failed unexpectedly.";
-		process.stderr.write(`${message}\n`);
-		process.exitCode = 1;
-		return true;
-	}
-}
 
 export async function runRootCommand(
 	parsed: Args,
@@ -1104,6 +1063,18 @@ export async function runRootCommand(
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	const nativeSurface =
+		mode === "rpc" || mode === "rpc-ui" || mode === "acp" ? mode : "print";
+	if (!isInteractive) {
+		const nativePolicy = resolveNativeLaunchPolicy(parsedArgs, nativeSurface);
+		if (nativePolicy.kind === "unavailable") {
+			process.stderr.write(`${nativePolicy.message}\n`);
+			process.exitCode = nativePolicy.exitCode;
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			return;
+		}
+	}
 	if (isInteractive) {
 		stopStartupWatchdog();
 		stopThemeWatcher();
@@ -1180,15 +1151,6 @@ export async function runRootCommand(
 		settingsInstance.get("theme.light"),
 	);
 
-	if (!isInteractive && (await runBreadboardLifecyclePreflight(parsedArgs))) {
-		stopStartupWatchdog();
-		stopThemeWatcher();
-		return;
-	}
-
-	// Native OMP provider/session discovery is outside the governed BreadBoard
-	// interactive slice. Do not run it until excluded launch modes have failed
-	// closed through lifecycle preflight.
 	const notifs: (InteractiveModeNotify | null)[] = [];
 	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
@@ -1386,11 +1348,6 @@ export async function runRootCommand(
 	};
 
 	if (mode === "acp") {
-		if (await runBreadboardLifecyclePreflight(parsedArgs)) {
-			stopStartupWatchdog();
-			stopThemeWatcher();
-			return;
-		}
 		const createAcpSession = createAcpSessionFactory({
 			baseOptions: sessionOptions,
 			settings: settingsInstance,

@@ -18,11 +18,12 @@ import type {
 	SubmitRequest,
 	SubmitResult,
 } from "../breadboard/session-port";
+import type { AgentProgress, SingleResult, TaskToolDetails } from "../task/types";
+import type { TodoStatus, TodoToolDetails } from "../tools/todo";
 import { BreadboardAssistantText } from "./components/breadboard-assistant-text";
 import { CustomEditor } from "./components/custom-editor";
 import { ErrorBannerComponent } from "./components/error-banner";
 import { ToolExecutionComponent } from "./components/tool-execution";
-import type { TodoStatus, TodoToolDetails } from "../tools/todo";
 import { TranscriptContainer } from "./components/transcript-container";
 import { UserMessageComponent } from "./components/user-message";
 import { getEditorTheme, getSelectListTheme, theme } from "./theme/theme";
@@ -56,14 +57,37 @@ const RECONNECT_DELAY_MS = 250;
 
 const waitBeforeReconnect = (): Promise<void> => Bun.sleep(RECONNECT_DELAY_MS);
 
+function stripTerminalControls(value: string): string {
+	return value
+		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\|$)/g, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\x1b[ -/]*[@-~]/g, "")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
+function sanitizeTerminalValue(value: unknown): unknown {
+	if (typeof value === "string") return stripTerminalControls(value);
+	if (Array.isArray(value)) return value.map(sanitizeTerminalValue);
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+				stripTerminalControls(key),
+				sanitizeTerminalValue(entry),
+			]),
+		);
+	}
+	return value;
+}
+
 function safeRuntimeValue(value: unknown): unknown {
-	const detection = detectSensitiveValues(value);
-	return detection.findings.length > 0 || detection.truncated ? REDACTED_VALUE : value;
+	const sanitized = sanitizeTerminalValue(value);
+	const detection = detectSensitiveValues(sanitized);
+	return detection.findings.length > 0 || detection.truncated ? REDACTED_VALUE : sanitized;
 }
 
 function safeRuntimeText(value: unknown): string {
 	const safeValue = safeRuntimeValue(value);
-	if (typeof safeValue === "string") return safeValue;
+	if (typeof safeValue === "string") return stripTerminalControls(safeValue);
 	try {
 		return JSON.stringify(safeValue);
 	} catch {
@@ -74,11 +98,7 @@ function safeRuntimeText(value: unknown): string {
 function toolArguments(payload: Extract<ProjectorEffect, { readonly kind: "tool-call-started" }>["payload"]): unknown {
 	const raw = safeRuntimeValue(payload.arguments);
 	const base: Record<string, unknown> =
-		raw !== null && typeof raw === "object" && !Array.isArray(raw)
-			? { ...raw }
-			: raw === null
-				? {}
-				: { value: raw };
+		raw !== null && typeof raw === "object" && !Array.isArray(raw) ? { ...raw } : raw === null ? {} : { value: raw };
 	if (payload.action !== null) base.action = safeRuntimeValue(payload.action);
 	if (payload.diffPreview !== null) base.diff_preview = safeRuntimeValue(payload.diffPreview);
 	if (payload.progress !== null) base.progress = safeRuntimeValue(payload.progress);
@@ -102,14 +122,16 @@ function todoStatus(value: unknown): TodoStatus {
 	}
 }
 
-function todoDetails(
-	payload: Extract<ProjectorEffect, { readonly kind: "todo-updated" }>["payload"],
-): TodoToolDetails {
-	const nested = payload.todo;
+function todoDetails(payload: unknown): TodoToolDetails {
+	const root =
+		payload !== null && typeof payload === "object" && !Array.isArray(payload)
+			? (payload as Record<string, unknown>)
+			: {};
+	const nested = root.todo;
 	const snapshot =
 		nested !== null && typeof nested === "object" && !Array.isArray(nested)
 			? (nested as Record<string, unknown>)
-			: (payload as Record<string, unknown>);
+			: root;
 	const rawItems = Array.isArray(snapshot.items) ? snapshot.items : [];
 	const tasks = rawItems.flatMap(item => {
 		if (item === null || typeof item !== "object" || Array.isArray(item)) return [];
@@ -125,6 +147,82 @@ function todoDetails(
 		op: "view",
 		phases: tasks.length === 0 ? [] : [{ name: phaseName, tasks }],
 		storage: "memory",
+	};
+}
+
+type TaskEventPayload = Extract<ProjectorEffect, { readonly kind: "task-event-observed" }>["payload"];
+
+function taskProgressStatus(payload: TaskEventPayload): AgentProgress["status"] {
+	const status = payload.status?.toLowerCase() ?? "";
+	const kind = payload.kind.toLowerCase();
+	if (status === "completed" || /(?:completed|finished)$/.test(kind)) return "completed";
+	if (status === "failed" || /failed$/.test(kind)) return "failed";
+	if (["aborted", "cancelled", "canceled"].includes(status) || /(?:aborted|cancelled|canceled)$/.test(kind))
+		return "aborted";
+	if (status === "pending") return "pending";
+	return "running";
+}
+
+function taskRenderSnapshot(payload: TaskEventPayload): {
+	readonly args: Record<string, string>;
+	readonly details: TaskToolDetails;
+	readonly partial: boolean;
+} {
+	const status = taskProgressStatus(payload);
+	const taskId = safeRuntimeText(payload.taskId);
+	const agent = safeRuntimeText(payload.laneLabel ?? payload.laneId ?? "task");
+	const task = safeRuntimeText(payload.description ?? payload.kind);
+	const progress: AgentProgress = {
+		index: 0,
+		id: taskId,
+		agent,
+		agentSource: "project",
+		status,
+		task,
+		description: task,
+		recentTools: [],
+		recentOutput: [],
+		toolCount: 0,
+		requests: 0,
+		tokens: 0,
+		cost: 0,
+		durationMs: 0,
+	};
+	const partial = status === "pending" || status === "running";
+	const results: SingleResult[] = partial
+		? []
+		: [
+				{
+					index: 0,
+					id: taskId,
+					agent,
+					agentSource: "project",
+					task,
+					description: task,
+					exitCode: status === "completed" ? 0 : 1,
+					output: task,
+					stderr: "",
+					truncated: false,
+					durationMs: 0,
+					tokens: 0,
+					requests: 0,
+					aborted: status === "aborted" || undefined,
+				},
+			];
+	return {
+		args: { agent, task },
+		details: {
+			projectAgentsDir: null,
+			results,
+			totalDurationMs: 0,
+			progress: partial ? [progress] : undefined,
+			async: {
+				state: partial ? "running" : status === "completed" ? "completed" : "failed",
+				jobId: taskId,
+				type: "task",
+			},
+		},
+		partial,
 	};
 }
 
@@ -219,6 +317,7 @@ export class BreadboardInteractiveSessionController {
 	#assistantRows = new Map<string, BreadboardAssistantText>();
 	#toolRows = new Map<string, ToolExecutionComponent>();
 	#cancellations = new Map<string, CancellationState>();
+	#taskRows = new Map<string, ToolExecutionComponent>();
 	#todoRow: ToolExecutionComponent | null = null;
 	#permissionQueue: PermissionRequestPayload[] = [];
 	#permissionPrompt: Container | null = null;
@@ -478,7 +577,8 @@ export class BreadboardInteractiveSessionController {
 	}
 
 	#showNextPermission(): void {
-		if (this.#permissionPrompt !== null || this.#permissionDecisionInFlight || this.#permissionQueue.length === 0) return;
+		if (this.#permissionPrompt !== null || this.#permissionDecisionInFlight || this.#permissionQueue.length === 0)
+			return;
 		const request = this.#permissionQueue[0];
 		if (request === undefined) return;
 		const prompt = new Container();
@@ -576,10 +676,12 @@ export class BreadboardInteractiveSessionController {
 				break;
 			}
 			case "turn-completed":
+				this.#sealTodoRow();
 				this.#setStatus("Completed");
 				this.#releaseSubmission(String(effect.evidence.turnId));
 				break;
 			case "turn-failed": {
+				this.#sealTodoRow();
 				this.#setStatus("Failed");
 				const details = effect.failure.details;
 				const suffix = details.kind === "turn-failed" ? ` (${details.code})` : "";
@@ -589,6 +691,7 @@ export class BreadboardInteractiveSessionController {
 				break;
 			}
 			case "turn-cancelled":
+				this.#sealTodoRow();
 				this.#setStatus(`Cancelled (${effect.reason})`);
 				this.#releaseSubmission(String(effect.evidence.turnId));
 				break;
@@ -669,7 +772,6 @@ export class BreadboardInteractiveSessionController {
 					false,
 					callId,
 				);
-				row.seal();
 				this.#todoRow = row;
 				this.transcript.addChild(row);
 				break;
@@ -694,18 +796,34 @@ export class BreadboardInteractiveSessionController {
 				);
 				break;
 			case "task-event-observed": {
-				const detail = effect.payload.description ?? effect.payload.childSessionId ?? effect.payload.taskId;
-				const status = effect.payload.status === null ? "" : ` · ${safeRuntimeText(effect.payload.status)}`;
-				this.transcript.addChild(
-					new Text(
-						theme.fg(
-							"accent",
-							`Task ${safeRuntimeText(effect.payload.kind)} · ${safeRuntimeText(detail)}${status}`,
-						),
-						1,
-						0,
-					),
+				const taskId = safeRuntimeText(effect.payload.taskId);
+				const snapshot = taskRenderSnapshot(effect.payload);
+				let row = this.#taskRows.get(taskId);
+				if (row === undefined) {
+					const callId = `task:${taskId}`;
+					row = new ToolExecutionComponent(
+						"task",
+						snapshot.args,
+						{ showImages: false, liveRegion: this.transcript },
+						undefined,
+						this.ui,
+						process.cwd(),
+						callId,
+					);
+					row.setArgsComplete(callId);
+					this.#taskRows.set(taskId, row);
+					this.transcript.addChild(row);
+				}
+				row.updateResult(
+					{
+						content: [{ type: "text", text: safeRuntimeText(effect.payload.description ?? effect.payload.kind) }],
+						details: snapshot.details,
+						isError: !snapshot.partial && taskProgressStatus(effect.payload) !== "completed",
+					},
+					snapshot.partial,
+					`task:${taskId}`,
 				);
+				if (!snapshot.partial) row.seal();
 				break;
 			}
 			case "runtime-event-observed":
@@ -716,6 +834,10 @@ export class BreadboardInteractiveSessionController {
 				break;
 		}
 		this.ui.requestRender();
+	}
+	#sealTodoRow(): void {
+		this.#todoRow?.seal();
+		this.#todoRow = null;
 	}
 
 	#releaseSubmission(turnId: string): void {

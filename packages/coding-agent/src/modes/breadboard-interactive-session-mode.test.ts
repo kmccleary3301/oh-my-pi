@@ -11,8 +11,8 @@ import {
 	type LoggedSessionEvent,
 	type ObserveSessionRequest,
 	type OpenedSession,
-	projectDisplayText,
 	type PermissionRequestId,
+	projectDisplayText,
 	type ReplayContractDigest,
 	type SessionId,
 	type SessionSnapshot,
@@ -308,6 +308,17 @@ describe("BreadboardInteractiveSessionController", () => {
 					result: { changed: false },
 					artifactRef: "artifact://tool-output",
 				}),
+				event("task_event_observed", 8, {
+					taskId,
+					kind: "subagent_completed",
+					status: "completed",
+					description: "Review source",
+					parentTaskId: null,
+					childSessionId: asId<SessionId>("session-child"),
+					parentSessionId: sessionId,
+					laneId: null,
+					laneLabel: null,
+				}),
 			],
 		});
 
@@ -318,7 +329,7 @@ describe("BreadboardInteractiveSessionController", () => {
 		const rendered = Bun.stripANSI(controller.transcript.render(100).join("\n"));
 		expect(rendered).toContain("remote_tool");
 		expect(rendered).toContain("Permission requested");
-		expect(rendered).toContain("Task subagent_spawned");
+		expect(rendered).toContain("Review source");
 		expect(rendered).toContain("artifact://tool-output");
 		expect(controller.projector.state.frozen).toBe(false);
 		await controller.close();
@@ -340,14 +351,22 @@ describe("BreadboardInteractiveSessionController", () => {
 						],
 					},
 				}),
+				event("todo_updated", 4, {
+					todo: {
+						op: "snapshot",
+						scope_label: "Implementation",
+						items: [{ id: "task-3", title: "Ship the verified result", status: "in_progress" }],
+					},
+				}),
 			],
 		});
 
 		const observing = controller.observe();
 		await transport.eventsDelivered;
 		const rendered = Bun.stripANSI(controller.transcript.render(100).join("\n"));
-		expect(rendered).toContain("Todo 2 tasks");
-		expect(rendered).toContain("Render canonical todo rows");
+		expect(rendered).toContain("Todo 1 task");
+		expect(rendered).toContain("Ship the verified result");
+		expect(rendered).not.toContain("Render canonical todo rows");
 		expect(controller.projector.state.frozen).toBe(false);
 		await controller.close();
 		await observing;
@@ -407,6 +426,43 @@ describe("BreadboardInteractiveSessionController", () => {
 		expect(rendered).not.toContain(secret);
 		expect(rendered).not.toContain("canary-token-never-serialize");
 		expect(rendered).toContain("[redacted]");
+		await controller.close();
+		await observing;
+	});
+
+	it("strips terminal control sequences from runtime-owned text", async () => {
+		const { controller, transport } = await acceptedController({
+			events: [
+				event("input_observed", 1, { text: "hello" }),
+				event("turn_started", 2, ExactEmptyPayload.value),
+				event("tool_called", 3, {
+					callId: asId<ToolCallId>("call-controls"),
+					tool: "evil\u001b]2;pwned\u0007safe",
+					arguments: { note: "before\u001b[2Jafter" },
+					action: null,
+					diffPreview: null,
+					progress: null,
+				}),
+				event("task_event_observed", 4, {
+					taskId: asId<TaskId>("task-controls"),
+					kind: "subagent_spawned",
+					status: "running",
+					description: "task\u001b]8;;https://attacker.invalid\u0007label\u001b]8;;\u0007",
+					childSessionId: null,
+					parentSessionId: null,
+				}),
+			],
+		});
+
+		const observing = controller.observe();
+		await transport.eventsDelivered;
+		const raw = controller.transcript.render(100).join("\n");
+		const visible = Bun.stripANSI(raw);
+		expect(raw).not.toContain("\u001b]2;pwned\u0007");
+		expect(raw).not.toContain("\u001b[2J");
+		expect(raw).not.toContain("attacker.invalid");
+		expect(visible).toContain("evilsafe");
+		expect(visible).toContain("[redacted]");
 		await controller.close();
 		await observing;
 	});

@@ -3052,27 +3052,32 @@ describe("CLI lifecycle composition boundary", () => {
 		}
 	});
 
-	test("off print and protocol paths return typed unavailable without AgentSession fallback", async () => {
+	test("engine-off RPC remains native and keeps stdout byte-clean JSONL", async () => {
 		const home = await temporaryLifecycleHome();
-		const printResult = await runLifecycleCli(["launch", "--engine-mode", "off", "--print", "synthetic-user-echo"], home);
-		const rpcResult = await runLifecycleCli(["launch", "--engine-mode", "off", "--mode", "rpc"], home);
-		for (const result of [printResult, rpcResult]) {
-			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("BreadBoard engine: off");
-			expect(result.stdout).not.toContain("synthetic-user-echo");
-			expect(result.stderr).not.toContain("No models available");
-		}
+		const result = await runLifecycleCli(["launch", "--engine-mode", "off", "--mode", "rpc"], home);
+		expect(result.exitCode).toBe(0);
+		const frames = result.stdout.trim().split("\n").map(line => JSON.parse(line) as { type?: string });
+		expect(frames[0]).toEqual({ type: "ready" });
+		expect(frames.every(frame => typeof frame.type === "string")).toBe(true);
+		expect(`${result.stdout}${result.stderr}`).not.toContain("BreadBoard engine:");
+		expect(result.stderr).not.toContain("missing_engine_artifact");
 	});
 
-	test("connected modes stop print and protocol paths before AgentSession", async () => {
+	test("explicit BreadBoard engine selection rejects native surfaces on stderr only", async () => {
 		const home = await temporaryLifecycleHome();
 		const endpoint = "http://127.0.0.1:1";
-		const printResult = await runLifecycleCli(["launch", "--engine-mode", "local-external", "--engine-url", endpoint, "--print", "hello"], home);
-		const rpcResult = await runLifecycleCli(["launch", "--engine-mode", "local-external", "--engine-url", endpoint, "--mode", "rpc"], home);
-		for (const result of [printResult, rpcResult]) {
-			expect(result.exitCode).toBe(1);
-			expect(`${result.stdout}${result.stderr}`).toContain("BreadBoard engine: external-disconnected (endpoint_unreachable)");
-			expect(result.stderr).not.toContain("No models available");
+		const cases = [
+			["launch", "--engine-mode", "local-external", "--engine-url", endpoint, "--print", "hello"],
+			["launch", "--engine-mode", "local-external", "--engine-url", endpoint, "--mode", "rpc"],
+			["launch", "--engine-mode", "local-external", "--engine-url", endpoint, "--mode", "rpc-ui"],
+			["launch", "--engine-mode", "local-external", "--engine-url", endpoint, "--mode", "acp"],
+		] as const;
+		for (const args of cases) {
+			const result = await runLifecycleCli([...args], home);
+			expect(result.exitCode).toBe(2);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toContain("BreadBoard launch error [unsupported_native_mode]");
+			expect(result.stderr).not.toContain(endpoint);
 		}
 	});
 });

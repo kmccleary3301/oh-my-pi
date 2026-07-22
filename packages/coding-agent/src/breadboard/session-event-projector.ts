@@ -9,10 +9,11 @@ import type {
 	SessionId,
 	SubmitInput,
 	SubmitReceipt,
-	TurnId,
 	ToolCallId,
+	TurnId,
 } from "@breadboard/sdk";
 import {
+	detectSensitiveValues,
 	digestLoggedSessionEvent,
 	ExactEmptyPayload,
 	normalizeSubmitInput,
@@ -88,6 +89,52 @@ export type SessionProjectorError =
 			readonly code: string;
 	  };
 
+type ToolCalledPayload = Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>["payload"];
+type ToolResultPayload = Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>["payload"];
+type PermissionRequestedPayload = Extract<LoggedSessionEvent, { readonly kind: "permission_requested" }>["payload"];
+type PermissionRespondedPayload = Extract<LoggedSessionEvent, { readonly kind: "permission_responded" }>["payload"];
+type TaskEventPayload = Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>["payload"];
+
+type ProjectedToolCalledPayload = Omit<
+	ToolCalledPayload,
+	"tool" | "arguments" | "action" | "diffPreview" | "progress"
+> & {
+	readonly tool: string;
+	readonly arguments: unknown;
+	readonly action: string | null;
+	readonly diffPreview: unknown;
+	readonly progress: unknown;
+};
+type ProjectedToolResultPayload = Omit<ToolResultPayload, "tool" | "status" | "result" | "artifactRef"> & {
+	readonly tool: string | null;
+	readonly status: string;
+	readonly result: unknown;
+	readonly artifactRef: unknown;
+};
+type ProjectedPermissionRequestedPayload = Omit<
+	PermissionRequestedPayload,
+	"tool" | "kind" | "summary" | "defaultScope"
+> & {
+	readonly tool: string;
+	readonly kind: string;
+	readonly summary: string | null;
+	readonly defaultScope: string | null;
+};
+type ProjectedPermissionRespondedPayload = Omit<PermissionRespondedPayload, "decision"> & {
+	readonly decision: string;
+};
+type ProjectedTaskEventPayload = {
+	readonly taskId: string;
+	readonly kind: string;
+	readonly status: string | null;
+	readonly description: string | null;
+	readonly parentTaskId: string | null;
+	readonly childSessionId: string | null;
+	readonly parentSessionId: string | null;
+	readonly laneId: string | null;
+	readonly laneLabel: string | null;
+};
+
 export type ProjectorEffect =
 	| {
 			readonly kind: "input-accepted";
@@ -131,32 +178,32 @@ export type ProjectorEffect =
 	| {
 			readonly kind: "tool-call-started";
 			readonly evidence: EventEvidence;
-			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>["payload"];
+			readonly payload: ProjectedToolCalledPayload;
 	  }
 	| {
 			readonly kind: "tool-call-completed";
 			readonly evidence: EventEvidence;
-			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>["payload"];
+			readonly payload: ProjectedToolResultPayload;
 	  }
 	| {
 			readonly kind: "permission-requested";
 			readonly evidence: EventEvidence;
-			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "permission_requested" }>["payload"];
+			readonly payload: ProjectedPermissionRequestedPayload;
 	  }
 	| {
 			readonly kind: "permission-responded";
 			readonly evidence: EventEvidence;
-			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "permission_responded" }>["payload"];
+			readonly payload: ProjectedPermissionRespondedPayload;
 	  }
 	| {
 			readonly kind: "task-event-observed";
 			readonly evidence: EventEvidence;
-			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>["payload"];
+			readonly payload: ProjectedTaskEventPayload;
 	  }
 	| {
 			readonly kind: "todo-updated";
 			readonly evidence: EventEvidence;
-			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "todo_updated" }>["payload"];
+			readonly payload: unknown;
 	  }
 	| {
 			readonly kind: "runtime-event-observed";
@@ -235,12 +282,18 @@ interface MutablePermissionRequest {
 	responded: boolean;
 }
 
+interface MutableTask {
+	readonly turnId: TurnId;
+	status: "running" | "terminal";
+}
+
 interface Transition {
 	readonly turns: Map<TurnId, MutableTurn>;
 	readonly userMessages: Map<InputId, string>;
 	readonly effect: ProjectorEffect;
 	readonly toolCalls?: Map<ToolCallId, MutableToolCall>;
 	readonly permissionRequests?: Map<string, MutablePermissionRequest>;
+	readonly tasks?: Map<string, MutableTask>;
 }
 
 interface TransitionFailure {
@@ -273,6 +326,72 @@ const copyTurn = (turn: MutableTurn): MutableTurn => ({
 
 const hasTerminal = (turn: MutableTurn): boolean => turn.terminal !== null;
 
+const projectRuntimeValue = <Value>(value: Value): Value | typeof REDACTED_VALUE => {
+	const detection = detectSensitiveValues(value);
+	return detection.findings.length > 0 || detection.truncated ? REDACTED_VALUE : value;
+};
+
+const projectRuntimeText = (value: string): string =>
+	projectRuntimeValue(value) === REDACTED_VALUE ? REDACTED_VALUE : value;
+
+const projectNullableRuntimeText = (value: string | null): string | null =>
+	value === null ? null : projectRuntimeText(value);
+
+const projectToolCalledPayload = (payload: ToolCalledPayload): ProjectedToolCalledPayload => ({
+	...payload,
+	tool: projectRuntimeText(payload.tool),
+	arguments: projectRuntimeValue(payload.arguments),
+	action: projectNullableRuntimeText(payload.action),
+	diffPreview: projectRuntimeValue(payload.diffPreview),
+	progress: projectRuntimeValue(payload.progress),
+});
+
+const projectToolResultPayload = (payload: ToolResultPayload): ProjectedToolResultPayload => ({
+	...payload,
+	tool: projectNullableRuntimeText(payload.tool),
+	status: projectRuntimeText(payload.status),
+	result: projectRuntimeValue(payload.result),
+	artifactRef: projectRuntimeValue(payload.artifactRef),
+});
+
+const projectPermissionRequestedPayload = (
+	payload: PermissionRequestedPayload,
+): ProjectedPermissionRequestedPayload => ({
+	...payload,
+	tool: projectRuntimeText(payload.tool),
+	kind: projectRuntimeText(payload.kind),
+	summary: projectNullableRuntimeText(payload.summary),
+	defaultScope: projectNullableRuntimeText(payload.defaultScope),
+});
+
+const projectPermissionRespondedPayload = (
+	payload: PermissionRespondedPayload,
+): ProjectedPermissionRespondedPayload => ({
+	...payload,
+	decision: projectRuntimeText(payload.decision),
+});
+
+const projectTaskEventPayload = (payload: TaskEventPayload): ProjectedTaskEventPayload => ({
+	taskId: projectRuntimeText(String(payload.taskId)),
+	kind: projectRuntimeText(payload.kind),
+	status: projectNullableRuntimeText(payload.status),
+	description: projectNullableRuntimeText(payload.description),
+	parentTaskId: projectNullableRuntimeText(payload.parentTaskId),
+	childSessionId: projectNullableRuntimeText(payload.childSessionId),
+	parentSessionId: projectNullableRuntimeText(payload.parentSessionId),
+	laneId: projectNullableRuntimeText(payload.laneId),
+	laneLabel: projectNullableRuntimeText(payload.laneLabel),
+});
+
+const isTerminalTaskEvent = (payload: TaskEventPayload): boolean => {
+	const status = payload.status?.toLowerCase() ?? "";
+	const kind = payload.kind.toLowerCase();
+	return (
+		["completed", "failed", "cancelled", "canceled", "aborted"].includes(status) ||
+		/(?:completed|failed|cancelled|canceled|aborted|finished)$/.test(kind)
+	);
+};
+
 export class SessionEventProjector {
 	readonly #sessionId: SessionId;
 	#lastAppliedEventId: EventId | null;
@@ -283,6 +402,7 @@ export class SessionEventProjector {
 	#toolCalls = new Map<ToolCallId, MutableToolCall>();
 	#permissionRequests = new Map<string, MutablePermissionRequest>();
 	#digests = new Map<string, string>();
+	#tasks = new Map<string, MutableTask>();
 	#frozenError: SessionProjectorError | null = null;
 
 	constructor(sessionId: SessionId);
@@ -455,6 +575,7 @@ export class SessionEventProjector {
 		this.#userMessages = transition.userMessages;
 		if (transition.toolCalls !== undefined) this.#toolCalls = transition.toolCalls;
 		if (transition.permissionRequests !== undefined) this.#permissionRequests = transition.permissionRequests;
+		if (transition.tasks !== undefined) this.#tasks = transition.tasks;
 		this.#lastAppliedEventId = event.eventId;
 		this.#lastAppliedSequence = event.sequence;
 		this.#digests.set(event.eventId, digest);
@@ -520,8 +641,10 @@ export class SessionEventProjector {
 			case "tool_execution_stdout_delta":
 			case "tool_execution_stderr_delta":
 			case "tool_execution_completed":
+				return this.#runtimeEventObserved(event);
 			case "checkpoint_list_observed":
 			case "checkpoint_restored":
+				return this.#sessionRuntimeEventObserved(event);
 			case "warning_observed":
 			case "reward_updated":
 			case "limits_updated":
@@ -535,16 +658,19 @@ export class SessionEventProjector {
 			case "run_finished":
 				return this.#sessionMetadata(event);
 			case "runtime_error_observed":
-				return event.payload.error.code === "unsupported_runtime_event_family"
-					? {
-							error: {
-								kind: "unsupported-event-family",
-								eventId: event.eventId,
-								sequence: event.sequence,
-								eventKind: event.kind,
-							},
-						}
-					: this.#runtimeEventObserved(event);
+				if (event.payload.error.code === "unsupported_runtime_event_family") {
+					return {
+						error: {
+							kind: "unsupported-event-family",
+							eventId: event.eventId,
+							sequence: event.sequence,
+							eventKind: event.kind,
+						},
+					};
+				}
+				return event.scope === "turn"
+					? this.#runtimeEventObserved(event)
+					: this.#sessionRuntimeEventObserved(event);
 			default:
 				return this.#unreachable(event);
 		}
@@ -572,7 +698,11 @@ export class SessionEventProjector {
 			turns,
 			userMessages,
 			toolCalls,
-			effect: { kind: "tool-call-started", evidence: projectEventEvidence(event), payload: event.payload },
+			effect: {
+				kind: "tool-call-started",
+				evidence: projectEventEvidence(event),
+				payload: projectToolCalledPayload(event.payload),
+			},
 		};
 	}
 
@@ -581,6 +711,8 @@ export class SessionEventProjector {
 	): TransitionResult {
 		const prepared = this.#prepareTurn(event);
 		if ("error" in prepared) return prepared;
+		if (!prepared.turn.started || hasTerminal(prepared.turn))
+			return { error: protocolError("tool_result_outside_active_turn", event.eventId, event.sequence) };
 		const current = this.#toolCalls.get(event.payload.callId);
 		if (current === undefined || current.turnId !== event.turnId)
 			return { error: protocolError("unknown_tool_call_correlation", event.eventId, event.sequence) };
@@ -600,7 +732,7 @@ export class SessionEventProjector {
 			effect: {
 				kind: "tool-call-completed",
 				evidence: projectEventEvidence(event),
-				payload: event.payload,
+				payload: projectToolResultPayload(event.payload),
 			},
 		};
 	}
@@ -620,7 +752,11 @@ export class SessionEventProjector {
 			turns: prepared.turns,
 			userMessages: prepared.userMessages,
 			permissionRequests,
-			effect: { kind: "permission-requested", evidence: projectEventEvidence(event), payload: event.payload },
+			effect: {
+				kind: "permission-requested",
+				evidence: projectEventEvidence(event),
+				payload: projectPermissionRequestedPayload(event.payload),
+			},
 		};
 	}
 
@@ -629,6 +765,8 @@ export class SessionEventProjector {
 	): TransitionResult {
 		const prepared = this.#prepareTurn(event);
 		if ("error" in prepared) return prepared;
+		if (!prepared.turn.started || hasTerminal(prepared.turn))
+			return { error: protocolError("permission_outside_active_turn", event.eventId, event.sequence) };
 		const current = this.#permissionRequests.get(event.payload.requestId);
 		if (current === undefined || current.turnId !== event.turnId)
 			return { error: protocolError("unknown_permission_correlation", event.eventId, event.sequence) };
@@ -640,45 +778,82 @@ export class SessionEventProjector {
 			turns: prepared.turns,
 			userMessages: prepared.userMessages,
 			permissionRequests,
-			effect: { kind: "permission-responded", evidence: projectEventEvidence(event), payload: event.payload },
+			effect: {
+				kind: "permission-responded",
+				evidence: projectEventEvidence(event),
+				payload: projectPermissionRespondedPayload(event.payload),
+			},
 		};
 	}
 
-	#taskEventObserved(
-		event: Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>,
-	): TransitionResult {
+	#taskEventObserved(event: Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>): TransitionResult {
 		const prepared = this.#prepareTurn(event);
 		if ("error" in prepared) return prepared;
 		if (!prepared.turn.started || hasTerminal(prepared.turn))
 			return { error: protocolError("task_event_outside_active_turn", event.eventId, event.sequence) };
+		const key = String(event.payload.taskId);
+		const current = this.#tasks.get(key);
+		if (current !== undefined && current.turnId !== event.turnId)
+			return { error: protocolError("task_correlation_collision", event.eventId, event.sequence) };
+		if (current?.status === "terminal")
+			return { error: protocolError("task_event_after_terminal", event.eventId, event.sequence) };
+		const tasks = new Map(this.#tasks);
+		tasks.set(key, {
+			turnId: event.turnId,
+			status: isTerminalTaskEvent(event.payload) ? "terminal" : "running",
+		});
 		return {
 			turns: prepared.turns,
 			userMessages: prepared.userMessages,
-			effect: { kind: "task-event-observed", evidence: projectEventEvidence(event), payload: event.payload },
+			tasks,
+			effect: {
+				kind: "task-event-observed",
+				evidence: projectEventEvidence(event),
+				payload: projectTaskEventPayload(event.payload),
+			},
 		};
 	}
 
 	#todoUpdated(event: Extract<LoggedSessionEvent, { readonly kind: "todo_updated" }>): Transition {
-		const turns = new Map<TurnId, MutableTurn>();
-		for (const [turnId, turn] of this.#turns) turns.set(turnId, copyTurn(turn));
 		return {
-			turns,
+			turns: new Map(this.#turns),
 			userMessages: new Map(this.#userMessages),
-			effect: { kind: "todo-updated", evidence: projectEventEvidence(event), payload: event.payload },
+			effect: {
+				kind: "todo-updated",
+				evidence: projectEventEvidence(event),
+				payload: projectRuntimeValue(event.payload),
+			},
 		};
 	}
 
-	#runtimeEventObserved(event: LoggedSessionEvent): Transition {
-		const turns = new Map<TurnId, MutableTurn>();
-		for (const [turnId, turn] of this.#turns) turns.set(turnId, copyTurn(turn));
+	#runtimeEventObserved(
+		event: LoggedSessionEvent & { readonly inputId: InputId; readonly turnId: TurnId },
+	): TransitionResult {
+		const prepared = this.#prepareTurn(event);
+		if ("error" in prepared) return prepared;
+		if (!prepared.turn.started || hasTerminal(prepared.turn))
+			return { error: protocolError("runtime_event_outside_active_turn", event.eventId, event.sequence) };
 		return {
-			turns,
+			turns: prepared.turns,
+			userMessages: prepared.userMessages,
+			effect: {
+				kind: "runtime-event-observed",
+				evidence: projectEventEvidence(event),
+				eventKind: event.kind,
+				payload: projectRuntimeValue(event.payload),
+			},
+		};
+	}
+
+	#sessionRuntimeEventObserved(event: LoggedSessionEvent): Transition {
+		return {
+			turns: new Map(this.#turns),
 			userMessages: new Map(this.#userMessages),
 			effect: {
 				kind: "runtime-event-observed",
 				evidence: projectEventEvidence(event),
 				eventKind: event.kind,
-				payload: event.payload,
+				payload: projectRuntimeValue(event.payload),
 			},
 		};
 	}
@@ -847,6 +1022,8 @@ export class SessionEventProjector {
 		if (!turn.assistantCompleted)
 			return { error: protocolError("completed_without_assistant_text", event.eventId, event.sequence) };
 		if (hasTerminal(turn)) return { error: protocolError("duplicate_terminal", event.eventId, event.sequence) };
+		const pendingChildError = this.#pendingChildError(event.turnId, event);
+		if (pendingChildError !== null) return pendingChildError;
 		turn.terminal = "completed";
 		turn.submittedText = null;
 		turn.deltaParts.length = 0;
@@ -861,6 +1038,8 @@ export class SessionEventProjector {
 		if (!turn.inputObserved || !turn.started)
 			return { error: protocolError("failed_before_turn_start", event.eventId, event.sequence) };
 		if (hasTerminal(turn)) return { error: protocolError("duplicate_terminal", event.eventId, event.sequence) };
+		const pendingChildError = this.#pendingChildError(event.turnId, event);
+		if (pendingChildError !== null) return pendingChildError;
 		if (event.payload.error.message !== REDACTED_VALUE)
 			return { error: protocolError("unredacted_turn_error", event.eventId, event.sequence) };
 		const failure = turnFailureFromEvent(event);
@@ -887,6 +1066,8 @@ export class SessionEventProjector {
 			return { error: protocolError("cancelled_before_input", event.eventId, event.sequence) };
 		}
 		if (hasTerminal(turn)) return { error: protocolError("duplicate_terminal", event.eventId, event.sequence) };
+		const pendingChildError = this.#pendingChildError(event.turnId, event);
+		if (pendingChildError !== null) return pendingChildError;
 		if (turn.cancellation?.originalDisposition === "cancellation_requested" && !turn.started) {
 			return { error: protocolError("active_cancel_before_turn_start", event.eventId, event.sequence) };
 		}
@@ -901,7 +1082,30 @@ export class SessionEventProjector {
 		};
 	}
 
-	#prepareTurn(event: Extract<LoggedSessionEvent, { readonly inputId: InputId; readonly turnId: TurnId }>):
+	#pendingChildError(turnId: TurnId, event: LoggedSessionEvent): TransitionFailure | null {
+		for (const toolCall of this.#toolCalls.values()) {
+			if (toolCall.turnId === turnId && toolCall.status === "running") {
+				return { error: protocolError("terminal_with_pending_tool_call", event.eventId, event.sequence) };
+			}
+		}
+		for (const permission of this.#permissionRequests.values()) {
+			if (permission.turnId === turnId && !permission.responded) {
+				return { error: protocolError("terminal_with_pending_permission", event.eventId, event.sequence) };
+			}
+		}
+		for (const task of this.#tasks.values()) {
+			if (task.turnId === turnId && task.status === "running") {
+				return { error: protocolError("terminal_with_pending_task", event.eventId, event.sequence) };
+			}
+		}
+		return null;
+	}
+	#prepareTurn(event: {
+		readonly inputId: InputId;
+		readonly turnId: TurnId;
+		readonly eventId: EventId;
+		readonly sequence: number;
+	}):
 		| {
 				readonly turn: MutableTurn;
 				readonly turns: Map<TurnId, MutableTurn>;
@@ -943,11 +1147,7 @@ export class SessionEventProjector {
 		};
 	}
 
-	#state(
-		turns = this.#turns,
-		userMessages = this.#userMessages,
-		toolCalls = this.#toolCalls,
-	): ProjectorState {
+	#state(turns = this.#turns, userMessages = this.#userMessages, toolCalls = this.#toolCalls): ProjectorState {
 		const visibleTurns = new Map<TurnId, ProjectedTurnState>();
 		for (const [turnId, turn] of turns) {
 			const status: ProjectedTurnStatus = turn.terminal ?? (turn.started ? "started" : "accepted");
@@ -969,11 +1169,11 @@ export class SessionEventProjector {
 			visibleToolCalls.set(callId, {
 				callId,
 				turnId: toolCall.turnId,
-				tool: toolCall.tool,
-				arguments: toolCall.arguments,
+				tool: projectRuntimeText(toolCall.tool),
+				arguments: projectRuntimeValue(toolCall.arguments),
 				status: toolCall.status,
-				result: toolCall.result,
-				artifactRef: toolCall.artifactRef,
+				result: projectRuntimeValue(toolCall.result),
+				artifactRef: toolCall.artifactRef === null ? null : projectRuntimeText(String(toolCall.artifactRef)),
 			});
 		}
 		return {
