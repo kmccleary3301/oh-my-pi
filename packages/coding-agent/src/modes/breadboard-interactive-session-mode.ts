@@ -4,8 +4,8 @@ import {
 	detectSensitiveValues,
 	REDACTED_VALUE,
 } from "@breadboard/sdk";
-import type { Terminal, TUI } from "@oh-my-pi/pi-tui";
-import { Container, ProcessTerminal, Text, TUI as Tui } from "@oh-my-pi/pi-tui";
+import type { SelectItem, Terminal, TUI } from "@oh-my-pi/pi-tui";
+import { Container, ProcessTerminal, SelectList, Text, TUI as Tui } from "@oh-my-pi/pi-tui";
 import {
 	type ProjectorEffect,
 	SessionEventProjector,
@@ -22,9 +22,10 @@ import { BreadboardAssistantText } from "./components/breadboard-assistant-text"
 import { CustomEditor } from "./components/custom-editor";
 import { ErrorBannerComponent } from "./components/error-banner";
 import { ToolExecutionComponent } from "./components/tool-execution";
+import type { TodoStatus, TodoToolDetails } from "../tools/todo";
 import { TranscriptContainer } from "./components/transcript-container";
 import { UserMessageComponent } from "./components/user-message";
-import { getEditorTheme, theme } from "./theme/theme";
+import { getEditorTheme, getSelectListTheme, theme } from "./theme/theme";
 
 export interface BreadboardInteractiveSessionModeOptions {
 	/** Test seam for terminal ownership; production defaults to ProcessTerminal. */
@@ -42,6 +43,8 @@ interface PendingSubmitRequest {
 	readonly text: string;
 	readonly clientMessageId: string;
 }
+
+type PermissionRequestPayload = Extract<ProjectorEffect, { readonly kind: "permission-requested" }>["payload"];
 
 interface CancellationState {
 	readonly key: string;
@@ -80,6 +83,49 @@ function toolArguments(payload: Extract<ProjectorEffect, { readonly kind: "tool-
 	if (payload.diffPreview !== null) base.diff_preview = safeRuntimeValue(payload.diffPreview);
 	if (payload.progress !== null) base.progress = safeRuntimeValue(payload.progress);
 	return base;
+}
+
+function todoStatus(value: unknown): TodoStatus {
+	switch (value) {
+		case "done":
+		case "completed":
+			return "completed";
+		case "canceled":
+		case "cancelled":
+		case "abandoned":
+			return "abandoned";
+		case "in_progress":
+		case "active":
+			return "in_progress";
+		default:
+			return "pending";
+	}
+}
+
+function todoDetails(
+	payload: Extract<ProjectorEffect, { readonly kind: "todo-updated" }>["payload"],
+): TodoToolDetails {
+	const nested = payload.todo;
+	const snapshot =
+		nested !== null && typeof nested === "object" && !Array.isArray(nested)
+			? (nested as Record<string, unknown>)
+			: (payload as Record<string, unknown>);
+	const rawItems = Array.isArray(snapshot.items) ? snapshot.items : [];
+	const tasks = rawItems.flatMap(item => {
+		if (item === null || typeof item !== "object" || Array.isArray(item)) return [];
+		const record = item as Record<string, unknown>;
+		const rawContent = record.title ?? record.content ?? record.id;
+		if (typeof rawContent !== "string" || rawContent.trim().length === 0) return [];
+		return [{ content: safeRuntimeText(rawContent), status: todoStatus(record.status) }];
+	});
+	const rawLabel = snapshot.scope_label ?? snapshot.scopeLabel;
+	const phaseName =
+		typeof rawLabel === "string" && rawLabel.trim().length > 0 ? safeRuntimeText(rawLabel) : "BreadBoard";
+	return {
+		op: "view",
+		phases: tasks.length === 0 ? [] : [{ name: phaseName, tasks }],
+		storage: "memory",
+	};
 }
 
 function makeRequestKey(): string {
@@ -173,6 +219,10 @@ export class BreadboardInteractiveSessionController {
 	#assistantRows = new Map<string, BreadboardAssistantText>();
 	#toolRows = new Map<string, ToolExecutionComponent>();
 	#cancellations = new Map<string, CancellationState>();
+	#todoRow: ToolExecutionComponent | null = null;
+	#permissionQueue: PermissionRequestPayload[] = [];
+	#permissionPrompt: Container | null = null;
+	#permissionDecisionInFlight = false;
 	#fatalFailure: CanonicalE4Failure | null = null;
 	#startUi: boolean;
 
@@ -226,6 +276,16 @@ export class BreadboardInteractiveSessionController {
 
 	get toolRows(): ReadonlyMap<string, ToolExecutionComponent> {
 		return this.#toolRows;
+	}
+
+	get pendingPermissionCount(): number {
+		return this.#permissionQueue.length;
+	}
+
+	async respondToPendingPermission(decision: "allow" | "deny"): Promise<void> {
+		const request = this.#permissionQueue[0];
+		if (request === undefined) return;
+		await this.#respondPermission(request, decision);
 	}
 
 	get fatalFailure(): CanonicalE4Failure | null {
@@ -417,6 +477,71 @@ export class BreadboardInteractiveSessionController {
 		this.transcript.addChild(row);
 	}
 
+	#showNextPermission(): void {
+		if (this.#permissionPrompt !== null || this.#permissionDecisionInFlight || this.#permissionQueue.length === 0) return;
+		const request = this.#permissionQueue[0];
+		if (request === undefined) return;
+		const prompt = new Container();
+		const detail = [safeRuntimeText(request.tool), safeRuntimeText(request.kind)]
+			.filter(value => value.length > 0)
+			.join(" · ");
+		prompt.addChild(new Text(theme.fg("warning", `Permission required · ${detail}`), 1, 0));
+		if (request.summary !== null) {
+			prompt.addChild(new Text(theme.fg("dim", safeRuntimeText(request.summary)), 1, 0));
+		}
+		const items: SelectItem[] = [
+			{ value: "allow", label: "Allow once" },
+			{ value: "deny", label: "Deny" },
+		];
+		const list = new SelectList(items, items.length, getSelectListTheme());
+		list.onSelect = item => {
+			if (item.value === "allow" || item.value === "deny") {
+				void this.#respondPermission(request, item.value);
+			}
+		};
+		list.onCancel = () => {
+			void this.#respondPermission(request, "deny");
+		};
+		prompt.addChild(list);
+		this.#permissionPrompt = prompt;
+		this.editor.disableSubmit = true;
+		this.editorContainer.clear();
+		this.editorContainer.addChild(prompt);
+		this.ui.setFocus(list);
+		this.ui.requestRender();
+	}
+
+	#removePermission(requestId: string): void {
+		const current = this.#permissionQueue[0];
+		this.#permissionQueue = this.#permissionQueue.filter(item => String(item.requestId) !== requestId);
+		if (current !== undefined && String(current.requestId) === requestId) {
+			const prompt = this.#permissionPrompt;
+			this.#permissionPrompt = null;
+			this.editorContainer.clear();
+			prompt?.dispose();
+			this.editorContainer.addChild(this.editor);
+			this.editor.disableSubmit = this.#closed || this.#fatalFailure !== null;
+			this.ui.setFocus(this.editor);
+		}
+		this.#showNextPermission();
+	}
+
+	async #respondPermission(request: PermissionRequestPayload, decision: "allow" | "deny"): Promise<void> {
+		if (this.#permissionDecisionInFlight || this.#closed) return;
+		this.#permissionDecisionInFlight = true;
+		this.#setStatus(`Permission ${decision} requested`);
+		try {
+			await this.#runtime.respondPermission({ requestId: request.requestId, decision });
+			this.#removePermission(String(request.requestId));
+		} catch (error) {
+			const failure = error instanceof CanonicalE4ClientError ? error.failure : undefined;
+			this.#showFailure(failure ?? { kind: "protocol", code: "permission_decision_failed" });
+		} finally {
+			this.#permissionDecisionInFlight = false;
+			this.#showNextPermission();
+		}
+	}
+
 	#applyEffect(effect: ProjectorEffect): void {
 		switch (effect.kind) {
 			case "input-accepted":
@@ -471,7 +596,7 @@ export class BreadboardInteractiveSessionController {
 				const callId = String(effect.payload.callId);
 				if (this.#toolRows.has(callId)) break;
 				const row = new ToolExecutionComponent(
-					effect.payload.tool,
+					safeRuntimeText(effect.payload.tool),
 					toolArguments(effect.payload),
 					{ showImages: false, liveRegion: this.transcript },
 					undefined,
@@ -482,7 +607,7 @@ export class BreadboardInteractiveSessionController {
 				row.setArgsComplete(callId);
 				this.#toolRows.set(callId, row);
 				this.transcript.addChild(row);
-				this.#setStatus(`Running ${effect.payload.tool}`);
+				this.#setStatus(`Running ${safeRuntimeText(effect.payload.tool)}`);
 				break;
 			}
 			case "tool-call-completed": {
@@ -509,21 +634,61 @@ export class BreadboardInteractiveSessionController {
 					callId,
 				);
 				row.seal();
-				this.#setStatus(effect.payload.error ? `${effect.payload.tool ?? "Tool"} failed` : "Working…");
+				this.#setStatus(
+					effect.payload.error ? `${safeRuntimeText(effect.payload.tool ?? "Tool")} failed` : "Working…",
+				);
+				break;
+			}
+			case "todo-updated": {
+				const previous = this.#todoRow;
+				if (previous !== null) {
+					if (this.transcript.isBlockUncommitted(previous)) {
+						this.transcript.removeChild(previous);
+						previous.dispose();
+					} else {
+						previous.seal();
+					}
+				}
+				const callId = `todo:${String(effect.evidence.eventId)}`;
+				const row = new ToolExecutionComponent(
+					"todo",
+					{ op: "view" },
+					{ showImages: false, liveRegion: this.transcript },
+					undefined,
+					this.ui,
+					process.cwd(),
+					callId,
+				);
+				row.setArgsComplete(callId);
+				row.updateResult(
+					{
+						content: [{ type: "text", text: "Todo snapshot" }],
+						details: todoDetails(effect.payload),
+						isError: false,
+					},
+					false,
+					callId,
+				);
+				row.seal();
+				this.#todoRow = row;
+				this.transcript.addChild(row);
 				break;
 			}
 			case "permission-requested": {
 				const detail = [
-					effect.payload.tool,
-					effect.payload.kind,
+					safeRuntimeText(effect.payload.tool),
+					safeRuntimeText(effect.payload.kind),
 					effect.payload.summary === null ? null : safeRuntimeText(effect.payload.summary),
 				]
 					.filter((value): value is string => typeof value === "string" && value.length > 0)
 					.join(" · ");
 				this.transcript.addChild(new Text(theme.fg("warning", `Permission requested · ${detail}`), 1, 0));
+				this.#permissionQueue.push(effect.payload);
+				this.#showNextPermission();
 				break;
 			}
 			case "permission-responded":
+				this.#removePermission(String(effect.payload.requestId));
 				this.transcript.addChild(
 					new Text(theme.fg("dim", `Permission ${safeRuntimeText(effect.payload.decision)}`), 1, 0),
 				);

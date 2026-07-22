@@ -376,4 +376,63 @@ describe("SessionEventProjector", () => {
 		});
 		expect(projector.state.frozen).toBe(false);
 	});
+	test("projects todo snapshots through a dedicated native effect", async () => {
+		const projector = new SessionEventProjector(sessionId);
+		const effects = [];
+		for (const event of [
+			firstInput,
+			started,
+			wireEvent(3, "todo_event", {
+				todo: {
+					op: "snapshot",
+					scope_label: "Implementation",
+					items: [{ id: "task-1", title: "Render todo rows", status: "in_progress" }],
+				},
+			}),
+		]) {
+			effects.push((await projector.apply(event)).effect);
+		}
+		expect(effects.at(-1)).toMatchObject({
+			kind: "todo-updated",
+			payload: { todo: { op: "snapshot" } },
+		});
+		expect(projector.state.frozen).toBe(false);
+	});
+
+	test("rejects unknown and duplicate permission correlations", async () => {
+		const unknown = new SessionEventProjector(sessionId);
+		await applyAll(unknown, [firstInput, started]);
+		const unknownResponse = await unknown.apply(
+			wireEvent(3, "permission_response", { request_id: "missing", decision: "deny" }),
+		);
+		expect(unknownResponse.error).toMatchObject({ kind: "protocol", code: "unknown_permission_correlation" });
+
+		const duplicate = new SessionEventProjector(sessionId);
+		await applyAll(duplicate, [
+			firstInput,
+			started,
+			wireEvent(3, "permission_request", {
+				request_id: "permission-1",
+				tool: "edit",
+				kind: "write",
+				rewindable: true,
+			}),
+			wireEvent(4, "permission_response", { request_id: "permission-1", decision: "allow" }),
+		]);
+		const repeated = await duplicate.apply(
+			wireEvent(5, "permission_response", { request_id: "permission-1", decision: "deny" }),
+		);
+		expect(repeated.error).toMatchObject({ kind: "protocol", code: "duplicate_permission_response" });
+	});
+
+	test("fails closed when the backend reports an unsupported runtime family", async () => {
+		const projector = new SessionEventProjector(sessionId);
+		await applyAll(projector, [firstInput, started]);
+		const result = await projector.apply(
+			wireEvent(3, "error", { code: "unsupported_runtime_event_family" }),
+		);
+		expect(result.status).toBe("rejected");
+		expect(result.error).toMatchObject({ kind: "unsupported-event-family", eventKind: "runtime_error_observed" });
+		expect(projector.state.frozen).toBe(true);
+	});
 });

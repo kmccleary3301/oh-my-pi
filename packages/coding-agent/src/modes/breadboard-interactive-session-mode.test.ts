@@ -94,10 +94,13 @@ function runtime(
 		submit?: (request: SubmitInput) => Promise<SubmitReceipt>;
 		cancel?: () => Promise<CancellationReceipt>;
 		events?: readonly LoggedSessionEvent[];
+		respondPermission?: OpenedSession["respondPermission"];
 	} = {},
 ) {
 	let closeCalls = 0;
 	let cancelCalls = 0;
+	let permissionDecisionCalls = 0;
+	let lastPermissionDecision: Parameters<OpenedSession["respondPermission"]>[0] | undefined;
 	let markEventsDelivered: () => void;
 	const eventsDelivered = new Promise<void>(resolve => {
 		markEventsDelivered = resolve;
@@ -120,6 +123,15 @@ function runtime(
 				originalDisposition: "cancellation_requested",
 			};
 		},
+		respondPermission: async request => {
+			permissionDecisionCalls++;
+			lastPermissionDecision = request;
+			if (options.respondPermission !== undefined) return options.respondPermission(request);
+			return {
+				requestId: asId<PermissionRequestId>(String(request.requestId)),
+				decision: request.decision,
+			};
+		},
 		events: async function* (_request?: ObserveSessionRequest) {
 			for (const item of options.events ?? []) yield item;
 			markEventsDelivered();
@@ -136,6 +148,12 @@ function runtime(
 		},
 		get cancelCalls() {
 			return cancelCalls;
+		},
+		get permissionDecisionCalls() {
+			return permissionDecisionCalls;
+		},
+		get lastPermissionDecision() {
+			return lastPermissionDecision;
 		},
 	};
 }
@@ -303,6 +321,92 @@ describe("BreadboardInteractiveSessionController", () => {
 		expect(rendered).toContain("Task subagent_spawned");
 		expect(rendered).toContain("artifact://tool-output");
 		expect(controller.projector.state.frozen).toBe(false);
+		await controller.close();
+		await observing;
+	});
+
+	it("renders canonical todo snapshots through the native OMP todo component", async () => {
+		const { controller, transport } = await acceptedController({
+			events: [
+				event("input_observed", 1, { text: "hello" }),
+				event("turn_started", 2, ExactEmptyPayload.value),
+				event("todo_updated", 3, {
+					todo: {
+						op: "snapshot",
+						scope_label: "Implementation",
+						items: [
+							{ id: "task-1", title: "Render canonical todo rows", status: "in_progress" },
+							{ id: "task-2", title: "Verify the result", status: "done" },
+						],
+					},
+				}),
+			],
+		});
+
+		const observing = controller.observe();
+		await transport.eventsDelivered;
+		const rendered = Bun.stripANSI(controller.transcript.render(100).join("\n"));
+		expect(rendered).toContain("Todo 2 tasks");
+		expect(rendered).toContain("Render canonical todo rows");
+		expect(controller.projector.state.frozen).toBe(false);
+		await controller.close();
+		await observing;
+	});
+
+	it("submits native permission decisions through the canonical session command", async () => {
+		const permissionRequestId = asId<PermissionRequestId>("permission-live");
+		const { controller, transport } = await acceptedController({
+			events: [
+				event("input_observed", 1, { text: "hello" }),
+				event("turn_started", 2, ExactEmptyPayload.value),
+				event("permission_requested", 3, {
+					requestId: permissionRequestId,
+					tool: "run_shell",
+					kind: "execute",
+					summary: "Run focused verification",
+					defaultScope: "project",
+					rewindable: false,
+				}),
+			],
+		});
+
+		const observing = controller.observe();
+		await transport.eventsDelivered;
+		expect(controller.pendingPermissionCount).toBe(1);
+		expect(Bun.stripANSI(controller.editorContainer.render(100).join("\n"))).toContain("Allow once");
+		await controller.respondToPendingPermission("allow");
+		expect(transport.permissionDecisionCalls).toBe(1);
+		expect(transport.lastPermissionDecision).toEqual({ requestId: permissionRequestId, decision: "allow" });
+		expect(controller.pendingPermissionCount).toBe(0);
+		await controller.close();
+		await observing;
+	});
+
+	it("redacts sensitive tool and permission labels before native rendering", async () => {
+		const secret = "sk-canary-never-serialize-123456";
+		const { controller, transport } = await acceptedController({
+			events: [
+				event("input_observed", 1, { text: "hello" }),
+				event("turn_started", 2, ExactEmptyPayload.value),
+				event("permission_requested", 3, {
+					requestId: asId<PermissionRequestId>("permission-redacted"),
+					tool: secret,
+					kind: "authorization is Bearer canary-token-never-serialize",
+					summary: secret,
+					defaultScope: null,
+					rewindable: false,
+				}),
+			],
+		});
+
+		const observing = controller.observe();
+		await transport.eventsDelivered;
+		const rendered = Bun.stripANSI(
+			[...controller.transcript.render(100), ...controller.editorContainer.render(100)].join("\n"),
+		);
+		expect(rendered).not.toContain(secret);
+		expect(rendered).not.toContain("canary-token-never-serialize");
+		expect(rendered).toContain("[redacted]");
 		await controller.close();
 		await observing;
 	});

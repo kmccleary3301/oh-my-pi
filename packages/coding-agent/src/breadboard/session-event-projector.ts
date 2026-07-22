@@ -46,7 +46,7 @@ export interface ProjectedToolCallState {
 	readonly arguments: unknown;
 	readonly status: "running" | "completed" | "failed";
 	readonly result: unknown;
-	readonly artifactRef: string | null;
+	readonly artifactRef: unknown;
 }
 
 export interface ProjectorState {
@@ -154,6 +154,11 @@ export type ProjectorEffect =
 			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>["payload"];
 	  }
 	| {
+			readonly kind: "todo-updated";
+			readonly evidence: EventEvidence;
+			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "todo_updated" }>["payload"];
+	  }
+	| {
 			readonly kind: "runtime-event-observed";
 			readonly evidence: EventEvidence;
 			readonly eventKind: LoggedSessionEvent["kind"];
@@ -222,7 +227,12 @@ interface MutableToolCall {
 	readonly arguments: unknown;
 	status: "running" | "completed" | "failed";
 	result: unknown;
-	artifactRef: string | null;
+	artifactRef: unknown;
+}
+
+interface MutablePermissionRequest {
+	readonly turnId: TurnId;
+	responded: boolean;
 }
 
 interface Transition {
@@ -230,6 +240,7 @@ interface Transition {
 	readonly userMessages: Map<InputId, string>;
 	readonly effect: ProjectorEffect;
 	readonly toolCalls?: Map<ToolCallId, MutableToolCall>;
+	readonly permissionRequests?: Map<string, MutablePermissionRequest>;
 }
 
 interface TransitionFailure {
@@ -270,6 +281,7 @@ export class SessionEventProjector {
 	#turnOrder: TurnId[] = [];
 	#userMessages = new Map<InputId, string>();
 	#toolCalls = new Map<ToolCallId, MutableToolCall>();
+	#permissionRequests = new Map<string, MutablePermissionRequest>();
 	#digests = new Map<string, string>();
 	#frozenError: SessionProjectorError | null = null;
 
@@ -442,6 +454,7 @@ export class SessionEventProjector {
 		this.#turns = transition.turns;
 		this.#userMessages = transition.userMessages;
 		if (transition.toolCalls !== undefined) this.#toolCalls = transition.toolCalls;
+		if (transition.permissionRequests !== undefined) this.#permissionRequests = transition.permissionRequests;
 		this.#lastAppliedEventId = event.eventId;
 		this.#lastAppliedSequence = event.sequence;
 		this.#digests.set(event.eventId, digest);
@@ -497,6 +510,7 @@ export class SessionEventProjector {
 			case "task_event_observed":
 				return this.#taskEventObserved(event);
 			case "todo_updated":
+				return this.#todoUpdated(event);
 			case "conversation_compaction_started":
 			case "conversation_compaction_completed":
 			case "assistant_message_started":
@@ -518,9 +532,19 @@ export class SessionEventProjector {
 			case "ctree_snapshot_observed":
 			case "completion_observed":
 			case "log_linked":
-			case "runtime_error_observed":
 			case "run_finished":
 				return this.#sessionMetadata(event);
+			case "runtime_error_observed":
+				return event.payload.error.code === "unsupported_runtime_event_family"
+					? {
+							error: {
+								kind: "unsupported-event-family",
+								eventId: event.eventId,
+								sequence: event.sequence,
+								eventKind: event.kind,
+							},
+						}
+					: this.#runtimeEventObserved(event);
 			default:
 				return this.#unreachable(event);
 		}
@@ -588,9 +612,14 @@ export class SessionEventProjector {
 		if ("error" in prepared) return prepared;
 		if (!prepared.turn.started || hasTerminal(prepared.turn))
 			return { error: protocolError("permission_outside_active_turn", event.eventId, event.sequence) };
+		if (this.#permissionRequests.has(event.payload.requestId))
+			return { error: protocolError("duplicate_permission_request", event.eventId, event.sequence) };
+		const permissionRequests = new Map(this.#permissionRequests);
+		permissionRequests.set(event.payload.requestId, { turnId: event.turnId, responded: false });
 		return {
 			turns: prepared.turns,
 			userMessages: prepared.userMessages,
+			permissionRequests,
 			effect: { kind: "permission-requested", evidence: projectEventEvidence(event), payload: event.payload },
 		};
 	}
@@ -600,9 +629,17 @@ export class SessionEventProjector {
 	): TransitionResult {
 		const prepared = this.#prepareTurn(event);
 		if ("error" in prepared) return prepared;
+		const current = this.#permissionRequests.get(event.payload.requestId);
+		if (current === undefined || current.turnId !== event.turnId)
+			return { error: protocolError("unknown_permission_correlation", event.eventId, event.sequence) };
+		if (current.responded)
+			return { error: protocolError("duplicate_permission_response", event.eventId, event.sequence) };
+		const permissionRequests = new Map(this.#permissionRequests);
+		permissionRequests.set(event.payload.requestId, { ...current, responded: true });
 		return {
 			turns: prepared.turns,
 			userMessages: prepared.userMessages,
+			permissionRequests,
 			effect: { kind: "permission-responded", evidence: projectEventEvidence(event), payload: event.payload },
 		};
 	}
@@ -618,6 +655,16 @@ export class SessionEventProjector {
 			turns: prepared.turns,
 			userMessages: prepared.userMessages,
 			effect: { kind: "task-event-observed", evidence: projectEventEvidence(event), payload: event.payload },
+		};
+	}
+
+	#todoUpdated(event: Extract<LoggedSessionEvent, { readonly kind: "todo_updated" }>): Transition {
+		const turns = new Map<TurnId, MutableTurn>();
+		for (const [turnId, turn] of this.#turns) turns.set(turnId, copyTurn(turn));
+		return {
+			turns,
+			userMessages: new Map(this.#userMessages),
+			effect: { kind: "todo-updated", evidence: projectEventEvidence(event), payload: event.payload },
 		};
 	}
 
@@ -647,7 +694,6 @@ export class SessionEventProjector {
 					| "ctree_snapshot_observed"
 					| "completion_observed"
 					| "log_linked"
-					| "runtime_error_observed"
 					| "run_finished";
 			}
 		>,

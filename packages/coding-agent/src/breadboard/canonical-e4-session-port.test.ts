@@ -18,6 +18,9 @@ const runtimeFor = (
 	cancel: async () => {
 		throw new Error("unused");
 	},
+	respondPermission: async () => {
+		throw new Error("unused");
+	},
 	events: async function* () {
 		yield* [];
 	},
