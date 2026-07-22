@@ -1,4 +1,9 @@
-import { CanonicalE4ClientError, type CanonicalE4Failure } from "@breadboard/sdk";
+import {
+	CanonicalE4ClientError,
+	type CanonicalE4Failure,
+	detectSensitiveValues,
+	REDACTED_VALUE,
+} from "@breadboard/sdk";
 import type { Terminal, TUI } from "@oh-my-pi/pi-tui";
 import { Container, ProcessTerminal, Text, TUI as Tui } from "@oh-my-pi/pi-tui";
 import {
@@ -16,6 +21,7 @@ import type {
 import { BreadboardAssistantText } from "./components/breadboard-assistant-text";
 import { CustomEditor } from "./components/custom-editor";
 import { ErrorBannerComponent } from "./components/error-banner";
+import { ToolExecutionComponent } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
 import { UserMessageComponent } from "./components/user-message";
 import { getEditorTheme, theme } from "./theme/theme";
@@ -46,6 +52,35 @@ interface CancellationState {
 const RECONNECT_DELAY_MS = 250;
 
 const waitBeforeReconnect = (): Promise<void> => Bun.sleep(RECONNECT_DELAY_MS);
+
+function safeRuntimeValue(value: unknown): unknown {
+	const detection = detectSensitiveValues(value);
+	return detection.findings.length > 0 || detection.truncated ? REDACTED_VALUE : value;
+}
+
+function safeRuntimeText(value: unknown): string {
+	const safeValue = safeRuntimeValue(value);
+	if (typeof safeValue === "string") return safeValue;
+	try {
+		return JSON.stringify(safeValue);
+	} catch {
+		return "[unavailable]";
+	}
+}
+
+function toolArguments(payload: Extract<ProjectorEffect, { readonly kind: "tool-call-started" }>["payload"]): unknown {
+	const raw = safeRuntimeValue(payload.arguments);
+	const base: Record<string, unknown> =
+		raw !== null && typeof raw === "object" && !Array.isArray(raw)
+			? { ...raw }
+			: raw === null
+				? {}
+				: { value: raw };
+	if (payload.action !== null) base.action = safeRuntimeValue(payload.action);
+	if (payload.diffPreview !== null) base.diff_preview = safeRuntimeValue(payload.diffPreview);
+	if (payload.progress !== null) base.progress = safeRuntimeValue(payload.progress);
+	return base;
+}
 
 function makeRequestKey(): string {
 	return crypto.randomUUID();
@@ -136,6 +171,7 @@ export class BreadboardInteractiveSessionController {
 	#submissionInFlight = false;
 	#userRows = new Map<string, UserMessageComponent>();
 	#assistantRows = new Map<string, BreadboardAssistantText>();
+	#toolRows = new Map<string, ToolExecutionComponent>();
 	#cancellations = new Map<string, CancellationState>();
 	#fatalFailure: CanonicalE4Failure | null = null;
 	#startUi: boolean;
@@ -186,6 +222,10 @@ export class BreadboardInteractiveSessionController {
 
 	get assistantRows(): ReadonlyMap<string, BreadboardAssistantText> {
 		return this.#assistantRows;
+	}
+
+	get toolRows(): ReadonlyMap<string, ToolExecutionComponent> {
+		return this.#toolRows;
 	}
 
 	get fatalFailure(): CanonicalE4Failure | null {
@@ -426,6 +466,84 @@ export class BreadboardInteractiveSessionController {
 			case "turn-cancelled":
 				this.#setStatus(`Cancelled (${effect.reason})`);
 				this.#releaseSubmission(String(effect.evidence.turnId));
+				break;
+			case "tool-call-started": {
+				const callId = String(effect.payload.callId);
+				if (this.#toolRows.has(callId)) break;
+				const row = new ToolExecutionComponent(
+					effect.payload.tool,
+					toolArguments(effect.payload),
+					{ showImages: false, liveRegion: this.transcript },
+					undefined,
+					this.ui,
+					process.cwd(),
+					callId,
+				);
+				row.setArgsComplete(callId);
+				this.#toolRows.set(callId, row);
+				this.transcript.addChild(row);
+				this.#setStatus(`Running ${effect.payload.tool}`);
+				break;
+			}
+			case "tool-call-completed": {
+				const callId = String(effect.payload.callId);
+				const row = this.#toolRows.get(callId);
+				if (row === undefined) break;
+				const artifact =
+					effect.payload.artifactRef === null ? "" : `\nArtifact: ${safeRuntimeText(effect.payload.artifactRef)}`;
+				row.updateResult(
+					{
+						content: [
+							{
+								type: "text",
+								text: `${safeRuntimeText(effect.payload.result ?? effect.payload.status)}${artifact}`,
+							},
+						],
+						details: {
+							status: effect.payload.status,
+							artifactRef: safeRuntimeValue(effect.payload.artifactRef),
+						},
+						isError: effect.payload.error,
+					},
+					false,
+					callId,
+				);
+				row.seal();
+				this.#setStatus(effect.payload.error ? `${effect.payload.tool ?? "Tool"} failed` : "Working…");
+				break;
+			}
+			case "permission-requested": {
+				const detail = [
+					effect.payload.tool,
+					effect.payload.kind,
+					effect.payload.summary === null ? null : safeRuntimeText(effect.payload.summary),
+				]
+					.filter((value): value is string => typeof value === "string" && value.length > 0)
+					.join(" · ");
+				this.transcript.addChild(new Text(theme.fg("warning", `Permission requested · ${detail}`), 1, 0));
+				break;
+			}
+			case "permission-responded":
+				this.transcript.addChild(
+					new Text(theme.fg("dim", `Permission ${safeRuntimeText(effect.payload.decision)}`), 1, 0),
+				);
+				break;
+			case "task-event-observed": {
+				const detail = effect.payload.description ?? effect.payload.childSessionId ?? effect.payload.taskId;
+				const status = effect.payload.status === null ? "" : ` · ${safeRuntimeText(effect.payload.status)}`;
+				this.transcript.addChild(
+					new Text(
+						theme.fg(
+							"accent",
+							`Task ${safeRuntimeText(effect.payload.kind)} · ${safeRuntimeText(detail)}${status}`,
+						),
+						1,
+						0,
+					),
+				);
+				break;
+			}
+			case "runtime-event-observed":
 				break;
 			case "session-metadata-observed":
 				break;

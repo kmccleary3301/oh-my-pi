@@ -12,11 +12,14 @@ import {
 	type ObserveSessionRequest,
 	type OpenedSession,
 	projectDisplayText,
+	type PermissionRequestId,
 	type ReplayContractDigest,
 	type SessionId,
 	type SessionSnapshot,
 	type SubmitInput,
 	type SubmitReceipt,
+	type TaskId,
+	type ToolCallId,
 	type TurnId,
 } from "@breadboard/sdk";
 import type { BreadboardSessionPort } from "../breadboard/session-port";
@@ -240,6 +243,70 @@ describe("BreadboardInteractiveSessionController", () => {
 		await observing;
 	});
 
+	it("renders correlated tool, permission, artifact, and subagent events in the native transcript", async () => {
+		const callId = asId<ToolCallId>("call-test");
+		const permissionRequestId = asId<PermissionRequestId>("permission-test");
+		const taskId = asId<TaskId>("task-test");
+		const { controller, transport } = await acceptedController({
+			events: [
+				event("input_observed", 1, { text: "hello" }),
+				event("turn_started", 2, ExactEmptyPayload.value),
+				event("tool_called", 3, {
+					callId,
+					tool: "remote_tool",
+					arguments: { path: "src/app.ts" },
+					action: "inspect",
+					diffPreview: "@@ preview @@",
+					progress: { completed: 0, total: 1 },
+				}),
+				event("permission_requested", 4, {
+					requestId: permissionRequestId,
+					tool: "remote_tool",
+					kind: "read",
+					summary: "Inspect src/app.ts",
+					defaultScope: "project",
+					rewindable: true,
+				}),
+				event("permission_responded", 5, {
+					requestId: permissionRequestId,
+					decision: "allow",
+				}),
+				event("task_event_observed", 6, {
+					taskId,
+					kind: "subagent_spawned",
+					status: "running",
+					description: "Review source",
+					parentTaskId: null,
+					childSessionId: asId<SessionId>("session-child"),
+					parentSessionId: sessionId,
+					laneId: null,
+					laneLabel: null,
+				}),
+				event("tool_result_observed", 7, {
+					callId,
+					tool: "remote_tool",
+					status: "ok",
+					error: false,
+					result: { changed: false },
+					artifactRef: "artifact://tool-output",
+				}),
+			],
+		});
+
+		const observing = controller.observe();
+		await transport.eventsDelivered;
+		expect(controller.toolRows.size).toBe(1);
+		expect(controller.transcript.children).toHaveLength(5);
+		const rendered = Bun.stripANSI(controller.transcript.render(100).join("\n"));
+		expect(rendered).toContain("remote_tool");
+		expect(rendered).toContain("Permission requested");
+		expect(rendered).toContain("Task subagent_spawned");
+		expect(rendered).toContain("artifact://tool-output");
+		expect(controller.projector.state.frozen).toBe(false);
+		await controller.close();
+		await observing;
+	});
+
 	it("sends one targeted cancellation key and keeps acknowledgement nonterminal", async () => {
 		const { controller, transport } = await acceptedController();
 		await controller.projector.apply(event("input_observed", 1, { text: "hello" }));
@@ -344,7 +411,7 @@ describe("BreadboardInteractiveSessionMode", () => {
 		const mode = new BreadboardInteractiveSessionMode(port, { kind: "attach", sessionId }, { startUi: false });
 
 		await expect(mode.run()).rejects.toMatchObject({
-			failure: { kind: "protocol", code: "unsupported_event_family" },
+			failure: { kind: "protocol", code: "unknown_turn_correlation" },
 		});
 		expect(mode.controller?.errorContainer.children).toHaveLength(1);
 		expect(mode.controller?.closed).toBe(true);

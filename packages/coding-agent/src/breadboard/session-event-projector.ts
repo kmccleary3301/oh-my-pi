@@ -10,6 +10,7 @@ import type {
 	SubmitInput,
 	SubmitReceipt,
 	TurnId,
+	ToolCallId,
 } from "@breadboard/sdk";
 import {
 	digestLoggedSessionEvent,
@@ -38,6 +39,16 @@ export interface ProjectedTurnState {
 	readonly terminalOutcome: "completed" | "failed" | "cancelled" | null;
 }
 
+export interface ProjectedToolCallState {
+	readonly callId: ToolCallId;
+	readonly turnId: TurnId;
+	readonly tool: string;
+	readonly arguments: unknown;
+	readonly status: "running" | "completed" | "failed";
+	readonly result: unknown;
+	readonly artifactRef: string | null;
+}
+
 export interface ProjectorState {
 	readonly sessionId: SessionId;
 	readonly frozen: boolean;
@@ -46,6 +57,7 @@ export interface ProjectorState {
 	readonly lastAppliedSequence: number;
 	readonly userMessages: ReadonlyMap<InputId, string>;
 	readonly turns: ReadonlyMap<TurnId, ProjectedTurnState>;
+	readonly toolCalls: ReadonlyMap<ToolCallId, ProjectedToolCallState>;
 }
 
 export type SessionProjectorError =
@@ -117,6 +129,37 @@ export type ProjectorEffect =
 			readonly reason: "user_requested" | "timeout" | "superseded";
 	  }
 	| {
+			readonly kind: "tool-call-started";
+			readonly evidence: EventEvidence;
+			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>["payload"];
+	  }
+	| {
+			readonly kind: "tool-call-completed";
+			readonly evidence: EventEvidence;
+			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>["payload"];
+	  }
+	| {
+			readonly kind: "permission-requested";
+			readonly evidence: EventEvidence;
+			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "permission_requested" }>["payload"];
+	  }
+	| {
+			readonly kind: "permission-responded";
+			readonly evidence: EventEvidence;
+			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "permission_responded" }>["payload"];
+	  }
+	| {
+			readonly kind: "task-event-observed";
+			readonly evidence: EventEvidence;
+			readonly payload: Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>["payload"];
+	  }
+	| {
+			readonly kind: "runtime-event-observed";
+			readonly evidence: EventEvidence;
+			readonly eventKind: LoggedSessionEvent["kind"];
+			readonly payload: unknown;
+	  }
+	| {
 			readonly kind: "session-metadata-observed";
 			readonly evidence: EventEvidence;
 	  }
@@ -172,10 +215,21 @@ interface MutableTurn {
 	cancellation: CancellationReceipt | null;
 }
 
+interface MutableToolCall {
+	readonly callId: ToolCallId;
+	readonly turnId: TurnId;
+	readonly tool: string;
+	readonly arguments: unknown;
+	status: "running" | "completed" | "failed";
+	result: unknown;
+	artifactRef: string | null;
+}
+
 interface Transition {
 	readonly turns: Map<TurnId, MutableTurn>;
 	readonly userMessages: Map<InputId, string>;
 	readonly effect: ProjectorEffect;
+	readonly toolCalls?: Map<ToolCallId, MutableToolCall>;
 }
 
 interface TransitionFailure {
@@ -215,6 +269,7 @@ export class SessionEventProjector {
 	#turns = new Map<TurnId, MutableTurn>();
 	#turnOrder: TurnId[] = [];
 	#userMessages = new Map<InputId, string>();
+	#toolCalls = new Map<ToolCallId, MutableToolCall>();
 	#digests = new Map<string, string>();
 	#frozenError: SessionProjectorError | null = null;
 
@@ -380,12 +435,13 @@ export class SessionEventProjector {
 		if ("error" in transition) {
 			return this.#rejectEvent(event, transition.error);
 		}
-		const nextState = this.#state(transition.turns, transition.userMessages);
+		const nextState = this.#state(transition.turns, transition.userMessages, transition.toolCalls);
 		const appendReplayTurnOrder = event.kind === "input_observed" && !this.#turns.has(event.turnId);
 		await apply(transition.effect, nextState);
 		if (appendReplayTurnOrder) this.#turnOrder.push(event.turnId);
 		this.#turns = transition.turns;
 		this.#userMessages = transition.userMessages;
+		if (transition.toolCalls !== undefined) this.#toolCalls = transition.toolCalls;
 		this.#lastAppliedEventId = event.eventId;
 		this.#lastAppliedSequence = event.sequence;
 		this.#digests.set(event.eventId, digest);
@@ -430,6 +486,17 @@ export class SessionEventProjector {
 				return this.#turnFailed(event);
 			case "turn_cancelled":
 				return this.#turnCancelled(event);
+			case "tool_called":
+				return this.#toolCalled(event);
+			case "tool_result_observed":
+				return this.#toolResultObserved(event);
+			case "permission_requested":
+				return this.#permissionRequested(event);
+			case "permission_responded":
+				return this.#permissionResponded(event);
+			case "task_event_observed":
+				return this.#taskEventObserved(event);
+			case "todo_updated":
 			case "conversation_compaction_started":
 			case "conversation_compaction_completed":
 			case "assistant_message_started":
@@ -439,19 +506,12 @@ export class SessionEventProjector {
 			case "tool_execution_stdout_delta":
 			case "tool_execution_stderr_delta":
 			case "tool_execution_completed":
-			case "tool_called":
-			case "tool_result_observed":
-			case "permission_requested":
-			case "permission_responded":
 			case "checkpoint_list_observed":
-				return {
-					error: {
-						kind: "unsupported-event-family",
-						eventId: event.eventId,
-						sequence: event.sequence,
-						eventKind: event.kind,
-					},
-				};
+			case "checkpoint_restored":
+			case "warning_observed":
+			case "reward_updated":
+			case "limits_updated":
+				return this.#runtimeEventObserved(event);
 			case "skills_catalog_observed":
 			case "skills_selection_observed":
 			case "ctree_node_observed":
@@ -461,22 +521,119 @@ export class SessionEventProjector {
 			case "runtime_error_observed":
 			case "run_finished":
 				return this.#sessionMetadata(event);
-			case "checkpoint_restored":
-			case "task_event_observed":
-			case "warning_observed":
-			case "reward_updated":
-			case "limits_updated":
-				return {
-					error: {
-						kind: "unsupported-event-family",
-						eventId: event.eventId,
-						sequence: event.sequence,
-						eventKind: event.kind,
-					},
-				};
 			default:
 				return this.#unreachable(event);
 		}
+	}
+
+	#toolCalled(event: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>): TransitionResult {
+		const prepared = this.#prepareTurn(event);
+		if ("error" in prepared) return prepared;
+		const { turn, turns, userMessages } = prepared;
+		if (!turn.started || hasTerminal(turn))
+			return { error: protocolError("tool_call_outside_active_turn", event.eventId, event.sequence) };
+		if (this.#toolCalls.has(event.payload.callId))
+			return { error: protocolError("duplicate_tool_call", event.eventId, event.sequence) };
+		const toolCalls = new Map(this.#toolCalls);
+		toolCalls.set(event.payload.callId, {
+			callId: event.payload.callId,
+			turnId: event.turnId,
+			tool: event.payload.tool,
+			arguments: event.payload.arguments,
+			status: "running",
+			result: null,
+			artifactRef: null,
+		});
+		return {
+			turns,
+			userMessages,
+			toolCalls,
+			effect: { kind: "tool-call-started", evidence: projectEventEvidence(event), payload: event.payload },
+		};
+	}
+
+	#toolResultObserved(
+		event: Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>,
+	): TransitionResult {
+		const prepared = this.#prepareTurn(event);
+		if ("error" in prepared) return prepared;
+		const current = this.#toolCalls.get(event.payload.callId);
+		if (current === undefined || current.turnId !== event.turnId)
+			return { error: protocolError("unknown_tool_call_correlation", event.eventId, event.sequence) };
+		if (current.status !== "running")
+			return { error: protocolError("duplicate_tool_result", event.eventId, event.sequence) };
+		const toolCalls = new Map(this.#toolCalls);
+		toolCalls.set(event.payload.callId, {
+			...current,
+			status: event.payload.error ? "failed" : "completed",
+			result: event.payload.result,
+			artifactRef: event.payload.artifactRef,
+		});
+		return {
+			turns: prepared.turns,
+			userMessages: prepared.userMessages,
+			toolCalls,
+			effect: {
+				kind: "tool-call-completed",
+				evidence: projectEventEvidence(event),
+				payload: event.payload,
+			},
+		};
+	}
+
+	#permissionRequested(
+		event: Extract<LoggedSessionEvent, { readonly kind: "permission_requested" }>,
+	): TransitionResult {
+		const prepared = this.#prepareTurn(event);
+		if ("error" in prepared) return prepared;
+		if (!prepared.turn.started || hasTerminal(prepared.turn))
+			return { error: protocolError("permission_outside_active_turn", event.eventId, event.sequence) };
+		return {
+			turns: prepared.turns,
+			userMessages: prepared.userMessages,
+			effect: { kind: "permission-requested", evidence: projectEventEvidence(event), payload: event.payload },
+		};
+	}
+
+	#permissionResponded(
+		event: Extract<LoggedSessionEvent, { readonly kind: "permission_responded" }>,
+	): TransitionResult {
+		const prepared = this.#prepareTurn(event);
+		if ("error" in prepared) return prepared;
+		return {
+			turns: prepared.turns,
+			userMessages: prepared.userMessages,
+			effect: { kind: "permission-responded", evidence: projectEventEvidence(event), payload: event.payload },
+		};
+	}
+
+	#taskEventObserved(
+		event: Extract<LoggedSessionEvent, { readonly kind: "task_event_observed" }>,
+	): TransitionResult {
+		const prepared = this.#prepareTurn(event);
+		if ("error" in prepared) return prepared;
+		if (!prepared.turn.started || hasTerminal(prepared.turn))
+			return { error: protocolError("task_event_outside_active_turn", event.eventId, event.sequence) };
+		return {
+			turns: prepared.turns,
+			userMessages: prepared.userMessages,
+			effect: { kind: "task-event-observed", evidence: projectEventEvidence(event), payload: event.payload },
+		};
+	}
+
+	#runtimeEventObserved(event: LoggedSessionEvent): Transition {
+		const turns = new Map<TurnId, MutableTurn>();
+		for (const [turnId, turn] of this.#turns) turns.set(turnId, copyTurn(turn));
+		return {
+			turns,
+			userMessages: new Map(this.#userMessages),
+			effect: {
+				kind: "runtime-event-observed",
+				evidence: projectEventEvidence(event),
+				eventKind: event.kind,
+				payload: event.payload,
+			},
+		};
 	}
 
 	#sessionMetadata(
@@ -740,7 +897,11 @@ export class SessionEventProjector {
 		};
 	}
 
-	#state(turns = this.#turns, userMessages = this.#userMessages): ProjectorState {
+	#state(
+		turns = this.#turns,
+		userMessages = this.#userMessages,
+		toolCalls = this.#toolCalls,
+	): ProjectorState {
 		const visibleTurns = new Map<TurnId, ProjectedTurnState>();
 		for (const [turnId, turn] of turns) {
 			const status: ProjectedTurnStatus = turn.terminal ?? (turn.started ? "started" : "accepted");
@@ -757,6 +918,18 @@ export class SessionEventProjector {
 				terminalOutcome: turn.terminal,
 			});
 		}
+		const visibleToolCalls = new Map<ToolCallId, ProjectedToolCallState>();
+		for (const [callId, toolCall] of toolCalls) {
+			visibleToolCalls.set(callId, {
+				callId,
+				turnId: toolCall.turnId,
+				tool: toolCall.tool,
+				arguments: toolCall.arguments,
+				status: toolCall.status,
+				result: toolCall.result,
+				artifactRef: toolCall.artifactRef,
+			});
+		}
 		return {
 			sessionId: this.#sessionId,
 			frozen: this.#frozenError !== null,
@@ -765,6 +938,7 @@ export class SessionEventProjector {
 			lastAppliedSequence: this.#lastAppliedSequence,
 			userMessages: new Map(userMessages),
 			turns: visibleTurns,
+			toolCalls: visibleToolCalls,
 		};
 	}
 }

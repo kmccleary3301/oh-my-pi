@@ -138,12 +138,14 @@ describe("SessionEventProjector", () => {
 		expect(applied.status).toBe("applied");
 	});
 
-	test("rejects unsupported canonical families and preserves redacted display", async () => {
+	test("projects closed runtime families and preserves redacted display", async () => {
 		const projector = new SessionEventProjector(sessionId);
 		register(projector);
-		const unsupported = await projector.apply(wireEvent(1, "assistant.reasoning.delta", { text: "secret" }));
-		expect(unsupported.error?.kind).toBe("unsupported-event-family");
-		expect(projector.state.lastAppliedSequence).toBe(0);
+		await applyAll(projector, [firstInput, started]);
+		const observed = await projector.apply(wireEvent(3, "assistant.reasoning.delta", { text: "secret" }));
+		expect(observed.effect?.kind).toBe("runtime-event-observed");
+		expect(projector.state.lastAppliedSequence).toBe(3);
+		expect(projector.state.frozen).toBe(false);
 
 		const redacted = new SessionEventProjector(sessionId);
 		const secretReceipt: SubmitReceipt = {
@@ -267,33 +269,111 @@ describe("SessionEventProjector", () => {
 		]);
 		expect(projector.state.turns.get(turnId)?.terminalOutcome).toBe("failed");
 	});
-	test("accepts session skills metadata but still freezes on tool families", async () => {
+	test("projects a tool-call-only assistant message without fabricating empty text completion", async () => {
 		const projector = new SessionEventProjector(sessionId);
-		const catalog = decodeLoggedSessionEvent({
-			stable_cursor: true,
-			id: "skills-catalog",
-			seq: 1,
-			session_id: "session-1",
-			input_id: null,
-			turn_id: null,
-			timestamp_ms: 1,
-			type: "skills_catalog",
-			payload: {},
+		register(projector);
+		await applyAll(projector, [
+			firstInput,
+			started,
+			wireEvent(3, "assistant_message", {
+				text: "",
+				message: {
+					role: "assistant",
+					content: null,
+					tool_calls: [
+						{
+							id: "call-1",
+							type: "function",
+							function: { name: "list_dir", arguments: "{\"path\":\".\"}" },
+						},
+					],
+				},
+			}),
+			wireEvent(4, "tool_call", {
+				call_id: "call-1",
+				tool: "list_dir",
+				call: {
+					id: "call-1",
+					type: "function",
+					function: { name: "list_dir", arguments: "{\"path\":\".\"}" },
+				},
+			}),
+			wireEvent(5, "tool_result", {
+				call_id: "call-1",
+				tool: "list_dir",
+				status: "ok",
+				error: false,
+				result: { path: ".", entries: [] },
+			}),
+			wireEvent(6, "assistant_message", { text: "smoke result" }),
+			wireEvent(7, "turn_completed", {}),
+		]);
+		expect(projector.state.turns.get(turnId)).toMatchObject({
+			assistantText: "smoke result",
+			hasAssistantCompletion: true,
+			terminalOutcome: "completed",
 		});
-		const selection = decodeLoggedSessionEvent({
-			stable_cursor: true,
-			id: "skills-selection",
-			seq: 2,
-			session_id: "session-1",
-			input_id: null,
-			turn_id: null,
-			timestamp_ms: 2,
-			type: "skills_selection",
-			payload: {},
+	});
+	test("projects correlated tool, permission, and task events without freezing the session", async () => {
+		const projector = new SessionEventProjector(sessionId);
+		register(projector);
+		const events = [
+			firstInput,
+			started,
+			wireEvent(3, "tool_call", {
+				call_id: "call-1",
+				tool: "edit",
+				arguments: { path: "src/app.ts" },
+				action: "update",
+				diff_preview: "@@ -1 +1 @@",
+				progress: { completed: 0, total: 1 },
+			}),
+			wireEvent(4, "permission_request", {
+				request_id: "permission-1",
+				tool: "edit",
+				kind: "write",
+				summary: "Update src/app.ts",
+				default_scope: "project",
+				rewindable: true,
+			}),
+			wireEvent(5, "permission_response", {
+				request_id: "permission-1",
+				decision: "allow",
+			}),
+			wireEvent(6, "task_event", {
+				task_id: "task-1",
+				kind: "subagent_spawned",
+				status: "running",
+				description: "Review the edit",
+				child_session_id: "session-child-1",
+				parent_session_id: "session-1",
+			}),
+			wireEvent(7, "tool_result", {
+				call_id: "call-1",
+				tool: "edit",
+				status: "ok",
+				error: false,
+				result: { changed: true },
+				artifact_ref: "artifact://edit-1",
+			}),
+		];
+		const effects = [];
+		for (const event of events) effects.push((await projector.apply(event)).effect);
+
+		expect(effects.map(effect => effect?.kind)).toEqual([
+			"input-observed",
+			"turn-started",
+			"tool-call-started",
+			"permission-requested",
+			"permission-responded",
+			"task-event-observed",
+			"tool-call-completed",
+		]);
+		expect([...projector.state.toolCalls.values()][0]).toMatchObject({
+			tool: "edit",
+			status: "completed",
+			artifactRef: "artifact://edit-1",
 		});
-		expect((await projector.apply(catalog)).status).toBe("applied");
-		expect((await projector.apply(selection)).status).toBe("applied");
-		const tool = await projector.apply(wireEvent(3, "tool_call", {}));
-		expect(tool.error?.kind).toBe("unsupported-event-family");
+		expect(projector.state.frozen).toBe(false);
 	});
 });
