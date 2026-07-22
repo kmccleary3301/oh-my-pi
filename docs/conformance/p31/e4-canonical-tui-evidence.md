@@ -120,7 +120,7 @@ bun test --parallel=1 \
 result: 152 passed
 
 bun test --parallel=1 test/breadboard-lifecycle-real-backend.integration.test.ts
-result: passed twice consecutively; 40 assertions per run; 182.82s and 182.93s
+result: passed ten consecutive runs; 40 assertions per run; 182.82s–183.55s per run; 1,830.70s total
 
 bun test --parallel=1 \
   test/silent-abort-print-mode.test.ts \
