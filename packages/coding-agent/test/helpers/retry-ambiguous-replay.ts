@@ -2,9 +2,11 @@ import { LifecycleE4ClientError } from "@breadboard/sdk";
 
 function isAmbiguousReplayFailure(error: unknown): boolean {
 	if (!(error instanceof LifecycleE4ClientError)) return false;
-	return error.failure.kind === "timeout" ||
+	return (
+		error.failure.kind === "timeout" ||
 		error.failure.kind === "caller-abort" ||
-		(error.failure.kind === "http" && error.failure.status === 0);
+		(error.failure.kind === "http" && error.failure.status === 0)
+	);
 }
 
 export async function retryAmbiguousReplay<T>(operation: () => Promise<T>): Promise<T> {

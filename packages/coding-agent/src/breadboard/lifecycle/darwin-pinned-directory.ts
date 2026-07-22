@@ -1,4 +1,4 @@
-import { dlopen, FFIType, ptr, read, type Library } from "bun:ffi";
+import { dlopen, FFIType, type Library, ptr, read } from "bun:ffi";
 
 const O_RDONLY = 0x00000000;
 const O_NONBLOCK = 0x00000004;
@@ -83,7 +83,11 @@ export class DarwinPinnedDirectoryError extends Error {
 
 	constructor(
 		message: string,
-		options: ErrorOptions & { readonly operation?: string; readonly relativePath?: string; readonly errno?: number } = {},
+		options: ErrorOptions & {
+			readonly operation?: string;
+			readonly relativePath?: string;
+			readonly errno?: number;
+		} = {},
 	) {
 		super(message, options);
 		this.name = "DarwinPinnedDirectoryError";
@@ -153,7 +157,10 @@ function validateComponent(component: string, relativePath: string): void {
 	if (component.includes("\0")) throw invalid("relative path contains NUL", relativePath);
 	if (component.includes("/")) throw invalid("relative path component contains a slash", relativePath);
 	if (Buffer.byteLength(component) > DARWIN_PINNED_DIRECTORY_LIMITS.maxComponentBytes) {
-		throw invalid(`relative path component exceeds ${DARWIN_PINNED_DIRECTORY_LIMITS.maxComponentBytes} bytes`, relativePath);
+		throw invalid(
+			`relative path component exceeds ${DARWIN_PINNED_DIRECTORY_LIMITS.maxComponentBytes} bytes`,
+			relativePath,
+		);
 	}
 }
 
@@ -206,7 +213,13 @@ function closeChecked(lib: SystemLibrary, fd: number): void {
 	if (Number(lib.symbols.close(fd)) !== 0) throw nativeError(lib, "close");
 }
 
-function openAt(lib: SystemLibrary, directoryFd: number, component: string, flags: number, relativePath: string): number {
+function openAt(
+	lib: SystemLibrary,
+	directoryFd: number,
+	component: string,
+	flags: number,
+	relativePath: string,
+): number {
 	const name = cString(component);
 	const fd = Number(lib.symbols.openat(directoryFd, ptr(name), flags));
 	if (fd < 0) throw nativeError(lib, "openat", relativePath);
@@ -216,7 +229,8 @@ function openAt(lib: SystemLibrary, directoryFd: number, component: string, flag
 function openDirectoryAt(lib: SystemLibrary, directoryFd: number, component: string, relativePath: string): number {
 	const fd = openAt(lib, directoryFd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, relativePath);
 	try {
-		if (fstatFd(lib, fd, "fstat", relativePath).type !== "directory") throw invalid("path component is not a directory", relativePath);
+		if (fstatFd(lib, fd, "fstat", relativePath).type !== "directory")
+			throw invalid("path component is not a directory", relativePath);
 		return fd;
 	} catch (error) {
 		closeQuietly(lib, fd);
@@ -258,7 +272,11 @@ function openRelative(
 	}
 }
 
-function openParent(lib: SystemLibrary, rootFd: number, relativePath: string): { readonly fd: number; readonly name: string; readonly ownsFd: boolean } {
+function openParent(
+	lib: SystemLibrary,
+	rootFd: number,
+	relativePath: string,
+): { readonly fd: number; readonly name: string; readonly ownsFd: boolean } {
 	const components = relativeComponents(relativePath);
 	let parentFd = rootFd;
 	let ownsParent = false;
@@ -276,7 +294,14 @@ function openParent(lib: SystemLibrary, rootFd: number, relativePath: string): {
 	}
 }
 
-function preadRetry(lib: SystemLibrary, fd: number, destination: Buffer, offset: number, length: number, fileOffset: number): number {
+function preadRetry(
+	lib: SystemLibrary,
+	fd: number,
+	destination: Buffer,
+	offset: number,
+	length: number,
+	fileOffset: number,
+): number {
 	for (;;) {
 		const result = Number(lib.symbols.pread(fd, ptr(destination, offset), length, fileOffset));
 		if (result >= 0) return result;
@@ -284,10 +309,16 @@ function preadRetry(lib: SystemLibrary, fd: number, destination: Buffer, offset:
 	}
 }
 
-function readRegularFd(lib: SystemLibrary, fd: number, expected: Readonly<Pick<PinnedStat, "dev" | "ino">>, maxBytes: number): Buffer {
+function readRegularFd(
+	lib: SystemLibrary,
+	fd: number,
+	expected: Readonly<Pick<PinnedStat, "dev" | "ino">>,
+	maxBytes: number,
+): Buffer {
 	const limit = boundedInteger(maxBytes, "maxBytes", DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes);
 	const stat = fstatFd(lib, fd, "fstat");
-	if (!sameIdentity(stat, expected) || stat.type !== "regular") throw invalid("opened file descriptor identity or type changed");
+	if (!sameIdentity(stat, expected) || stat.type !== "regular")
+		throw invalid("opened file descriptor identity or type changed");
 	if (stat.size < 0n || stat.size > BigInt(limit)) throw invalid(`regular file exceeds the ${limit}-byte read limit`);
 	let capacity = Math.min(limit + 1, Math.max(1, Number(stat.size) + 1));
 	let bytes = Buffer.allocUnsafe(capacity);
@@ -308,7 +339,13 @@ function readRegularFd(lib: SystemLibrary, fd: number, expected: Readonly<Pick<P
 	}
 }
 
-function readlinkAt(lib: SystemLibrary, directoryFd: number, component: string, maxBytes: number, relativePath: string): Buffer {
+function readlinkAt(
+	lib: SystemLibrary,
+	directoryFd: number,
+	component: string,
+	maxBytes: number,
+	relativePath: string,
+): Buffer {
 	const limit = boundedInteger(maxBytes, "maxBytes", DARWIN_PINNED_DIRECTORY_LIMITS.maxSymlinkBytes);
 	const output = Buffer.allocUnsafe(limit + 1);
 	const name = cString(component);
@@ -358,8 +395,13 @@ function directoryEntries(lib: SystemLibrary, fd: number): readonly DirectoryEnt
 			) {
 				throw invalid("directory entry record is malformed");
 			}
-			const nameBytes = Buffer.from(buffer.subarray(cursor + DIRENT_NAME_OFFSET, cursor + DIRENT_NAME_OFFSET + nameLength));
-			if (!(nameBytes.length === 1 && nameBytes[0] === 0x2e) && !(nameBytes.length === 2 && nameBytes[0] === 0x2e && nameBytes[1] === 0x2e)) {
+			const nameBytes = Buffer.from(
+				buffer.subarray(cursor + DIRENT_NAME_OFFSET, cursor + DIRENT_NAME_OFFSET + nameLength),
+			);
+			if (
+				!(nameBytes.length === 1 && nameBytes[0] === 0x2e) &&
+				!(nameBytes.length === 2 && nameBytes[0] === 0x2e && nameBytes[1] === 0x2e)
+			) {
 				let name: string;
 				try {
 					name = utf8Decoder.decode(nameBytes);
@@ -376,16 +418,27 @@ function directoryEntries(lib: SystemLibrary, fd: number): readonly DirectoryEnt
 	return entries;
 }
 
-function verifyRegularEntry(lib: SystemLibrary, directoryFd: number, entry: DirectoryEntry, relativePath: string): void {
+function verifyRegularEntry(
+	lib: SystemLibrary,
+	directoryFd: number,
+	entry: DirectoryEntry,
+	relativePath: string,
+): void {
 	const fd = openAt(lib, directoryFd, entry.name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, relativePath);
 	try {
-		if (fstatFd(lib, fd, "fstat", relativePath).type !== "regular") throw invalid("directory entry changed type during enumeration", relativePath);
+		if (fstatFd(lib, fd, "fstat", relativePath).type !== "regular")
+			throw invalid("directory entry changed type during enumeration", relativePath);
 	} finally {
 		closeQuietly(lib, fd);
 	}
 }
 
-function verifySymlinkEntry(lib: SystemLibrary, directoryFd: number, entry: DirectoryEntry, relativePath: string): void {
+function verifySymlinkEntry(
+	lib: SystemLibrary,
+	directoryFd: number,
+	entry: DirectoryEntry,
+	relativePath: string,
+): void {
 	const name = cString(entry.name);
 	const byte = Buffer.allocUnsafe(1);
 	let result: number;
@@ -432,7 +485,8 @@ class NativePinnedFile implements PinnedFile {
 	async stat(): Promise<PinnedStat> {
 		this.#assertOpen();
 		const stat = fstatFd(this.#lib, this.fd, "fstat");
-		if (!sameIdentity(stat, this.#identity) || stat.type !== this.#type) throw invalid("opened file descriptor identity or type changed");
+		if (!sameIdentity(stat, this.#identity) || stat.type !== this.#type)
+			throw invalid("opened file descriptor identity or type changed");
 		return stat;
 	}
 
@@ -498,7 +552,11 @@ class NativePinnedDirectory implements PinnedDirectory {
 	async listLeaves(options: PinnedDirectoryListOptions): Promise<readonly string[]> {
 		this.#assertRoot();
 		const maxEntries = boundedInteger(options.maxEntries, "maxEntries", DARWIN_PINNED_DIRECTORY_LIMITS.maxEntries);
-		const maxPathBytes = boundedInteger(options.maxPathBytes, "maxPathBytes", DARWIN_PINNED_DIRECTORY_LIMITS.maxRelativePathBytes);
+		const maxPathBytes = boundedInteger(
+			options.maxPathBytes,
+			"maxPathBytes",
+			DARWIN_PINNED_DIRECTORY_LIMITS.maxRelativePathBytes,
+		);
 		const maxTotalPathBytes = boundedInteger(
 			options.maxTotalPathBytes ?? DARWIN_PINNED_DIRECTORY_LIMITS.maxTotalPathBytes,
 			"maxTotalPathBytes",
@@ -509,7 +567,8 @@ class NativePinnedDirectory implements PinnedDirectory {
 		let visitedEntries = 0;
 		const visit = (directoryFd: number, prefix: string): void => {
 			for (const entry of directoryEntries(this.#lib, directoryFd)) {
-				if (visitedEntries === maxEntries) throw invalid(`directory enumeration exceeds the ${maxEntries}-entry limit`);
+				if (visitedEntries === maxEntries)
+					throw invalid(`directory enumeration exceeds the ${maxEntries}-entry limit`);
 				visitedEntries += 1;
 				const relativePath = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
 				const pathBytes = Buffer.byteLength(relativePath);
@@ -554,7 +613,8 @@ class NativePinnedDirectory implements PinnedDirectory {
 	#assertRoot(): PinnedStat {
 		if (this.#closed) throw invalid("pinned directory is closed");
 		const stat = fstatFd(this.#lib, this.fd, "fstat");
-		if (!sameIdentity(stat, this.identity) || stat.type !== "directory") throw invalid("pinned root descriptor identity or type changed");
+		if (!sameIdentity(stat, this.identity) || stat.type !== "directory")
+			throw invalid("pinned root descriptor identity or type changed");
 		return stat;
 	}
 }

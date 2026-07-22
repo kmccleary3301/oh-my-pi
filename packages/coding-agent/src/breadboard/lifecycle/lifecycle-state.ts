@@ -59,7 +59,6 @@ export const LIFECYCLE_FAILURE_STATES = [
 ] as const;
 export type LifecycleFailureStateName = (typeof LIFECYCLE_FAILURE_STATES)[number];
 
-
 export interface LifecycleState {
 	readonly name: LifecycleStateName;
 	readonly mode: BreadboardEngineMode;
@@ -114,8 +113,16 @@ export interface LifecycleObservedHandle {
 
 export type LifecycleResult =
 	| { readonly kind: "off"; readonly state: LifecycleState & { readonly name: "off" } }
-	| { readonly kind: "observed"; readonly state: LifecycleState & { readonly name: "compatible-observed" }; readonly handle: LifecycleObservedHandle }
-	| { readonly kind: "ready"; readonly state: LifecycleState & { readonly name: "ready" }; readonly handle: LifecycleReadyHandle }
+	| {
+			readonly kind: "observed";
+			readonly state: LifecycleState & { readonly name: "compatible-observed" };
+			readonly handle: LifecycleObservedHandle;
+	  }
+	| {
+			readonly kind: "ready";
+			readonly state: LifecycleState & { readonly name: "ready" };
+			readonly handle: LifecycleReadyHandle;
+	  }
 	| { readonly kind: "detached"; readonly state: LifecycleState & { readonly name: "detached" } }
 	| { readonly kind: "stopped"; readonly state: LifecycleState & { readonly name: "stopped" } }
 	| {
@@ -165,9 +172,16 @@ const LOCAL_OWNED_ONLY: Readonly<Partial<Record<LifecycleStateName, true>>> = {
 	"owner-lease-expired": true,
 };
 
-export function lifecycleState(mode: BreadboardEngineMode, name: LifecycleStateName, attempt = 0, reason?: LifecycleReason): LifecycleState {
-	if (mode !== "local-owned" && LOCAL_OWNED_ONLY[name]) throw new Error(`lifecycle state ${name} is forbidden in ${mode}`);
-	if (mode === "off" && name !== "off" && reason !== "mode_forbidden") throw new Error(`off mode cannot enter lifecycle state ${name}`);
+export function lifecycleState(
+	mode: BreadboardEngineMode,
+	name: LifecycleStateName,
+	attempt = 0,
+	reason?: LifecycleReason,
+): LifecycleState {
+	if (mode !== "local-owned" && LOCAL_OWNED_ONLY[name])
+		throw new Error(`lifecycle state ${name} is forbidden in ${mode}`);
+	if (mode === "off" && name !== "off" && reason !== "mode_forbidden")
+		throw new Error(`off mode cannot enter lifecycle state ${name}`);
 	if (TERMINAL_STATES[name] && name !== "off" && name !== "detached" && name !== "stopped" && reason === undefined) {
 		throw new Error(`terminal lifecycle state ${name} requires a reason`);
 	}
@@ -180,5 +194,8 @@ export function lifecycleFailure(
 	reason: LifecycleReason,
 	attempt = 0,
 ): LifecycleResult {
-	return { kind: "failure", state: lifecycleState(mode, name, attempt, reason) as LifecycleResult & never } as LifecycleResult;
+	return {
+		kind: "failure",
+		state: lifecycleState(mode, name, attempt, reason) as LifecycleResult & never,
+	} as LifecycleResult;
 }

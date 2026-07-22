@@ -1,5 +1,5 @@
+import { dlopen, FFIType, type Library, ptr, read } from "bun:ffi";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { dlopen, FFIType, ptr, read, type Library } from "bun:ffi";
 
 const MH_MAGIC_64 = 0xfeedfacf;
 const FAT_MAGIC = 0xcafebabe;
@@ -101,13 +101,21 @@ interface CodeDirectoryCandidate {
 }
 
 function checkedRange(total: number, offset: number, length: number, label: string): void {
-	if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset > total || length > total - offset) {
+	if (
+		!Number.isSafeInteger(offset) ||
+		!Number.isSafeInteger(length) ||
+		offset < 0 ||
+		length < 0 ||
+		offset > total ||
+		length > total - offset
+	) {
 		throw new DarwinVerifiedSpawnError(`malformed Mach-O: ${label} is out of bounds`);
 	}
 }
 
 function safeBigUint64(value: bigint, label: string): number {
-	if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new DarwinVerifiedSpawnError(`malformed Mach-O: ${label} is too large`);
+	if (value > BigInt(Number.MAX_SAFE_INTEGER))
+		throw new DarwinVerifiedSpawnError(`malformed Mach-O: ${label} is too large`);
 	return Number(value);
 }
 
@@ -115,37 +123,56 @@ function arm64Slice(bytes: Buffer): Slice {
 	if (bytes.byteLength < 4) throw new DarwinVerifiedSpawnError("malformed Mach-O: missing magic");
 	if (bytes.readUInt32LE(0) === MH_MAGIC_64) return { offset: 0, size: bytes.byteLength };
 	const magic = bytes.readUInt32BE(0);
-	if (magic !== FAT_MAGIC && magic !== FAT_MAGIC_64) throw new DarwinVerifiedSpawnError("unsupported Mach-O container or byte order");
+	if (magic !== FAT_MAGIC && magic !== FAT_MAGIC_64)
+		throw new DarwinVerifiedSpawnError("unsupported Mach-O container or byte order");
 	if (bytes.byteLength < 8) throw new DarwinVerifiedSpawnError("malformed fat Mach-O header");
 	const count = bytes.readUInt32BE(4);
 	const archSize = magic === FAT_MAGIC_64 ? 32 : 20;
-	if (count === 0 || count > Math.floor((bytes.byteLength - 8) / archSize)) throw new DarwinVerifiedSpawnError("malformed fat Mach-O architecture table");
+	if (count === 0 || count > Math.floor((bytes.byteLength - 8) / archSize))
+		throw new DarwinVerifiedSpawnError("malformed fat Mach-O architecture table");
 	const tableEnd = 8 + count * archSize;
 	const regions: Array<Slice & { readonly cpuType: number }> = [];
 	for (let index = 0; index < count; index += 1) {
 		const base = 8 + index * archSize;
 		const cpuType = bytes.readUInt32BE(base);
-		const offset = magic === FAT_MAGIC_64 ? safeBigUint64(bytes.readBigUInt64BE(base + 8), "fat slice offset") : bytes.readUInt32BE(base + 8);
-		const size = magic === FAT_MAGIC_64 ? safeBigUint64(bytes.readBigUInt64BE(base + 16), "fat slice size") : bytes.readUInt32BE(base + 12);
+		const offset =
+			magic === FAT_MAGIC_64
+				? safeBigUint64(bytes.readBigUInt64BE(base + 8), "fat slice offset")
+				: bytes.readUInt32BE(base + 8);
+		const size =
+			magic === FAT_MAGIC_64
+				? safeBigUint64(bytes.readBigUInt64BE(base + 16), "fat slice size")
+				: bytes.readUInt32BE(base + 12);
 		const align = bytes.readUInt32BE(base + (magic === FAT_MAGIC_64 ? 24 : 16));
-		if (magic === FAT_MAGIC_64 && bytes.readUInt32BE(base + 28) !== 0) throw new DarwinVerifiedSpawnError("malformed fat64 reserved field");
+		if (magic === FAT_MAGIC_64 && bytes.readUInt32BE(base + 28) !== 0)
+			throw new DarwinVerifiedSpawnError("malformed fat64 reserved field");
 		if (size === 0 || align > 31) throw new DarwinVerifiedSpawnError("malformed fat Mach-O slice metadata");
 		checkedRange(bytes.byteLength, offset, size, "fat slice");
-		if (offset < tableEnd || offset % 2 ** align !== 0) throw new DarwinVerifiedSpawnError("malformed fat Mach-O slice alignment");
+		if (offset < tableEnd || offset % 2 ** align !== 0)
+			throw new DarwinVerifiedSpawnError("malformed fat Mach-O slice alignment");
 		regions.push({ cpuType, offset, size });
 	}
 	const ordered = [...regions].sort((left, right) => left.offset - right.offset);
 	for (let index = 1; index < ordered.length; index += 1) {
 		const previous = ordered[index - 1] as Slice;
 		const current = ordered[index] as Slice;
-		if (current.offset < previous.offset + previous.size) throw new DarwinVerifiedSpawnError("ambiguous overlapping fat Mach-O slices");
+		if (current.offset < previous.offset + previous.size)
+			throw new DarwinVerifiedSpawnError("ambiguous overlapping fat Mach-O slices");
 	}
 	const matches = regions.filter(region => region.cpuType === CPU_TYPE_ARM64);
-	if (matches.length !== 1) throw new DarwinVerifiedSpawnError(matches.length === 0 ? "unsupported Mach-O: no arm64 slice" : "ambiguous Mach-O: multiple arm64 slices");
+	if (matches.length !== 1)
+		throw new DarwinVerifiedSpawnError(
+			matches.length === 0 ? "unsupported Mach-O: no arm64 slice" : "ambiguous Mach-O: multiple arm64 slices",
+		);
 	return matches[0] as Slice;
 }
 
-function hashMetadata(hashType: number): { readonly type: SupportedHashType; readonly size: number; readonly algorithm: "sha1" | "sha256" | "sha384"; readonly rank: number } {
+function hashMetadata(hashType: number): {
+	readonly type: SupportedHashType;
+	readonly size: number;
+	readonly algorithm: "sha1" | "sha256" | "sha384";
+	readonly rank: number;
+} {
 	switch (hashType) {
 		case 1:
 			return { type: 1, size: 20, algorithm: "sha1", rank: 1 };
@@ -161,7 +188,8 @@ function hashMetadata(hashType: number): { readonly type: SupportedHashType; rea
 }
 
 function minimumCodeDirectoryHeader(version: number): number {
-	if (version < 0x20001 || version > 0x20600) throw new DarwinVerifiedSpawnError(`unsupported CodeDirectory version 0x${version.toString(16)}`);
+	if (version < 0x20001 || version > 0x20600)
+		throw new DarwinVerifiedSpawnError(`unsupported CodeDirectory version 0x${version.toString(16)}`);
 	if (version >= 0x20600) return 108;
 	if (version >= 0x20500) return 96;
 	if (version >= 0x20400) return 88;
@@ -171,10 +199,10 @@ function minimumCodeDirectoryHeader(version: number): number {
 	return 44;
 }
 
-
 function validateScatter(bytes: Buffer, offset: number): void {
 	if (offset === 0) return;
-	if (offset < 44 || offset >= bytes.byteLength) throw new DarwinVerifiedSpawnError("malformed CodeDirectory scatter offset");
+	if (offset < 44 || offset >= bytes.byteLength)
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory scatter offset");
 	let cursor = offset;
 	let pages = 0;
 	while (true) {
@@ -188,35 +216,47 @@ function validateScatter(bytes: Buffer, offset: number): void {
 }
 
 function codeDirectoryCandidate(bytes: Buffer, codeLimitMaximum: number): CodeDirectoryCandidate {
-	if (bytes.byteLength < 44 || bytes.readUInt32BE(0) !== CSMAGIC_CODEDIRECTORY) throw new DarwinVerifiedSpawnError("malformed CodeDirectory blob");
+	if (bytes.byteLength < 44 || bytes.readUInt32BE(0) !== CSMAGIC_CODEDIRECTORY)
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory blob");
 	const declaredLength = bytes.readUInt32BE(4);
 	if (declaredLength !== bytes.byteLength) throw new DarwinVerifiedSpawnError("malformed CodeDirectory length");
 	const version = bytes.readUInt32BE(8);
 	const headerLength = minimumCodeDirectoryHeader(version);
 	if (bytes.byteLength < headerLength) throw new DarwinVerifiedSpawnError("malformed versioned CodeDirectory header");
 	if (bytes.readUInt32BE(40) !== 0) throw new DarwinVerifiedSpawnError("malformed CodeDirectory spare field");
-	if (version >= 0x20300 && bytes.readUInt32BE(52) !== 0) throw new DarwinVerifiedSpawnError("malformed CodeDirectory spare3 field");
+	if (version >= 0x20300 && bytes.readUInt32BE(52) !== 0)
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory spare3 field");
 	const metadata = hashMetadata(bytes[37] as number);
 	if (bytes[36] !== metadata.size) throw new DarwinVerifiedSpawnError("malformed CodeDirectory hash size");
 	const pageSize = bytes[39] as number;
-	if (pageSize !== 12 && pageSize !== 14) throw new DarwinVerifiedSpawnError(`unsupported CodeDirectory page size ${pageSize}`);
+	if (pageSize !== 12 && pageSize !== 14)
+		throw new DarwinVerifiedSpawnError(`unsupported CodeDirectory page size ${pageSize}`);
 	const hashOffset = bytes.readUInt32BE(16);
 	const identOffset = bytes.readUInt32BE(20);
 	const specialSlots = bytes.readUInt32BE(24);
 	const codeSlots = bytes.readUInt32BE(28);
 	const codeLimit32 = bytes.readUInt32BE(32);
 	let codeLimit = codeLimit32;
-	if (version >= 0x20300 && codeLimit32 === 0xffffffff) codeLimit = safeBigUint64(bytes.readBigUInt64BE(56), "CodeDirectory code limit");
+	if (version >= 0x20300 && codeLimit32 === 0xffffffff)
+		codeLimit = safeBigUint64(bytes.readBigUInt64BE(56), "CodeDirectory code limit");
 	if (codeLimit > codeLimitMaximum) throw new DarwinVerifiedSpawnError("malformed CodeDirectory code limit");
 	const scatterOffset = version >= 0x20100 ? bytes.readUInt32BE(44) : 0;
 	validateScatter(bytes, scatterOffset);
-	if (scatterOffset === 0 && codeSlots !== Math.ceil(codeLimit / 2 ** pageSize)) throw new DarwinVerifiedSpawnError("malformed CodeDirectory code slot count");
-	if (hashOffset > bytes.byteLength || specialSlots > Math.floor(hashOffset / metadata.size)) throw new DarwinVerifiedSpawnError("malformed CodeDirectory special hash slots");
-	if (codeSlots > Math.floor((bytes.byteLength - hashOffset) / metadata.size)) throw new DarwinVerifiedSpawnError("malformed CodeDirectory code hash slots");
-	if (identOffset < headerLength || identOffset >= bytes.byteLength || bytes.indexOf(0, identOffset) < 0) throw new DarwinVerifiedSpawnError("malformed CodeDirectory identifier");
+	if (scatterOffset === 0 && codeSlots !== Math.ceil(codeLimit / 2 ** pageSize))
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory code slot count");
+	if (hashOffset > bytes.byteLength || specialSlots > Math.floor(hashOffset / metadata.size))
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory special hash slots");
+	if (codeSlots > Math.floor((bytes.byteLength - hashOffset) / metadata.size))
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory code hash slots");
+	if (identOffset < headerLength || identOffset >= bytes.byteLength || bytes.indexOf(0, identOffset) < 0)
+		throw new DarwinVerifiedSpawnError("malformed CodeDirectory identifier");
 	if (version >= 0x20200) {
 		const teamOffset = bytes.readUInt32BE(48);
-		if (teamOffset !== 0 && (teamOffset < headerLength || teamOffset >= bytes.byteLength || bytes.indexOf(0, teamOffset) < 0)) throw new DarwinVerifiedSpawnError("malformed CodeDirectory team identifier");
+		if (
+			teamOffset !== 0 &&
+			(teamOffset < headerLength || teamOffset >= bytes.byteLength || bytes.indexOf(0, teamOffset) < 0)
+		)
+			throw new DarwinVerifiedSpawnError("malformed CodeDirectory team identifier");
 	}
 	if (version >= 0x20600 && bytes[96] !== 0) {
 		const linkageOffset = bytes.readUInt32BE(100);
@@ -230,9 +270,12 @@ function selectCodeDirectory(signature: Buffer, codeLimitMaximum: number): CodeD
 	if (signature.byteLength < 8) throw new DarwinVerifiedSpawnError("malformed code signature blob");
 	const magic = signature.readUInt32BE(0);
 	const declaredLength = signature.readUInt32BE(4);
-	if (declaredLength < 8 || declaredLength > signature.byteLength) throw new DarwinVerifiedSpawnError("malformed code signature length");
-	if (magic === CSMAGIC_CODEDIRECTORY) return codeDirectoryCandidate(signature.subarray(0, declaredLength), codeLimitMaximum);
-	if (magic !== CSMAGIC_EMBEDDED_SIGNATURE || declaredLength < 12) throw new DarwinVerifiedSpawnError("unsupported code signature container");
+	if (declaredLength < 8 || declaredLength > signature.byteLength)
+		throw new DarwinVerifiedSpawnError("malformed code signature length");
+	if (magic === CSMAGIC_CODEDIRECTORY)
+		return codeDirectoryCandidate(signature.subarray(0, declaredLength), codeLimitMaximum);
+	if (magic !== CSMAGIC_EMBEDDED_SIGNATURE || declaredLength < 12)
+		throw new DarwinVerifiedSpawnError("unsupported code signature container");
 	const superBlob = signature.subarray(0, declaredLength);
 	const count = superBlob.readUInt32BE(8);
 	if (count > Math.floor((declaredLength - 12) / 8)) throw new DarwinVerifiedSpawnError("malformed SuperBlob index");
@@ -249,7 +292,10 @@ function selectCodeDirectory(signature: Buffer, codeLimitMaximum: number): CodeD
 		if (childLength < 8) throw new DarwinVerifiedSpawnError("malformed SuperBlob child length");
 		checkedRange(declaredLength, offset, childLength, "SuperBlob child");
 		regions.push({ offset, size: childLength });
-		if (slot === CSSLOT_CODEDIRECTORY || (slot >= CSSLOT_ALTERNATE_CODEDIRECTORIES && slot < CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT)) {
+		if (
+			slot === CSSLOT_CODEDIRECTORY ||
+			(slot >= CSSLOT_ALTERNATE_CODEDIRECTORIES && slot < CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT)
+		) {
 			candidates.push(codeDirectoryCandidate(superBlob.subarray(offset, offset + childLength), codeLimitMaximum));
 		}
 	}
@@ -257,9 +303,11 @@ function selectCodeDirectory(signature: Buffer, codeLimitMaximum: number): CodeD
 	for (let index = 1; index < ordered.length; index += 1) {
 		const previous = ordered[index - 1] as Slice;
 		const current = ordered[index] as Slice;
-		if (current.offset < previous.offset + previous.size) throw new DarwinVerifiedSpawnError("ambiguous overlapping SuperBlob children");
+		if (current.offset < previous.offset + previous.size)
+			throw new DarwinVerifiedSpawnError("ambiguous overlapping SuperBlob children");
 	}
-	if (candidates.length === 0) throw new DarwinVerifiedSpawnError("code signature has no supported CodeDirectory slot");
+	if (candidates.length === 0)
+		throw new DarwinVerifiedSpawnError("code signature has no supported CodeDirectory slot");
 	let best = candidates[0] as CodeDirectoryCandidate;
 	const ranks = new Set<number>();
 	for (const candidate of candidates) {
@@ -276,13 +324,15 @@ export function parseDarwinArm64CodeIdentity(input: Uint8Array): DarwinCodeIdent
 	const slice = arm64Slice(bytes);
 	checkedRange(bytes.byteLength, slice.offset, slice.size, "arm64 slice");
 	const macho = bytes.subarray(slice.offset, slice.offset + slice.size);
-	if (macho.byteLength < 32 || macho.readUInt32LE(0) !== MH_MAGIC_64) throw new DarwinVerifiedSpawnError("unsupported arm64 Mach-O header");
+	if (macho.byteLength < 32 || macho.readUInt32LE(0) !== MH_MAGIC_64)
+		throw new DarwinVerifiedSpawnError("unsupported arm64 Mach-O header");
 	if (macho.readUInt32LE(4) !== CPU_TYPE_ARM64) throw new DarwinVerifiedSpawnError("Mach-O slice is not arm64");
 	if (macho.readUInt32LE(12) !== MH_EXECUTE) throw new DarwinVerifiedSpawnError("unsupported Mach-O file type");
 	const commandCount = macho.readUInt32LE(16);
 	const commandBytes = macho.readUInt32LE(20);
 	checkedRange(macho.byteLength, 32, commandBytes, "load command table");
-	if (commandCount === 0 || commandCount > Math.floor(commandBytes / 8)) throw new DarwinVerifiedSpawnError("malformed Mach-O load command count");
+	if (commandCount === 0 || commandCount > Math.floor(commandBytes / 8))
+		throw new DarwinVerifiedSpawnError("malformed Mach-O load command count");
 	let cursor = 32;
 	let signature: Slice | undefined;
 	for (let index = 0; index < commandCount; index += 1) {
@@ -292,10 +342,12 @@ export function parseDarwinArm64CodeIdentity(input: Uint8Array): DarwinCodeIdent
 		if (size < 8 || size % 8 !== 0) throw new DarwinVerifiedSpawnError("malformed Mach-O load command size");
 		checkedRange(32 + commandBytes, cursor, size, "load command");
 		if (command === LC_CODE_SIGNATURE) {
-			if (signature !== undefined || size !== 16) throw new DarwinVerifiedSpawnError("ambiguous or malformed LC_CODE_SIGNATURE");
+			if (signature !== undefined || size !== 16)
+				throw new DarwinVerifiedSpawnError("ambiguous or malformed LC_CODE_SIGNATURE");
 			const offset = macho.readUInt32LE(cursor + 8);
 			const length = macho.readUInt32LE(cursor + 12);
-			if (length === 0 || offset < 32 + commandBytes) throw new DarwinVerifiedSpawnError("malformed LC_CODE_SIGNATURE range");
+			if (length === 0 || offset < 32 + commandBytes)
+				throw new DarwinVerifiedSpawnError("malformed LC_CODE_SIGNATURE range");
 			checkedRange(macho.byteLength, offset, length, "LC_CODE_SIGNATURE data");
 			signature = { offset, size: length };
 		}
@@ -303,7 +355,10 @@ export function parseDarwinArm64CodeIdentity(input: Uint8Array): DarwinCodeIdent
 	}
 	if (cursor !== 32 + commandBytes) throw new DarwinVerifiedSpawnError("malformed Mach-O load command table size");
 	if (signature === undefined) throw new DarwinVerifiedSpawnError("Mach-O has no LC_CODE_SIGNATURE");
-	const candidate = selectCodeDirectory(macho.subarray(signature.offset, signature.offset + signature.size), signature.offset);
+	const candidate = selectCodeDirectory(
+		macho.subarray(signature.offset, signature.offset + signature.size),
+		signature.offset,
+	);
 	const metadata = hashMetadata(candidate.hashType);
 	const digest = createHash(metadata.algorithm).update(candidate.bytes).digest();
 	return { hashType: candidate.hashType, cdHash: Buffer.from(digest.subarray(0, 20)) };
@@ -323,12 +378,16 @@ class CStringVector {
 		const total = this.strings.reduce((sum, value) => sum + value.byteLength, 0);
 		if (total > MAX_C_STRING_BYTES) throw new DarwinVerifiedSpawnError(`${label} exceeds native byte limit`);
 		this.pointers = new BigUint64Array(this.strings.length + 1);
-		for (let index = 0; index < this.strings.length; index += 1) this.pointers[index] = BigInt(ptr(this.strings[index] as Buffer));
+		for (let index = 0; index < this.strings.length; index += 1)
+			this.pointers[index] = BigInt(ptr(this.strings[index] as Buffer));
 	}
 }
 
 const SYSTEM_SYMBOLS = {
-	posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+	posix_spawn: {
+		args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr],
+		returns: FFIType.i32,
+	},
 	posix_spawnattr_init: { args: [FFIType.ptr], returns: FFIType.i32 },
 	posix_spawnattr_destroy: { args: [FFIType.ptr], returns: FFIType.i32 },
 	posix_spawnattr_setflags: { args: [FFIType.ptr, FFIType.i16], returns: FFIType.i32 },
@@ -356,7 +415,8 @@ interface NativeLibraries {
 let libraries: NativeLibraries | undefined;
 
 function nativeLibraries(): NativeLibraries {
-	if (process.platform !== "darwin") throw new DarwinVerifiedSpawnError(`Darwin verified spawn is unsupported on ${process.platform}`);
+	if (process.platform !== "darwin")
+		throw new DarwinVerifiedSpawnError(`Darwin verified spawn is unsupported on ${process.platform}`);
 	libraries ??= {
 		system: dlopen("/usr/lib/libSystem.B.dylib", SYSTEM_SYMBOLS),
 		proc: dlopen("/usr/lib/libproc.dylib", PROC_SYMBOLS),
@@ -439,11 +499,17 @@ class BunDarwinVerifiedSpawnNative implements DarwinVerifiedSpawnNative {
 	spawnSuspended(path: string, argv: readonly string[], env: Readonly<Record<string, string>>): DarwinSuspendedChild {
 		if (argv.length > MAX_ARGUMENTS) throw new DarwinVerifiedSpawnError("argument count exceeds native limit");
 		const entries = Object.entries(env);
-		if (entries.length > MAX_ENVIRONMENT_ENTRIES) throw new DarwinVerifiedSpawnError("environment count exceeds native limit");
-		for (const [key] of entries) if (key.length === 0 || key.includes("=") || key.includes("\0")) throw new DarwinVerifiedSpawnError("environment contains an invalid key");
+		if (entries.length > MAX_ENVIRONMENT_ENTRIES)
+			throw new DarwinVerifiedSpawnError("environment count exceeds native limit");
+		for (const [key] of entries)
+			if (key.length === 0 || key.includes("=") || key.includes("\0"))
+				throw new DarwinVerifiedSpawnError("environment contains an invalid key");
 		const pathBytes = cString(path, "executable path");
 		const argvVector = new CStringVector([path, ...argv], "argv");
-		const envVector = new CStringVector(entries.map(([key, value]) => `${key}=${value}`), "env");
+		const envVector = new CStringVector(
+			entries.map(([key, value]) => `${key}=${value}`),
+			"env",
+		);
 		const pipeFds = new Int32Array(2);
 		const attributes = new BigUint64Array(1);
 		const actions = new BigUint64Array(1);
@@ -452,23 +518,68 @@ class BunDarwinVerifiedSpawnNative implements DarwinVerifiedSpawnNative {
 		let pipeOpen = false;
 		let spawned = false;
 		try {
-			if (Number(this.#libraries.system.symbols.pipe(ptr(pipeFds))) !== 0) throw new DarwinVerifiedSpawnError(`pipe failed with errno ${errno(this.#libraries.system)}`);
+			if (Number(this.#libraries.system.symbols.pipe(ptr(pipeFds))) !== 0)
+				throw new DarwinVerifiedSpawnError(`pipe failed with errno ${errno(this.#libraries.system)}`);
 			pipeOpen = true;
-			checkDirectError("posix_spawnattr_init", Number(this.#libraries.system.symbols.posix_spawnattr_init(ptr(attributes))));
+			checkDirectError(
+				"posix_spawnattr_init",
+				Number(this.#libraries.system.symbols.posix_spawnattr_init(ptr(attributes))),
+			);
 			attributesInitialized = true;
-			checkDirectError("posix_spawnattr_setflags", Number(this.#libraries.system.symbols.posix_spawnattr_setflags(ptr(attributes), POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT)));
-			checkDirectError("posix_spawn_file_actions_init", Number(this.#libraries.system.symbols.posix_spawn_file_actions_init(ptr(actions))));
+			checkDirectError(
+				"posix_spawnattr_setflags",
+				Number(
+					this.#libraries.system.symbols.posix_spawnattr_setflags(
+						ptr(attributes),
+						POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT,
+					),
+				),
+			);
+			checkDirectError(
+				"posix_spawn_file_actions_init",
+				Number(this.#libraries.system.symbols.posix_spawn_file_actions_init(ptr(actions))),
+			);
 			actionsInitialized = true;
-			checkDirectError("posix_spawn_file_actions_adddup2", Number(this.#libraries.system.symbols.posix_spawn_file_actions_adddup2(ptr(actions), pipeFds[0] as number, BOOTSTRAP_FD)));
-			if (pipeFds[0] !== BOOTSTRAP_FD) checkDirectError("posix_spawn_file_actions_addclose(read)", Number(this.#libraries.system.symbols.posix_spawn_file_actions_addclose(ptr(actions), pipeFds[0] as number)));
-			checkDirectError("posix_spawn_file_actions_addclose(write)", Number(this.#libraries.system.symbols.posix_spawn_file_actions_addclose(ptr(actions), pipeFds[1] as number)));
+			checkDirectError(
+				"posix_spawn_file_actions_adddup2",
+				Number(
+					this.#libraries.system.symbols.posix_spawn_file_actions_adddup2(
+						ptr(actions),
+						pipeFds[0] as number,
+						BOOTSTRAP_FD,
+					),
+				),
+			);
+			if (pipeFds[0] !== BOOTSTRAP_FD)
+				checkDirectError(
+					"posix_spawn_file_actions_addclose(read)",
+					Number(
+						this.#libraries.system.symbols.posix_spawn_file_actions_addclose(ptr(actions), pipeFds[0] as number),
+					),
+				);
+			checkDirectError(
+				"posix_spawn_file_actions_addclose(write)",
+				Number(
+					this.#libraries.system.symbols.posix_spawn_file_actions_addclose(ptr(actions), pipeFds[1] as number),
+				),
+			);
 			const pid = new Int32Array(1);
 			checkDirectError(
 				"posix_spawn",
-				Number(this.#libraries.system.symbols.posix_spawn(ptr(pid), ptr(pathBytes), ptr(actions), ptr(attributes), ptr(argvVector.pointers), ptr(envVector.pointers))),
+				Number(
+					this.#libraries.system.symbols.posix_spawn(
+						ptr(pid),
+						ptr(pathBytes),
+						ptr(actions),
+						ptr(attributes),
+						ptr(argvVector.pointers),
+						ptr(envVector.pointers),
+					),
+				),
 			);
 			spawned = true;
-			if (Number(this.#libraries.system.symbols.close(pipeFds[0] as number)) !== 0) throw new DarwinVerifiedSpawnError(`close(read pipe) failed with errno ${errno(this.#libraries.system)}`);
+			if (Number(this.#libraries.system.symbols.close(pipeFds[0] as number)) !== 0)
+				throw new DarwinVerifiedSpawnError(`close(read pipe) failed with errno ${errno(this.#libraries.system)}`);
 			pipeFds[0] = -1;
 			return new NativeChild(pid[0] as number, pipeFds[1] as number, this.#libraries.system);
 		} finally {
@@ -481,7 +592,9 @@ class BunDarwinVerifiedSpawnNative implements DarwinVerifiedSpawnNative {
 
 	processStartToken(pid: number): string | null {
 		const info = new Uint8Array(PROC_PIDTBSDINFO_SIZE);
-		const size = Number(this.#libraries.proc.symbols.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, ptr(info), info.byteLength));
+		const size = Number(
+			this.#libraries.proc.symbols.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, ptr(info), info.byteLength),
+		);
 		const view = new DataView(info.buffer, info.byteOffset, info.byteLength);
 		if (size !== info.byteLength || view.getUint32(12, true) !== pid) return null;
 		const seconds = view.getBigUint64(120, true);
@@ -492,7 +605,11 @@ class BunDarwinVerifiedSpawnNative implements DarwinVerifiedSpawnNative {
 
 	loadedCodeIdentity(pid: number): DarwinCodeIdentity | null {
 		const result = Buffer.alloc(21);
-		if (Number(this.#libraries.system.symbols.csops(pid, CS_OPS_CDHASH_WITH_INFO, ptr(result), result.byteLength)) !== 0) return null;
+		if (
+			Number(this.#libraries.system.symbols.csops(pid, CS_OPS_CDHASH_WITH_INFO, ptr(result), result.byteLength)) !==
+			0
+		)
+			return null;
 		const metadata = hashMetadata(result[20] as number);
 		return { hashType: metadata.type, cdHash: Buffer.from(result.subarray(0, 20)) };
 	}
@@ -500,7 +617,9 @@ class BunDarwinVerifiedSpawnNative implements DarwinVerifiedSpawnNative {
 	writeAll(fd: number, bytes: Uint8Array): void {
 		let offset = 0;
 		while (offset < bytes.byteLength) {
-			const written = Number(this.#libraries.system.symbols.write(fd, ptr(bytes, offset), bytes.byteLength - offset));
+			const written = Number(
+				this.#libraries.system.symbols.write(fd, ptr(bytes, offset), bytes.byteLength - offset),
+			);
 			if (written > 0) {
 				offset += written;
 				continue;
@@ -512,7 +631,8 @@ class BunDarwinVerifiedSpawnNative implements DarwinVerifiedSpawnNative {
 	}
 
 	close(fd: number): void {
-		if (Number(this.#libraries.system.symbols.close(fd)) !== 0) throw new DarwinVerifiedSpawnError(`close bootstrap pipe failed with errno ${errno(this.#libraries.system)}`);
+		if (Number(this.#libraries.system.symbols.close(fd)) !== 0)
+			throw new DarwinVerifiedSpawnError(`close bootstrap pipe failed with errno ${errno(this.#libraries.system)}`);
 	}
 
 	signal(pid: number, signal: "SIGKILL" | "SIGCONT"): boolean {
@@ -532,12 +652,20 @@ export function darwinProcessStartToken(pid: number): string | null {
 	return defaultDarwinVerifiedSpawnNative().processStartToken(pid);
 }
 
-
 function identitiesEqual(expected: DarwinCodeIdentity, actual: DarwinCodeIdentity): boolean {
-	return expected.hashType === actual.hashType && expected.cdHash.byteLength === 20 && actual.cdHash.byteLength === 20 && timingSafeEqual(expected.cdHash, actual.cdHash);
+	return (
+		expected.hashType === actual.hashType &&
+		expected.cdHash.byteLength === 20 &&
+		actual.cdHash.byteLength === 20 &&
+		timingSafeEqual(expected.cdHash, actual.cdHash)
+	);
 }
 
-async function cleanupFailedSpawn(native: DarwinVerifiedSpawnNative, child: DarwinSuspendedChild, pipeOpen: boolean): Promise<void> {
+async function cleanupFailedSpawn(
+	native: DarwinVerifiedSpawnNative,
+	child: DarwinSuspendedChild,
+	pipeOpen: boolean,
+): Promise<void> {
 	if (pipeOpen) {
 		try {
 			native.close(child.bootstrapFd);
@@ -580,14 +708,18 @@ export async function spawnDarwinVerified(options: DarwinVerifiedSpawnOptions): 
 		if (startToken === undefined) throw new DarwinVerifiedSpawnError("spawned process start identity is unavailable");
 		const loadedIdentity = native.loadedCodeIdentity(child.pid);
 		if (loadedIdentity === null) throw new DarwinVerifiedSpawnError("spawned process code identity is unavailable");
-		if (native.processStartToken(child.pid) !== startToken) throw new DarwinVerifiedSpawnError("spawned process identity changed during attestation");
-		if (!identitiesEqual(expectedIdentity, loadedIdentity)) throw new DarwinVerifiedSpawnError("spawned process code identity does not match verified bytes");
+		if (native.processStartToken(child.pid) !== startToken)
+			throw new DarwinVerifiedSpawnError("spawned process identity changed during attestation");
+		if (!identitiesEqual(expectedIdentity, loadedIdentity))
+			throw new DarwinVerifiedSpawnError("spawned process code identity does not match verified bytes");
 		await options.bindIdentity(child.pid, startToken);
 		native.writeAll(child.bootstrapFd, options.bootstrap);
 		native.close(child.bootstrapFd);
 		pipeOpen = false;
-		if (native.processStartToken(child.pid) !== startToken) throw new DarwinVerifiedSpawnError("spawned process identity changed before resume");
-		if (!native.signal(child.pid, "SIGCONT")) throw new DarwinVerifiedSpawnError("spawned process exited before resume");
+		if (native.processStartToken(child.pid) !== startToken)
+			throw new DarwinVerifiedSpawnError("spawned process identity changed before resume");
+		if (!native.signal(child.pid, "SIGCONT"))
+			throw new DarwinVerifiedSpawnError("spawned process exited before resume");
 		resumed = true;
 		const verifiedChild = child;
 		const verifiedStartToken = startToken;
@@ -599,7 +731,8 @@ export async function spawnDarwinVerified(options: DarwinVerifiedSpawnOptions): 
 			waitForExit: timeoutMs => verifiedChild.waitForExit(timeoutMs),
 			signalIfSame: async signal => {
 				const current = native.processStartToken(verifiedChild.pid);
-				if (current === null) return (await verifiedChild.waitForExit(0)) ? "process-exited" : "identity-unavailable";
+				if (current === null)
+					return (await verifiedChild.waitForExit(0)) ? "process-exited" : "identity-unavailable";
 				if (current !== verifiedStartToken) return "identity-changed";
 				return native.signal(verifiedChild.pid, signal) ? "sent" : "process-exited";
 			},

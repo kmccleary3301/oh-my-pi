@@ -1,10 +1,19 @@
-import { createHash, randomBytes } from "node:crypto";
-import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, ftruncateSync, readFileSync, writeFileSync } from "node:fs";
-import type { Stats } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
-import { basename, join } from "node:path";
 import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi";
+import { createHash, randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
+import {
+	closeSync,
+	constants,
+	fchmodSync,
+	fstatSync,
+	fsyncSync,
+	ftruncateSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
+import { basename, join } from "node:path";
 import type { OwnerExitPolicy } from "./run-config";
 
 export const AUTHORITY_RECORD_SCHEMA_VERSION = "p30.local-authority.v4" as const;
@@ -46,7 +55,12 @@ export interface LocalControlAttempt {
 	readonly requesterCredentialRef: string;
 	readonly requesterCredentialVerifier: string;
 	readonly expectedAdmissionEpoch: number;
-	readonly phase: "begin-pending" | "draining" | "graceful-accepted" | "hard-signal-pending" | "hard-signal-commit-pending";
+	readonly phase:
+		| "begin-pending"
+		| "draining"
+		| "graceful-accepted"
+		| "hard-signal-pending"
+		| "hard-signal-commit-pending";
 	readonly drainGeneration?: number;
 	readonly createdAtUnix: number;
 }
@@ -60,7 +74,6 @@ interface ControlAttemptRequester {
 	readonly registrationCredential: string;
 	readonly admissionEpoch: number;
 }
-
 
 export interface AuthoritySecret {
 	readonly ownerCredential: Buffer;
@@ -110,7 +123,10 @@ export interface LocalAuthorityStoreSeams {
 	readonly now?: () => number;
 	readonly randomId?: () => string;
 	readonly processStartToken?: () => string;
-	readonly isLockOwnerAlive?: (owner: { readonly pid: number; readonly processStartToken: string }) => Promise<boolean | "ambiguous">;
+	readonly isLockOwnerAlive?: (owner: {
+		readonly pid: number;
+		readonly processStartToken: string;
+	}) => Promise<boolean | "ambiguous">;
 	readonly sleep?: (milliseconds: number) => Promise<void>;
 	readonly beforeSecureOpen?: (path: string) => void | Promise<void>;
 	readonly beforeAtomicRename?: (from: string, to: string) => void | Promise<void>;
@@ -132,7 +148,10 @@ export type AuthorityStoreErrorCode =
 
 export class LocalAuthorityStoreError extends Error {
 	readonly name = "LocalAuthorityStoreError";
-	constructor(readonly code: AuthorityStoreErrorCode, message: string) {
+	constructor(
+		readonly code: AuthorityStoreErrorCode,
+		message: string,
+	) {
 		super(message);
 	}
 }
@@ -144,8 +163,6 @@ interface LockOwner {
 	readonly processStartToken: string;
 	readonly createdAtUnix: number;
 }
-
-
 
 interface RootIdentity {
 	readonly dev: number | bigint;
@@ -231,7 +248,10 @@ function requireNativeSystem(): NonNullable<typeof nativeSystem> {
 const libproc =
 	process.platform === "darwin"
 		? dlopen("/usr/lib/libproc.dylib", {
-				proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+				proc_pidinfo: {
+					args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32],
+					returns: FFIType.i32,
+				},
 			})
 		: null;
 
@@ -254,13 +274,16 @@ function darwinProcessStartToken(pid: number): string | null {
 function isOpaqueBuffer(value: Uint8Array): boolean {
 	if (value.byteLength < 20 || value.byteLength > 128) return false;
 	for (const byte of value) {
-		if (!(
-			(byte >= 0x41 && byte <= 0x5a) ||
-			(byte >= 0x61 && byte <= 0x7a) ||
-			(byte >= 0x30 && byte <= 0x39) ||
-			byte === 0x5f ||
-			byte === 0x2d
-		)) return false;
+		if (
+			!(
+				(byte >= 0x41 && byte <= 0x5a) ||
+				(byte >= 0x61 && byte <= 0x7a) ||
+				(byte >= 0x30 && byte <= 0x39) ||
+				byte === 0x5f ||
+				byte === 0x2d
+			)
+		)
+			return false;
 	}
 	return true;
 }
@@ -295,7 +318,10 @@ function encodeAuthoritySecret(secret: AuthoritySecret): Buffer {
 
 function decodeAuthoritySecret(bytes: Buffer): AuthoritySecret {
 	const headerLength = AUTHORITY_SECRET_MAGIC.byteLength + 4;
-	if (bytes.byteLength < headerLength || !bytes.subarray(0, AUTHORITY_SECRET_MAGIC.byteLength).equals(AUTHORITY_SECRET_MAGIC)) {
+	if (
+		bytes.byteLength < headerLength ||
+		!bytes.subarray(0, AUTHORITY_SECRET_MAGIC.byteLength).equals(AUTHORITY_SECRET_MAGIC)
+	) {
 		throw new LocalAuthorityStoreError("secret_integrity", "owner credential record is invalid");
 	}
 	const ownerLength = bytes.readUInt32BE(AUTHORITY_SECRET_MAGIC.byteLength);
@@ -320,7 +346,10 @@ function encodeControlSecret(secret: ControlAttemptSecret): Buffer {
 
 function decodeControlSecret(bytes: Buffer): ControlAttemptSecret {
 	const headerLength = CONTROL_SECRET_MAGIC.byteLength + 4;
-	if (bytes.byteLength < headerLength || !bytes.subarray(0, CONTROL_SECRET_MAGIC.byteLength).equals(CONTROL_SECRET_MAGIC)) {
+	if (
+		bytes.byteLength < headerLength ||
+		!bytes.subarray(0, CONTROL_SECRET_MAGIC.byteLength).equals(CONTROL_SECRET_MAGIC)
+	) {
 		throw new LocalAuthorityStoreError("secret_integrity", "control requester credential record is invalid");
 	}
 	const credentialLength = bytes.readUInt32BE(CONTROL_SECRET_MAGIC.byteLength);
@@ -347,7 +376,10 @@ function encodePendingSecret(secret: PendingStartSecret): Buffer {
 
 function decodePendingSecret(bytes: Buffer): PendingStartSecret {
 	const headerLength = PENDING_SECRET_MAGIC.byteLength + 8;
-	if (bytes.byteLength < headerLength || !bytes.subarray(0, PENDING_SECRET_MAGIC.byteLength).equals(PENDING_SECRET_MAGIC)) {
+	if (
+		bytes.byteLength < headerLength ||
+		!bytes.subarray(0, PENDING_SECRET_MAGIC.byteLength).equals(PENDING_SECRET_MAGIC)
+	) {
 		throw new LocalAuthorityStoreError("secret_integrity", "pending launch secret is invalid");
 	}
 	const bootstrapLength = bytes.readUInt32BE(PENDING_SECRET_MAGIC.byteLength);
@@ -455,7 +487,16 @@ function assertStartClaim(value: unknown): LocalStartClaim {
 		throw new LocalAuthorityStoreError("start_claim_integrity", "start claim is not an object");
 	}
 	const claim = value as Record<string, unknown>;
-	const pendingFields = ["launchId", "executableSha256", "executablePathSha256", "argvSha256", "engineArtifactSha256", "servedBackendCommit", "pendingSecretRef", "pendingSecretVerifier"];
+	const pendingFields = [
+		"launchId",
+		"executableSha256",
+		"executablePathSha256",
+		"argvSha256",
+		"engineArtifactSha256",
+		"servedBackendCommit",
+		"pendingSecretRef",
+		"pendingSecretVerifier",
+	];
 	const pendingCount = pendingFields.reduce((count, field) => count + (claim[field] === undefined ? 0 : 1), 0);
 	const engineFields = [claim.enginePid, claim.engineProcessStartToken];
 	const ownerAttemptGeneration = claim.ownerAttemptGeneration;
@@ -469,25 +510,33 @@ function assertStartClaim(value: unknown): LocalStartClaim {
 		claim.processStartToken.length < 3 ||
 		!Number.isSafeInteger(claim.createdAtUnix) ||
 		(pendingCount !== 0 && pendingCount !== pendingFields.length) ||
-		(pendingCount > 0 && (
-			typeof claim.launchId !== "string" || !OPAQUE.test(claim.launchId) ||
-			typeof claim.executableSha256 !== "string" || !SHA256.test(claim.executableSha256) ||
-			typeof claim.executablePathSha256 !== "string" || !SHA256.test(claim.executablePathSha256) ||
-			typeof claim.argvSha256 !== "string" || !SHA256.test(claim.argvSha256) ||
-			typeof claim.engineArtifactSha256 !== "string" || !SHA256.test(claim.engineArtifactSha256) ||
-			typeof claim.servedBackendCommit !== "string" || !/^[0-9a-f]{40,64}$/.test(claim.servedBackendCommit) ||
-			typeof claim.pendingSecretRef !== "string" || !PENDING_SECRET_REF.test(claim.pendingSecretRef) ||
-			typeof claim.pendingSecretVerifier !== "string" || !SHA256.test(claim.pendingSecretVerifier)
-		)) ||
-		(engineFields.some(field => field !== undefined) && (
-			!Number.isSafeInteger(claim.enginePid) || (claim.enginePid as number) < 1 ||
-			typeof claim.engineProcessStartToken !== "string" || claim.engineProcessStartToken.length < 8
-		)) ||
-		(ownerAttemptGeneration !== undefined && (
-			!Number.isSafeInteger(ownerAttemptGeneration) || (ownerAttemptGeneration as number) < 1 ||
-			pendingCount !== pendingFields.length ||
-			engineFields.some(field => field === undefined)
-		))
+		(pendingCount > 0 &&
+			(typeof claim.launchId !== "string" ||
+				!OPAQUE.test(claim.launchId) ||
+				typeof claim.executableSha256 !== "string" ||
+				!SHA256.test(claim.executableSha256) ||
+				typeof claim.executablePathSha256 !== "string" ||
+				!SHA256.test(claim.executablePathSha256) ||
+				typeof claim.argvSha256 !== "string" ||
+				!SHA256.test(claim.argvSha256) ||
+				typeof claim.engineArtifactSha256 !== "string" ||
+				!SHA256.test(claim.engineArtifactSha256) ||
+				typeof claim.servedBackendCommit !== "string" ||
+				!/^[0-9a-f]{40,64}$/.test(claim.servedBackendCommit) ||
+				typeof claim.pendingSecretRef !== "string" ||
+				!PENDING_SECRET_REF.test(claim.pendingSecretRef) ||
+				typeof claim.pendingSecretVerifier !== "string" ||
+				!SHA256.test(claim.pendingSecretVerifier))) ||
+		(engineFields.some(field => field !== undefined) &&
+			(!Number.isSafeInteger(claim.enginePid) ||
+				(claim.enginePid as number) < 1 ||
+				typeof claim.engineProcessStartToken !== "string" ||
+				claim.engineProcessStartToken.length < 8)) ||
+		(ownerAttemptGeneration !== undefined &&
+			(!Number.isSafeInteger(ownerAttemptGeneration) ||
+				(ownerAttemptGeneration as number) < 1 ||
+				pendingCount !== pendingFields.length ||
+				engineFields.some(field => field === undefined)))
 	) {
 		throw new LocalAuthorityStoreError("start_claim_integrity", "start claim is invalid");
 	}
@@ -517,28 +566,49 @@ function assertControlAttempt(value: unknown): LocalControlAttempt {
 		"phase",
 		"createdAtUnix",
 	];
-	const hasDrain = attempt.phase === "draining" || attempt.phase === "graceful-accepted" || attempt.phase === "hard-signal-pending" || attempt.phase === "hard-signal-commit-pending";
+	const hasDrain =
+		attempt.phase === "draining" ||
+		attempt.phase === "graceful-accepted" ||
+		attempt.phase === "hard-signal-pending" ||
+		attempt.phase === "hard-signal-commit-pending";
 	if (
 		Object.keys(attempt).length !== requiredKeys.length + (hasDrain ? 1 : 0) ||
 		requiredKeys.some(key => !Object.hasOwn(attempt, key)) ||
-		(hasDrain !== Object.hasOwn(attempt, "drainGeneration")) ||
+		hasDrain !== Object.hasOwn(attempt, "drainGeneration") ||
 		attempt.schemaVersion !== "p30.local-control-attempt.v3" ||
-		typeof attempt.recordRevision !== "string" || !OPAQUE.test(attempt.recordRevision) ||
-		typeof attempt.engineInstanceId !== "string" || !OPAQUE.test(attempt.engineInstanceId) ||
-		typeof attempt.engineBootId !== "string" || !OPAQUE.test(attempt.engineBootId) ||
-		typeof attempt.launchId !== "string" || !OPAQUE.test(attempt.launchId) ||
-		!Number.isSafeInteger(attempt.ownerGeneration) || (attempt.ownerGeneration as number) < 1 ||
+		typeof attempt.recordRevision !== "string" ||
+		!OPAQUE.test(attempt.recordRevision) ||
+		typeof attempt.engineInstanceId !== "string" ||
+		!OPAQUE.test(attempt.engineInstanceId) ||
+		typeof attempt.engineBootId !== "string" ||
+		!OPAQUE.test(attempt.engineBootId) ||
+		typeof attempt.launchId !== "string" ||
+		!OPAQUE.test(attempt.launchId) ||
+		!Number.isSafeInteger(attempt.ownerGeneration) ||
+		(attempt.ownerGeneration as number) < 1 ||
 		(attempt.operation !== "stop" && attempt.operation !== "restart") ||
-		typeof attempt.controlRequestId !== "string" || !OPAQUE.test(attempt.controlRequestId) ||
-		typeof attempt.registrationId !== "string" || !OPAQUE.test(attempt.registrationId) ||
-		!Number.isSafeInteger(attempt.requesterRegistrationGeneration) || (attempt.requesterRegistrationGeneration as number) < 1 ||
-		typeof attempt.requesterClientInstanceId !== "string" || !OPAQUE.test(attempt.requesterClientInstanceId) ||
-		typeof attempt.requesterCredentialRef !== "string" || !CONTROL_SECRET_REF.test(attempt.requesterCredentialRef) ||
-		typeof attempt.requesterCredentialVerifier !== "string" || !SHA256.test(attempt.requesterCredentialVerifier) ||
-		!Number.isSafeInteger(attempt.expectedAdmissionEpoch) || (attempt.expectedAdmissionEpoch as number) < 0 ||
-		(attempt.phase !== "begin-pending" && attempt.phase !== "draining" && attempt.phase !== "graceful-accepted" && attempt.phase !== "hard-signal-pending" && attempt.phase !== "hard-signal-commit-pending") ||
+		typeof attempt.controlRequestId !== "string" ||
+		!OPAQUE.test(attempt.controlRequestId) ||
+		typeof attempt.registrationId !== "string" ||
+		!OPAQUE.test(attempt.registrationId) ||
+		!Number.isSafeInteger(attempt.requesterRegistrationGeneration) ||
+		(attempt.requesterRegistrationGeneration as number) < 1 ||
+		typeof attempt.requesterClientInstanceId !== "string" ||
+		!OPAQUE.test(attempt.requesterClientInstanceId) ||
+		typeof attempt.requesterCredentialRef !== "string" ||
+		!CONTROL_SECRET_REF.test(attempt.requesterCredentialRef) ||
+		typeof attempt.requesterCredentialVerifier !== "string" ||
+		!SHA256.test(attempt.requesterCredentialVerifier) ||
+		!Number.isSafeInteger(attempt.expectedAdmissionEpoch) ||
+		(attempt.expectedAdmissionEpoch as number) < 0 ||
+		(attempt.phase !== "begin-pending" &&
+			attempt.phase !== "draining" &&
+			attempt.phase !== "graceful-accepted" &&
+			attempt.phase !== "hard-signal-pending" &&
+			attempt.phase !== "hard-signal-commit-pending") ||
 		(hasDrain && (!Number.isSafeInteger(attempt.drainGeneration) || (attempt.drainGeneration as number) < 1)) ||
-		!Number.isSafeInteger(attempt.createdAtUnix) || (attempt.createdAtUnix as number) < 0
+		!Number.isSafeInteger(attempt.createdAtUnix) ||
+		(attempt.createdAtUnix as number) < 0
 	) {
 		throw new LocalAuthorityStoreError("control_attempt_integrity", "control attempt is invalid");
 	}
@@ -563,22 +633,26 @@ export class LocalAuthorityStore {
 		this.#now = seams.now ?? Date.now;
 		this.#randomId = seams.randomId ?? (() => randomBytes(18).toString("hex"));
 		const currentProcessStartToken = darwinProcessStartToken(process.pid);
-		this.#processStartToken = seams.processStartToken ?? (() => {
-			if (currentProcessStartToken === null) {
-				throw new LocalAuthorityStoreError("lock_integrity", "current process identity is unavailable");
-			}
-			return currentProcessStartToken;
-		});
+		this.#processStartToken =
+			seams.processStartToken ??
+			(() => {
+				if (currentProcessStartToken === null) {
+					throw new LocalAuthorityStoreError("lock_integrity", "current process identity is unavailable");
+				}
+				return currentProcessStartToken;
+			});
 		this.#sleep = seams.sleep ?? (milliseconds => Bun.sleep(milliseconds));
-		this.#isLockOwnerAlive = seams.isLockOwnerAlive ?? (async owner => {
-			try {
-				process.kill(owner.pid, 0);
-			} catch (error) {
-				return isErrno(error, "ESRCH") ? false : "ambiguous";
-			}
-			const current = darwinProcessStartToken(owner.pid);
-			return current === null ? "ambiguous" : current === owner.processStartToken;
-		});
+		this.#isLockOwnerAlive =
+			seams.isLockOwnerAlive ??
+			(async owner => {
+				try {
+					process.kill(owner.pid, 0);
+				} catch (error) {
+					return isErrno(error, "ESRCH") ? false : "ambiguous";
+				}
+				const current = darwinProcessStartToken(owner.pid);
+				return current === null ? "ambiguous" : current === owner.processStartToken;
+			});
 	}
 
 	static endpointKey(endpoint: string): string {
@@ -586,8 +660,16 @@ export class LocalAuthorityStore {
 	}
 
 	#validateRoot(metadata: Stats): void {
-		if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== this.#uid() || (metadata.mode & 0o777) !== 0o700) {
-			throw new LocalAuthorityStoreError("root_integrity", "authority store root identity or permissions are invalid");
+		if (
+			!metadata.isDirectory() ||
+			metadata.isSymbolicLink() ||
+			metadata.uid !== this.#uid() ||
+			(metadata.mode & 0o777) !== 0o700
+		) {
+			throw new LocalAuthorityStoreError(
+				"root_integrity",
+				"authority store root identity or permissions are invalid",
+			);
 		}
 		if (this.#rootIdentity && (metadata.dev !== this.#rootIdentity.dev || metadata.ino !== this.#rootIdentity.ino)) {
 			throw new LocalAuthorityStoreError("root_integrity", "authority store root identity changed");
@@ -597,7 +679,8 @@ export class LocalAuthorityStore {
 	async #assertRootIdentity(): Promise<void> {
 		const descriptor = this.#rootDescriptor;
 		const identity = this.#rootIdentity;
-		if (!descriptor || !identity) throw new LocalAuthorityStoreError("root_integrity", "authority root descriptor is not pinned");
+		if (!descriptor || !identity)
+			throw new LocalAuthorityStoreError("root_integrity", "authority root descriptor is not pinned");
 		const descriptorMetadata = await descriptor.stat();
 		this.#validateRoot(descriptorMetadata);
 		const pathMetadata = await lstat(this.root);
@@ -638,7 +721,10 @@ export class LocalAuthorityStore {
 		}
 		if ((metadata.mode & 0o777) !== 0o700) {
 			if (createdPath === undefined) {
-				throw new LocalAuthorityStoreError("root_integrity", "pre-existing authority store permissions are invalid");
+				throw new LocalAuthorityStoreError(
+					"root_integrity",
+					"pre-existing authority store permissions are invalid",
+				);
 			}
 			await chmod(this.root, 0o700);
 			metadata = await lstat(this.root);
@@ -664,7 +750,8 @@ export class LocalAuthorityStore {
 	}
 
 	#rootFd(): number {
-		if (!this.#rootDescriptor) throw new LocalAuthorityStoreError("root_integrity", "authority root descriptor is not pinned");
+		if (!this.#rootDescriptor)
+			throw new LocalAuthorityStoreError("root_integrity", "authority root descriptor is not pinned");
 		return this.#rootDescriptor.fd;
 	}
 
@@ -693,7 +780,9 @@ export class LocalAuthorityStore {
 		await this.#assertRootIdentity();
 		const fromBuffer = cPath(from);
 		const toBuffer = cPath(to);
-		if (Number(requireNativeSystem().renameat(this.#rootFd(), ptr(fromBuffer), this.#rootFd(), ptr(toBuffer))) !== 0) {
+		if (
+			Number(requireNativeSystem().renameat(this.#rootFd(), ptr(fromBuffer), this.#rootFd(), ptr(toBuffer))) !== 0
+		) {
 			throw systemError("renameat", from);
 		}
 		await this.#assertRootIdentity();
@@ -743,7 +832,6 @@ export class LocalAuthorityStore {
 		if (removed) await this.#syncParent();
 	}
 
-
 	async #openLockFile(name: string): Promise<number> {
 		try {
 			return await this.#openAt(name, constants.O_RDWR | constants.O_NOFOLLOW);
@@ -751,7 +839,12 @@ export class LocalAuthorityStore {
 			if (!isErrno(error, "ENOENT")) throw error;
 		}
 		try {
-			return await this.#openAt(name, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600, 0o600);
+			return await this.#openAt(
+				name,
+				constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+				0o600,
+				0o600,
+			);
 		} catch (error) {
 			if (!isErrno(error, "EEXIST")) throw error;
 			return await this.#openAt(name, constants.O_RDWR | constants.O_NOFOLLOW);
@@ -769,19 +862,32 @@ export class LocalAuthorityStore {
 			let acquired = false;
 			try {
 				const descriptorMetadata = fstatSync(fd);
-				if (!descriptorMetadata.isFile() || descriptorMetadata.nlink !== 1 || descriptorMetadata.uid !== this.#uid() || (descriptorMetadata.mode & 0o077) !== 0) {
-					throw new LocalAuthorityStoreError("lock_integrity", "authority lock ownership or link integrity is invalid");
+				if (
+					!descriptorMetadata.isFile() ||
+					descriptorMetadata.nlink !== 1 ||
+					descriptorMetadata.uid !== this.#uid() ||
+					(descriptorMetadata.mode & 0o077) !== 0
+				) {
+					throw new LocalAuthorityStoreError(
+						"lock_integrity",
+						"authority lock ownership or link integrity is invalid",
+					);
 				}
 				fchmodSync(fd, 0o600);
 				acquired = requireNativeSystem().flock(fd, LOCK_EX | LOCK_NB) === 0;
 				if (!acquired) {
-					if (this.#now() - started >= timeoutMs) throw new LocalAuthorityStoreError("lock_timeout", "authority lock could not be acquired");
+					if (this.#now() - started >= timeoutMs)
+						throw new LocalAuthorityStoreError("lock_timeout", "authority lock could not be acquired");
 				} else {
 					await this.seams.beforeLockIdentityCheck?.(lockPath);
 					const pathFd = await this.#openAt(lockName, constants.O_RDONLY | constants.O_NOFOLLOW);
 					try {
 						const pathMetadata = fstatSync(pathFd);
-						if (pathMetadata.dev !== descriptorMetadata.dev || pathMetadata.ino !== descriptorMetadata.ino || pathMetadata.nlink !== 1) {
+						if (
+							pathMetadata.dev !== descriptorMetadata.dev ||
+							pathMetadata.ino !== descriptorMetadata.ino ||
+							pathMetadata.nlink !== 1
+						) {
 							throw new LocalAuthorityStoreError("lock_integrity", "authority lock path identity changed");
 						}
 					} finally {
@@ -822,13 +928,27 @@ export class LocalAuthorityStore {
 			if (!isErrno(error, "ENOENT")) throw error;
 		}
 		if (current) {
-			const starterAlive = await this.#isLockOwnerAlive({ pid: current.pid, processStartToken: current.processStartToken });
+			const starterAlive = await this.#isLockOwnerAlive({
+				pid: current.pid,
+				processStartToken: current.processStartToken,
+			});
 			if (starterAlive !== false) return { kind: "occupied", claim: current };
-			if (current.pendingSecretRef && current.enginePid === undefined && current.engineProcessStartToken === undefined) {
+			if (
+				current.pendingSecretRef &&
+				current.enginePid === undefined &&
+				current.engineProcessStartToken === undefined
+			) {
 				return { kind: "unbound", claim: current };
 			}
-			if (current.pendingSecretRef && current.enginePid !== undefined && current.engineProcessStartToken !== undefined) {
-				const engineAlive = await this.#isLockOwnerAlive({ pid: current.enginePid, processStartToken: current.engineProcessStartToken });
+			if (
+				current.pendingSecretRef &&
+				current.enginePid !== undefined &&
+				current.engineProcessStartToken !== undefined
+			) {
+				const engineAlive = await this.#isLockOwnerAlive({
+					pid: current.enginePid,
+					processStartToken: current.engineProcessStartToken,
+				});
 				if (engineAlive === true) return { kind: "recoverable", claim: current };
 				if (engineAlive === "ambiguous") return { kind: "occupied", claim: current };
 				return { kind: "dead-bound", claim: current };
@@ -838,7 +958,7 @@ export class LocalAuthorityStore {
 			await this.#renameAt(claimPath, retired);
 			await this.#syncParent();
 		}
-		if (await this.probeCurrent(endpoint) === null) await this.#cleanupOrphanAuthoritySecrets(key);
+		if ((await this.probeCurrent(endpoint)) === null) await this.#cleanupOrphanAuthoritySecrets(key);
 		const claim: LocalStartClaim = Object.freeze({
 			schemaVersion: "p30.local-start-claim.v4",
 			token: this.#randomId(),
@@ -850,7 +970,12 @@ export class LocalAuthorityStore {
 		return { kind: "claimed", claim };
 	}
 
-	async prepareStartClaim(endpoint: string, token: string, input: PrepareStartClaimInput, secret: PendingStartSecret): Promise<LocalStartClaim> {
+	async prepareStartClaim(
+		endpoint: string,
+		token: string,
+		input: PrepareStartClaimInput,
+		secret: PendingStartSecret,
+	): Promise<LocalStartClaim> {
 		if (
 			!OPAQUE.test(input.launchId) ||
 			!SHA256.test(input.executableSha256) ||
@@ -866,7 +991,8 @@ export class LocalAuthorityStore {
 		}
 		const key = endpointKey(endpoint);
 		const claim = await this.#readStartClaim(key);
-		if (claim.token !== token || claim.pendingSecretRef !== undefined) throw new LocalAuthorityStoreError("generation_conflict", "start claim generation changed");
+		if (claim.token !== token || claim.pendingSecretRef !== undefined)
+			throw new LocalAuthorityStoreError("generation_conflict", "start claim generation changed");
 		const pendingSecretRef = `${key}.starting.secret.${token}.bin`;
 		const verifier = pendingSecretVerifier(secret);
 		const pendingSecret = encodePendingSecret(secret);
@@ -886,10 +1012,16 @@ export class LocalAuthorityStore {
 		}
 	}
 
-	async bindStartClaimProcess(endpoint: string, token: string, pid: number, processStartToken: string): Promise<LocalStartClaim> {
+	async bindStartClaimProcess(
+		endpoint: string,
+		token: string,
+		pid: number,
+		processStartToken: string,
+	): Promise<LocalStartClaim> {
 		const key = endpointKey(endpoint);
 		const claim = await this.#readStartClaim(key);
-		if (claim.token !== token || claim.pendingSecretRef === undefined) throw new LocalAuthorityStoreError("generation_conflict", "start claim generation changed");
+		if (claim.token !== token || claim.pendingSecretRef === undefined)
+			throw new LocalAuthorityStoreError("generation_conflict", "start claim generation changed");
 		const bound = assertStartClaim({ ...claim, enginePid: pid, engineProcessStartToken: processStartToken });
 		await this.#atomicWrite(`${key}.starting.json`, `${JSON.stringify(bound)}\n`);
 		return bound;
@@ -898,7 +1030,11 @@ export class LocalAuthorityStore {
 	async markOwnerAttempt(endpoint: string, expected: LocalStartClaim): Promise<LocalStartClaim> {
 		const key = endpointKey(endpoint);
 		const claim = await this.#readStartClaim(key);
-		if (JSON.stringify(claim) !== JSON.stringify(expected) || claim.enginePid === undefined || claim.engineProcessStartToken === undefined) {
+		if (
+			JSON.stringify(claim) !== JSON.stringify(expected) ||
+			claim.enginePid === undefined ||
+			claim.engineProcessStartToken === undefined
+		) {
 			throw new LocalAuthorityStoreError("generation_conflict", "start claim identity changed");
 		}
 		const nextGeneration = (claim.ownerAttemptGeneration ?? 0) + 1;
@@ -929,7 +1065,6 @@ export class LocalAuthorityStore {
 		return rolledBack;
 	}
 
-
 	async verifyStartClaim(endpoint: string, expected: LocalStartClaim): Promise<void> {
 		const current = await this.#readStartClaim(endpointKey(endpoint));
 		if (JSON.stringify(current) !== JSON.stringify(expected)) {
@@ -938,14 +1073,18 @@ export class LocalAuthorityStore {
 	}
 
 	async readPendingSecret(claim: LocalStartClaim): Promise<PendingStartSecret> {
-		if (!claim.pendingSecretRef || !claim.pendingSecretVerifier) throw new LocalAuthorityStoreError("secret_integrity", "pending launch secret reference is unavailable");
+		if (!claim.pendingSecretRef || !claim.pendingSecretVerifier)
+			throw new LocalAuthorityStoreError("secret_integrity", "pending launch secret reference is unavailable");
 		const bytes = await this.#readSecureBytes(join(this.root, claim.pendingSecretRef), "secret_integrity");
 		try {
 			const secret = decodePendingSecret(bytes);
 			if (pendingSecretVerifier(secret) !== claim.pendingSecretVerifier) {
 				secret.bootstrapCredential.fill(0);
 				secret.ownerCredential.fill(0);
-				throw new LocalAuthorityStoreError("secret_verifier_mismatch", "pending launch secret verifier does not match");
+				throw new LocalAuthorityStoreError(
+					"secret_verifier_mismatch",
+					"pending launch secret verifier does not match",
+				);
 			}
 			return secret;
 		} finally {
@@ -962,7 +1101,8 @@ export class LocalAuthorityStore {
 			if (isErrno(error, "ENOENT")) return;
 			throw error;
 		}
-		if (current.token !== token) throw new LocalAuthorityStoreError("generation_conflict", "start claim generation changed");
+		if (current.token !== token)
+			throw new LocalAuthorityStoreError("generation_conflict", "start claim generation changed");
 		if (current.pendingSecretRef) await this.#unlinkAt(current.pendingSecretRef, true);
 		await this.#unlinkAt(`${key}.starting.json`);
 		await this.#syncParent();
@@ -983,14 +1123,19 @@ export class LocalAuthorityStore {
 	}
 
 	async #readStartClaim(key: string): Promise<LocalStartClaim> {
-		return assertStartClaim(await this.#readSecureJson<unknown>(join(this.root, `${key}.starting.json`), "start_claim_integrity"));
+		return assertStartClaim(
+			await this.#readSecureJson<unknown>(join(this.root, `${key}.starting.json`), "start_claim_integrity"),
+		);
 	}
 
 	async probeCurrent(endpoint: string): Promise<LocalAuthorityRecord | null> {
 		if (!(await this.#readOnlyRootAvailable())) return null;
 		const key = endpointKey(endpoint);
 		try {
-			return assertRecord(JSON.parse(await this.#readSecureText(join(this.root, `${key}.authority.json`), "record_integrity")), key);
+			return assertRecord(
+				JSON.parse(await this.#readSecureText(join(this.root, `${key}.authority.json`), "record_integrity")),
+				key,
+			);
 		} catch (error) {
 			if (isErrno(error, "ENOENT")) return null;
 			if (error instanceof LocalAuthorityStoreError) throw error;
@@ -1021,7 +1166,10 @@ export class LocalAuthorityStore {
 	async commit(
 		endpoint: string,
 		expected: LocalAuthorityRecord | null,
-		record: Omit<LocalAuthorityRecord, "schemaVersion" | "recordRevision" | "ownerCredentialRef" | "ownerCredentialVerifier">,
+		record: Omit<
+			LocalAuthorityRecord,
+			"schemaVersion" | "recordRevision" | "ownerCredentialRef" | "ownerCredentialVerifier"
+		>,
 		secret: AuthoritySecret,
 	): Promise<LocalAuthorityRecord> {
 		if (!isOpaqueBuffer(secret.ownerCredential)) {
@@ -1031,7 +1179,8 @@ export class LocalAuthorityStore {
 		if ((expected === null) !== (current === null) || (expected && current && !sameRecord(expected, current))) {
 			throw new LocalAuthorityStoreError("generation_conflict", "authority record identity changed");
 		}
-		if (expected && record.ownerGeneration <= expected.ownerGeneration) throw new LocalAuthorityStoreError("generation_conflict", "authority generation must increase");
+		if (expected && record.ownerGeneration <= expected.ownerGeneration)
+			throw new LocalAuthorityStoreError("generation_conflict", "authority generation must increase");
 		const key = endpointKey(endpoint);
 		const recordRevision = this.#randomId();
 		const ownerCredentialRef = `${key}.secret.${record.ownerGeneration}.${recordRevision}.bin`;
@@ -1064,7 +1213,8 @@ export class LocalAuthorityStore {
 	}
 
 	async readSecret(record: LocalAuthorityRecord): Promise<AuthoritySecret> {
-		if (!SECRET_REF.test(record.ownerCredentialRef)) throw new LocalAuthorityStoreError("secret_integrity", "authority secret reference is invalid");
+		if (!SECRET_REF.test(record.ownerCredentialRef))
+			throw new LocalAuthorityStoreError("secret_integrity", "authority secret reference is invalid");
 		const bytes = await this.#readSecureBytes(join(this.root, record.ownerCredentialRef), "secret_integrity");
 		try {
 			const secret = decodeAuthoritySecret(bytes);
@@ -1082,7 +1232,9 @@ export class LocalAuthorityStore {
 		const key = endpointKey(endpoint);
 		let attempt: LocalControlAttempt;
 		try {
-			attempt = assertControlAttempt(await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"));
+			attempt = assertControlAttempt(
+				await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"),
+			);
 		} catch (error) {
 			if (isErrno(error, "ENOENT")) return null;
 			throw error;
@@ -1091,10 +1243,8 @@ export class LocalAuthorityStore {
 			attempt.engineInstanceId !== record.engineInstanceId ||
 			attempt.engineBootId !== record.engineBootId ||
 			attempt.launchId !== record.launchId ||
-			(attempt.phase === "begin-pending" && (
-				attempt.recordRevision !== record.recordRevision ||
-				attempt.ownerGeneration !== record.ownerGeneration
-			))
+			(attempt.phase === "begin-pending" &&
+				(attempt.recordRevision !== record.recordRevision || attempt.ownerGeneration !== record.ownerGeneration))
 		) {
 			throw new LocalAuthorityStoreError("generation_conflict", "control attempt authority changed");
 		}
@@ -1109,14 +1259,16 @@ export class LocalAuthorityStore {
 			const secret = decodeControlSecret(bytes);
 			if (controlSecretVerifier(secret.requesterRegistrationCredential) !== attempt.requesterCredentialVerifier) {
 				secret.requesterRegistrationCredential.fill(0);
-				throw new LocalAuthorityStoreError("secret_verifier_mismatch", "control requester secret verifier does not match");
+				throw new LocalAuthorityStoreError(
+					"secret_verifier_mismatch",
+					"control requester secret verifier does not match",
+				);
 			}
 			return Object.freeze(secret);
 		} finally {
 			bytes.fill(0);
 		}
 	}
-
 
 	async prepareControlAttempt(
 		endpoint: string,
@@ -1184,7 +1336,10 @@ export class LocalAuthorityStore {
 	): Promise<LocalControlAttempt> {
 		const currentAuthority = await this.probeCurrent(endpoint);
 		if (!currentAuthority || !sameRecord(currentAuthority, record)) {
-			throw new LocalAuthorityStoreError("generation_conflict", "authority record changed before expired control replacement");
+			throw new LocalAuthorityStoreError(
+				"generation_conflict",
+				"authority record changed before expired control replacement",
+			);
 		}
 		const current = await this.readControlAttempt(endpoint, record);
 		if (current === null) {
@@ -1192,12 +1347,18 @@ export class LocalAuthorityStore {
 		}
 		if (JSON.stringify(current) !== JSON.stringify(expired)) {
 			if (current.operation !== operation) {
-				throw new LocalAuthorityStoreError("generation_conflict", "another control operation replaced the expired attempt");
+				throw new LocalAuthorityStoreError(
+					"generation_conflict",
+					"another control operation replaced the expired attempt",
+				);
 			}
 			return current;
 		}
 		if (current.phase !== "begin-pending") {
-			throw new LocalAuthorityStoreError("generation_conflict", "only a pending begin can be replaced after requester expiry");
+			throw new LocalAuthorityStoreError(
+				"generation_conflict",
+				"only a pending begin can be replaced after requester expiry",
+			);
 		}
 		const secret = await this.readControlAttemptSecret(current);
 		secret.requesterRegistrationCredential.fill(0);
@@ -1205,14 +1366,15 @@ export class LocalAuthorityStore {
 		return await this.prepareControlAttempt(endpoint, record, operation, controlRequestId, requester);
 	}
 
-
 	async markControlAttemptDraining(
 		endpoint: string,
 		expected: LocalControlAttempt,
 		drainGeneration: number,
 	): Promise<LocalControlAttempt> {
 		const key = endpointKey(endpoint);
-		const current = assertControlAttempt(await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"));
+		const current = assertControlAttempt(
+			await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"),
+		);
 		if (JSON.stringify(current) !== JSON.stringify(expected)) {
 			throw new LocalAuthorityStoreError("generation_conflict", "control attempt changed before drain commit");
 		}
@@ -1236,13 +1398,16 @@ export class LocalAuthorityStore {
 		phase: "graceful-accepted" | "hard-signal-pending" | "hard-signal-commit-pending",
 	): Promise<LocalControlAttempt> {
 		const key = endpointKey(endpoint);
-		const current = assertControlAttempt(await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"));
+		const current = assertControlAttempt(
+			await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"),
+		);
 		if (JSON.stringify(current) !== JSON.stringify(expected)) {
 			throw new LocalAuthorityStoreError("generation_conflict", "control attempt changed before phase commit");
 		}
-		const allowed = (expected.phase === "draining" && phase === "graceful-accepted")
-			|| (expected.phase === "graceful-accepted" && phase === "hard-signal-pending")
-			|| (expected.phase === "hard-signal-pending" && phase === "hard-signal-commit-pending");
+		const allowed =
+			(expected.phase === "draining" && phase === "graceful-accepted") ||
+			(expected.phase === "graceful-accepted" && phase === "hard-signal-pending") ||
+			(expected.phase === "hard-signal-pending" && phase === "hard-signal-commit-pending");
 		if (!allowed) {
 			if (expected.phase === phase) return current;
 			throw new LocalAuthorityStoreError("generation_conflict", "control attempt phase transition is invalid");
@@ -1254,7 +1419,9 @@ export class LocalAuthorityStore {
 
 	async clearControlAttempt(endpoint: string, expected: LocalControlAttempt): Promise<void> {
 		const key = endpointKey(endpoint);
-		const current = assertControlAttempt(await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"));
+		const current = assertControlAttempt(
+			await this.#readSecureJson<unknown>(join(this.root, `${key}.control.json`), "control_attempt_integrity"),
+		);
 		if (JSON.stringify(current) !== JSON.stringify(expected)) {
 			throw new LocalAuthorityStoreError("generation_conflict", "control attempt changed");
 		}
@@ -1267,7 +1434,11 @@ export class LocalAuthorityStore {
 	async retireDeadGeneration(endpoint: string, expected: LocalAuthorityRecord): Promise<void> {
 		const key = endpointKey(endpoint);
 		const current = await this.probeCurrent(endpoint);
-		if (!current || !sameRecord(current, expected)) throw new LocalAuthorityStoreError("generation_conflict", "authority record identity changed before retirement");
+		if (!current || !sameRecord(current, expected))
+			throw new LocalAuthorityStoreError(
+				"generation_conflict",
+				"authority record identity changed before retirement",
+			);
 		const controlAttempt = await this.readControlAttempt(endpoint, current);
 		const suffix = `retired.${expected.ownerGeneration}.${expected.recordRevision}.${this.#now()}.${this.#randomId()}`;
 		const recordPath = join(this.root, `${key}.authority.json`);
@@ -1286,7 +1457,12 @@ export class LocalAuthorityStore {
 		const fd = await this.#openAt(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 		try {
 			const metadata = fstatSync(fd);
-			if (!metadata.isFile() || metadata.nlink !== 1 || metadata.uid !== this.#uid() || (metadata.mode & 0o077) !== 0) {
+			if (
+				!metadata.isFile() ||
+				metadata.nlink !== 1 ||
+				metadata.uid !== this.#uid() ||
+				(metadata.mode & 0o077) !== 0
+			) {
 				throw new LocalAuthorityStoreError(errorCode, "authority file ownership or link integrity is invalid");
 			}
 			const bytes = readFileSync(fd);
@@ -1315,10 +1491,19 @@ export class LocalAuthorityStore {
 		}
 	}
 
-	async #exclusiveWrite(name: string, content: string | Uint8Array, errorCode: AuthorityStoreErrorCode): Promise<void> {
+	async #exclusiveWrite(
+		name: string,
+		content: string | Uint8Array,
+		errorCode: AuthorityStoreErrorCode,
+	): Promise<void> {
 		let fd: number;
 		try {
-			fd = await this.#openAt(name, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600, 0o600);
+			fd = await this.#openAt(
+				name,
+				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+				0o600,
+				0o600,
+			);
 		} catch (error) {
 			if (isErrno(error, "EEXIST")) throw new LocalAuthorityStoreError(errorCode, "authority file already exists");
 			throw error;
@@ -1340,7 +1525,12 @@ export class LocalAuthorityStore {
 
 	async #atomicWrite(name: string, content: string | Uint8Array): Promise<void> {
 		const temporary = `.${name}.${this.#randomId()}.tmp`;
-		const fd = await this.#openAt(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600, 0o600);
+		const fd = await this.#openAt(
+			temporary,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+			0o600,
+			0o600,
+		);
 		try {
 			const metadata = fstatSync(fd);
 			if (!metadata.isFile() || metadata.nlink !== 1 || metadata.uid !== this.#uid()) {

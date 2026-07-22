@@ -7,6 +7,7 @@ import {
 	type AgentTool,
 	AppendOnlyContextManager,
 	filterProviderReplayMessages,
+	type StreamFn,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type {
@@ -425,6 +426,12 @@ export interface CreateAgentSessionOptions {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
 	deadline?: number;
+	/**
+	 * Optional transport for the primary Agent loop only. Side-channel, advisor,
+	 * title, and compaction requests retain OMP's native settings-aware streams.
+	 * This is the governed seam for an external durable turn runtime.
+	 */
+	mainStreamFn?: StreamFn;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -2833,7 +2840,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						});
 					}
 				}
-				return settingsAwareStreamFn(streamModel, context, streamOptions);
+				return (options.mainStreamFn ?? settingsAwareStreamFn)(streamModel, context, streamOptions);
 			},
 			cursorExecHandlers,
 			getCursorTools: () => [...(toolSession.xdevRegistry?.list() ?? [])],

@@ -1,12 +1,12 @@
+import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { describe, expect, test } from "bun:test";
 import {
+	type DarwinCodeIdentity,
 	DarwinVerifiedSpawnError,
+	type DarwinVerifiedSpawnNative,
 	parseDarwinArm64CodeIdentity,
 	spawnDarwinVerified,
-	type DarwinCodeIdentity,
-	type DarwinVerifiedSpawnNative,
 } from "./darwin-verified-spawn";
 
 const MH_MAGIC_64 = 0xfeedfacf;
@@ -102,7 +102,11 @@ interface NativeScenario {
 	readonly continueResult?: boolean;
 }
 
-function scenarioNative(expected: DarwinCodeIdentity, events: string[], scenario: NativeScenario = {}): DarwinVerifiedSpawnNative {
+function scenarioNative(
+	expected: DarwinCodeIdentity,
+	events: string[],
+	scenario: NativeScenario = {},
+): DarwinVerifiedSpawnNative {
 	let tokenIndex = 0;
 	const tokens = scenario.tokens ?? ["darwin:1:2"];
 	return {
@@ -169,12 +173,14 @@ describe("parseDarwinArm64CodeIdentity", () => {
 		const truncated = codeDirectory(3, 0x33);
 		const sha256 = codeDirectory(2, 0x22);
 		const sha384 = codeDirectory(4, 0x44);
-		const identity = parseDarwinArm64CodeIdentity(thinArm64MachO([
-			{ slot: 0, bytes: sha1 },
-			{ slot: 0x1000, bytes: truncated },
-			{ slot: 0x1001, bytes: sha256 },
-			{ slot: 0x1002, bytes: sha384 },
-		]));
+		const identity = parseDarwinArm64CodeIdentity(
+			thinArm64MachO([
+				{ slot: 0, bytes: sha1 },
+				{ slot: 0x1000, bytes: truncated },
+				{ slot: 0x1001, bytes: sha256 },
+				{ slot: 0x1002, bytes: sha384 },
+			]),
+		);
 		expect(identity).toEqual(expectedIdentity(sha384, 4));
 	});
 
@@ -183,9 +189,19 @@ describe("parseDarwinArm64CodeIdentity", () => {
 		const arm64 = thinArm64MachO([{ slot: 0, bytes: directory }]);
 		const other = Buffer.alloc(64, 0xa5);
 		for (const bytes of [
-			fatMachO([{ cpuType: CPU_TYPE_X86_64, bytes: other }, { cpuType: CPU_TYPE_ARM64, bytes: arm64 }]),
-			fatMachO([{ cpuType: CPU_TYPE_X86_64, bytes: other }, { cpuType: CPU_TYPE_ARM64, bytes: arm64 }], true),
-		]) expect(parseDarwinArm64CodeIdentity(bytes)).toEqual(expectedIdentity(directory, 2));
+			fatMachO([
+				{ cpuType: CPU_TYPE_X86_64, bytes: other },
+				{ cpuType: CPU_TYPE_ARM64, bytes: arm64 },
+			]),
+			fatMachO(
+				[
+					{ cpuType: CPU_TYPE_X86_64, bytes: other },
+					{ cpuType: CPU_TYPE_ARM64, bytes: arm64 },
+				],
+				true,
+			),
+		])
+			expect(parseDarwinArm64CodeIdentity(bytes)).toEqual(expectedIdentity(directory, 2));
 	});
 
 	test("rejects duplicate supported hash ranks as ambiguous", () => {
@@ -219,10 +235,14 @@ describe("parseDarwinArm64CodeIdentity", () => {
 
 	test("rejects ambiguous fat arm64 slices and malformed load-command ranges", () => {
 		const arm64 = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x01) }]);
-		expect(() => parseDarwinArm64CodeIdentity(fatMachO([
-			{ cpuType: CPU_TYPE_ARM64, bytes: arm64 },
-			{ cpuType: CPU_TYPE_ARM64, bytes: arm64 },
-		]))).toThrow("multiple arm64 slices");
+		expect(() =>
+			parseDarwinArm64CodeIdentity(
+				fatMachO([
+					{ cpuType: CPU_TYPE_ARM64, bytes: arm64 },
+					{ cpuType: CPU_TYPE_ARM64, bytes: arm64 },
+				]),
+			),
+		).toThrow("multiple arm64 slices");
 		const malformed = Buffer.from(arm64);
 		malformed.writeUInt32LE(24, 36);
 		expect(() => parseDarwinArm64CodeIdentity(malformed)).toThrow(DarwinVerifiedSpawnError);
@@ -257,9 +277,13 @@ describe("spawnDarwinVerified", () => {
 		const executableBytes = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x11) }]);
 		const expected = parseDarwinArm64CodeIdentity(executableBytes);
 		const events: string[] = [];
-		const native = scenarioNative(expected, events, { loaded: { hashType: expected.hashType, cdHash: Buffer.alloc(20, 0xff) } });
+		const native = scenarioNative(expected, events, {
+			loaded: { hashType: expected.hashType, cdHash: Buffer.alloc(20, 0xff) },
+		});
 		const bootstrap = Buffer.from("not-a-secret", "utf8");
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
+		await expect(
+			spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events)),
+		).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
 		expect(events).not.toContain("bind");
 		expect(events).not.toContain("write");
 		expect(events).not.toContain("SIGCONT");
@@ -273,7 +297,9 @@ describe("spawnDarwinVerified", () => {
 		const events: string[] = [];
 		const native = scenarioNative(expected, events, { tokens: [null] });
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow("start identity is unavailable");
+		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow(
+			"start identity is unavailable",
+		);
 		expect(events).not.toContain("attest");
 		expect(events).not.toContain("bind");
 		expect(events).not.toContain("write");
@@ -286,9 +312,13 @@ describe("spawnDarwinVerified", () => {
 		const executableBytes = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x12) }]);
 		const expected = parseDarwinArm64CodeIdentity(executableBytes);
 		const events: string[] = [];
-		const native = scenarioNative(expected, events, { loaded: { hashType: 3, cdHash: Buffer.from(expected.cdHash) } });
+		const native = scenarioNative(expected, events, {
+			loaded: { hashType: 3, cdHash: Buffer.from(expected.cdHash) },
+		});
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow("does not match verified bytes");
+		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow(
+			"does not match verified bytes",
+		);
 		expect(events).not.toContain("bind");
 		expect(events).not.toContain("write");
 		expect(events).not.toContain("SIGCONT");
@@ -301,7 +331,9 @@ describe("spawnDarwinVerified", () => {
 		const events: string[] = [];
 		const native = scenarioNative(expected, events, { tokens: ["darwin:1:2", "darwin:9:9"] });
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow("identity changed during attestation");
+		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow(
+			"identity changed during attestation",
+		);
 		expect(events).not.toContain("bind");
 		expect(events).not.toContain("write");
 		expect(events).not.toContain("SIGCONT");
@@ -314,7 +346,9 @@ describe("spawnDarwinVerified", () => {
 		const events: string[] = [];
 		const native = scenarioNative(expected, events, { loaded: null });
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow("code identity is unavailable");
+		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow(
+			"code identity is unavailable",
+		);
 		expect(events).not.toContain("bind");
 		expect(events).not.toContain("write");
 		expect(events).not.toContain("SIGCONT");
@@ -327,7 +361,9 @@ describe("spawnDarwinVerified", () => {
 		const events: string[] = [];
 		const native = scenarioNative(expected, events, { tokens: ["darwin:1:2", "darwin:1:2", null] });
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow("identity changed before resume");
+		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toThrow(
+			"identity changed before resume",
+		);
 		expect(events).toContain("bind");
 		expect(events).toContain("write");
 		expect(events).not.toContain("SIGCONT");
@@ -345,7 +381,9 @@ describe("spawnDarwinVerified", () => {
 		};
 		const native = scenarioNative(expected, events, scenario);
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events, scenario))).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
+		await expect(
+			spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events, scenario)),
+		).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
 		expect(events).not.toContain("write");
 		expect(events).not.toContain("SIGCONT");
 		expect(events.slice(-3)).toEqual(["eof", "SIGKILL", "reap"]);
@@ -372,21 +410,22 @@ describe("spawnDarwinVerified", () => {
 			}),
 		} as DarwinVerifiedSpawnNative;
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified({
-			...spawnOptions(executableBytes, bootstrap, native, events),
-			bindIdentity: async () => {
-				events.push("bind");
-				await Bun.sleep(20);
-				settled = true;
-				events.push("poll-reaped");
-				throw new Error("bind failed after child exit");
-			},
-		})).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
+		await expect(
+			spawnDarwinVerified({
+				...spawnOptions(executableBytes, bootstrap, native, events),
+				bindIdentity: async () => {
+					events.push("bind");
+					await Bun.sleep(20);
+					settled = true;
+					events.push("poll-reaped");
+					throw new Error("bind failed after child exit");
+				},
+			}),
+		).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
 		expect(events).not.toContain("SIGKILL");
 		expect(events.slice(-3)).toEqual(["poll-reaped", "eof", "reap"]);
 		expect(bootstrap.every(byte => byte === 0)).toBe(true);
 	});
-
 
 	test("closes, kills, and reaps without resume when the bounded write fails", async () => {
 		const executableBytes = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x16) }]);
@@ -398,7 +437,9 @@ describe("spawnDarwinVerified", () => {
 		};
 		const native = scenarioNative(expected, events, scenario);
 		const bootstrap = Buffer.alloc(16, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events))).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
+		await expect(
+			spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, native, events)),
+		).rejects.toBeInstanceOf(DarwinVerifiedSpawnError);
 		expect(events).not.toContain("SIGCONT");
 		expect(events.slice(-4)).toEqual(["write", "eof", "SIGKILL", "reap"]);
 		expect(bootstrap.every(byte => byte === 0)).toBe(true);
@@ -409,7 +450,9 @@ describe("spawnDarwinVerified", () => {
 		const expected = parseDarwinArm64CodeIdentity(executableBytes);
 		const events: string[] = [];
 		const bootstrap = Buffer.alloc(33, 0x5a);
-		await expect(spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, scenarioNative(expected, events), events))).rejects.toThrow("1..32 bytes");
+		await expect(
+			spawnDarwinVerified(spawnOptions(executableBytes, bootstrap, scenarioNative(expected, events), events)),
+		).rejects.toThrow("1..32 bytes");
 		expect(events).toEqual([]);
 		expect(bootstrap.every(byte => byte === 0)).toBe(true);
 	});
@@ -418,7 +461,9 @@ describe("spawnDarwinVerified", () => {
 		const executableBytes = thinArm64MachO([{ slot: 0, bytes: codeDirectory(2, 0x18) }]);
 		const expected = parseDarwinArm64CodeIdentity(executableBytes);
 		const events: string[] = [];
-		const native = scenarioNative(expected, events, { tokens: ["darwin:1:2", "darwin:1:2", "darwin:1:2", "darwin:9:9"] });
+		const native = scenarioNative(expected, events, {
+			tokens: ["darwin:1:2", "darwin:1:2", "darwin:1:2", "darwin:9:9"],
+		});
 		const child = await spawnDarwinVerified(spawnOptions(executableBytes, Buffer.from("fixture"), native, events));
 		expect(await child.signalIfSame("SIGKILL")).toBe("identity-changed");
 		expect(events.filter(event => event === "SIGKILL")).toHaveLength(0);
@@ -433,7 +478,7 @@ describe.skipIf(process.platform !== "darwin")("Darwin native verified spawn", (
 		const child = await spawnDarwinVerified({
 			executablePath,
 			executableBytes,
-			argv: ["-c", "IFS= read -r value <&3; test \"$value\" = fixture"],
+			argv: ["-c", 'IFS= read -r value <&3; test "$value" = fixture'],
 			env: { PATH: "/usr/bin:/bin" },
 			bootstrap,
 			bindIdentity: async () => undefined,

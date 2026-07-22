@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { emergencyTerminalRestore } from "@oh-my-pi/pi-tui";
-import type { LifecycleDispatchResult } from "./lifecycle-supervisor";
 import type { LifecycleState } from "./lifecycle-state";
+import type { LifecycleDispatchResult } from "./lifecycle-supervisor";
 import type { BreadboardRunConfig } from "./run-config";
 
 export interface LifecyclePresentation {
@@ -46,7 +46,8 @@ export function displayEndpointIdentity(endpoint: string | undefined): string | 
 }
 
 export function presentLifecycle(result: LifecycleDispatchResult): LifecyclePresentation {
-	if (result.kind === "off") return { summary: "BreadBoard engine: off", remediation: REMEDIATION_BY_REASON.engine_mode_off, exitCode: 0 };
+	if (result.kind === "off")
+		return { summary: "BreadBoard engine: off", remediation: REMEDIATION_BY_REASON.engine_mode_off, exitCode: 0 };
 	if (result.kind === "ready") {
 		return {
 			summary: `BreadBoard engine: ready (${result.state.mode}; instance ${result.handle.binding.engineInstanceId})`,
@@ -68,7 +69,10 @@ export function presentLifecycle(result: LifecycleDispatchResult): LifecyclePres
 	};
 }
 
-export function secretSafeLifecycleStatus(config: BreadboardRunConfig, state: LifecycleState): Readonly<Record<string, unknown>> {
+export function secretSafeLifecycleStatus(
+	config: BreadboardRunConfig,
+	state: LifecycleState,
+): Readonly<Record<string, unknown>> {
 	return Object.freeze({
 		mode: config.mode,
 		state: state.name,

@@ -1,28 +1,41 @@
 import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdtemp, open, rm } from "node:fs/promises";
+import { type FileHandle, mkdtemp, open, rm } from "node:fs/promises";
+import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { request as httpsRequest } from "node:https";
-import { checkServerIdentity } from "node:tls";
 import type { PeerCertificate } from "node:tls";
+import { checkServerIdentity } from "node:tls";
 import {
-	createLifecycleE4Client,
-	LifecycleE4ClientError,
-	P30_SESSION_CONTRACT_ID,
-	P30_SESSION_SCHEMA_SHA256,
 	type BoundLifecycleE4Client,
 	type ClientRegistrationResponse,
+	createLifecycleE4Client,
 	type HardSignalOutcome,
 	type HardSignalPermitResponse,
 	type LifecycleE4Client,
+	LifecycleE4ClientError,
 	type LifecycleEngineBinding,
+	P30_SESSION_CONTRACT_ID,
+	P30_SESSION_SCHEMA_SHA256,
 } from "@breadboard/sdk";
-import { darwinProcessStartToken, DarwinVerifiedSpawnError, spawnDarwinVerified } from "./darwin-verified-spawn";
-import type { LocalAuthorityRecord, LocalControlAttempt, LocalStartClaim } from "./local-authority-store";
-import { LocalAuthorityStore, LocalAuthorityStoreError } from "./local-authority-store";
-import { lifecycleFailure, lifecycleState, type LifecycleReadyHandle, type LifecycleResult, type LifecycleState, type LifecycleStateName } from "./lifecycle-state";
-import { executablePathSha256, type BreadboardAuth, type BreadboardRunConfig, type EngineArtifact, type OwnerExitPolicy } from "./run-config";
+import { DarwinVerifiedSpawnError, darwinProcessStartToken, spawnDarwinVerified } from "./darwin-verified-spawn";
+import {
+	type LifecycleReadyHandle,
+	type LifecycleResult,
+	type LifecycleState,
+	type LifecycleStateName,
+	lifecycleFailure,
+	lifecycleState,
+} from "./lifecycle-state";
+import type { LocalAuthorityRecord, LocalStartClaim } from "./local-authority-store";
+import { type LocalAuthorityStore, LocalAuthorityStoreError } from "./local-authority-store";
+import {
+	type BreadboardAuth,
+	type BreadboardRunConfig,
+	type EngineArtifact,
+	executablePathSha256,
+	type OwnerExitPolicy,
+} from "./run-config";
 
 export interface SpawnedEngineProcess {
 	readonly pid: number;
@@ -62,9 +75,10 @@ export interface ResolvedRemoteSecurity {
 	readonly privateKeyPem?: string;
 }
 
-function createAuthenticatedRequestFetch(
-	security: { readonly bearerToken?: string; readonly fetch?: typeof fetch },
-): typeof fetch {
+function createAuthenticatedRequestFetch(security: {
+	readonly bearerToken?: string;
+	readonly fetch?: typeof fetch;
+}): typeof fetch {
 	const transport = security.fetch ?? globalThis.fetch;
 	if (security.bearerToken === undefined) return transport;
 	const authorization = `Bearer ${security.bearerToken}`;
@@ -73,7 +87,9 @@ function createAuthenticatedRequestFetch(
 		init?: Parameters<typeof fetch>[1],
 	): Promise<Response> => {
 		const headers = new Headers(input instanceof Request ? input.headers : undefined);
-		new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+		new Headers(init?.headers).forEach((value, name) => {
+			headers.set(name, value);
+		});
 		headers.set("authorization", authorization);
 		return transport(input, { ...init, headers });
 	};
@@ -89,7 +105,9 @@ export interface LifecycleSupervisorDependencies {
 		readonly bearerToken?: string;
 		readonly fetch?: typeof fetch;
 	}) => LifecycleE4Client;
-	readonly resolveRemoteSecurity?: (auth: Exclude<BreadboardAuth, { readonly kind: "process-secret" }>) => Promise<ResolvedRemoteSecurity>;
+	readonly resolveRemoteSecurity?: (
+		auth: Exclude<BreadboardAuth, { readonly kind: "process-secret" }>,
+	) => Promise<ResolvedRemoteSecurity>;
 	readonly randomCredential?: () => string;
 	readonly randomSecret?: () => Buffer;
 	readonly randomOwnerCredential?: () => Buffer;
@@ -118,7 +136,6 @@ interface ReadyContext {
 	readonly process?: SpawnedEngineProcess;
 	readonly effectiveExitPolicy?: OwnerExitPolicy;
 }
-
 
 class EngineArtifactValidationError extends Error {}
 class ProcessIdentityValidationError extends Error {}
@@ -149,7 +166,13 @@ const ALLOWED_TRANSITIONS: Readonly<Partial<Record<LifecycleStateName, ReadonlyS
 	claiming: new Set(["starting", "connecting"]),
 	starting: new Set(["connecting", "backing-off"]),
 	connecting: new Set(["handshaking"]),
-	handshaking: new Set(["acquiring-owner", "registering-client", "compatible-observed", "reconnecting", "backing-off"]),
+	handshaking: new Set([
+		"acquiring-owner",
+		"registering-client",
+		"compatible-observed",
+		"reconnecting",
+		"backing-off",
+	]),
 	"acquiring-owner": new Set(["registering-client", "reconnecting"]),
 	"registering-client": new Set(["ready", "reconnecting"]),
 	ready: new Set(["claiming", "draining", "detaching-client", "backing-off", "reconnecting"]),
@@ -173,10 +196,11 @@ export function lifecycleChildEnvironment(launchId: string): Readonly<Record<str
 	});
 }
 
-
 function mappedFailure(mode: BreadboardRunConfig["mode"], error: unknown, attempt = 0): LifecycleResult {
-	if (error instanceof EngineArtifactValidationError) return lifecycleFailure(mode, "failed", "engine_artifact_mismatch", attempt);
-	if (error instanceof ProcessIdentityValidationError) return lifecycleFailure(mode, "failed", "process_identity_unavailable", attempt);
+	if (error instanceof EngineArtifactValidationError)
+		return lifecycleFailure(mode, "failed", "engine_artifact_mismatch", attempt);
+	if (error instanceof ProcessIdentityValidationError)
+		return lifecycleFailure(mode, "failed", "process_identity_unavailable", attempt);
 	if (error instanceof LifecycleE4ClientError) {
 		switch (error.failure.kind) {
 			case "auth":
@@ -208,7 +232,11 @@ function mappedFailure(mode: BreadboardRunConfig["mode"], error: unknown, attemp
 			default:
 				return lifecycleFailure(
 					mode,
-					mode === "local-external" ? "external-disconnected" : mode === "remote" ? "remote-disconnected" : "recovery-needed",
+					mode === "local-external"
+						? "external-disconnected"
+						: mode === "remote"
+							? "remote-disconnected"
+							: "recovery-needed",
 					"endpoint_unreachable",
 					attempt,
 				);
@@ -231,8 +259,6 @@ function unrefDelay(milliseconds: number): Promise<void> {
 	return promise;
 }
 
-
-
 class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 	readonly #children = new Map<number, SpawnedEngineProcess>();
 
@@ -245,8 +271,8 @@ class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 		const source = await open(artifact.executablePath, constants.O_RDONLY | constants.O_NOFOLLOW);
 		const snapshotRoot = await mkdtemp(join(tmpdir(), "omp-engine-snapshot-"));
 		const snapshotPath = join(snapshotRoot, "engine");
-		let snapshot;
-		let execution;
+		let snapshot: FileHandle | undefined;
+		let execution: FileHandle | undefined;
 		try {
 			const sourceMetadata = await source.stat();
 			if (!sourceMetadata.isFile() || sourceMetadata.nlink !== 1) {
@@ -256,7 +282,11 @@ class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 			if (`sha256:${createHash("sha256").update(sourceBytes).digest("hex")}` !== artifact.executableSha256) {
 				throw new EngineArtifactValidationError("engine executable digest changed");
 			}
-			snapshot = await open(snapshotPath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+			snapshot = await open(
+				snapshotPath,
+				constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+				0o600,
+			);
 			await snapshot.writeFile(sourceBytes);
 			await snapshot.sync();
 			await snapshot.chmod(0o500);
@@ -326,7 +356,8 @@ class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 		try {
 			process.kill(pid, 0);
 		} catch (error) {
-			if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") return { kind: "dead" };
+			if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH")
+				return { kind: "dead" };
 			return { kind: "ambiguous" };
 		}
 		if (process.platform !== "darwin") return { kind: "ambiguous" };
@@ -343,7 +374,8 @@ class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 			while (true) {
 				try {
 					const current = await this.observe(pid);
-					if (current.kind === "dead" || (current.kind === "alive" && current.startToken !== expectedStartToken)) return null;
+					if (current.kind === "dead" || (current.kind === "alive" && current.startToken !== expectedStartToken))
+						return null;
 				} catch {
 					// An unobservable process is not proof of death; keep the owner record closed.
 				}
@@ -359,7 +391,8 @@ class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 				const current = await this.observe(pid);
 				if (current.kind === "dead") return "process_exited";
 				if (current.kind !== "alive" || current.startToken !== expectedStartToken) return "abandoned";
-				if (authorizationExpiresAtUnix !== undefined && Date.now() >= authorizationExpiresAtUnix * 1_000) return "authorization_expired";
+				if (authorizationExpiresAtUnix !== undefined && Date.now() >= authorizationExpiresAtUnix * 1_000)
+					return "authorization_expired";
 				try {
 					process.kill(pid, "SIGKILL");
 					return "sent";
@@ -371,12 +404,13 @@ class DefaultLifecycleProcessAdapter implements LifecycleProcessAdapter {
 			},
 			waitForExit: async timeoutMs => {
 				const deadline = Date.now() + timeoutMs;
-				do {
+				for (;;) {
 					const current = await this.observe(pid);
-					if (current.kind === "dead" || (current.kind === "alive" && current.startToken !== expectedStartToken)) return true;
+					if (current.kind === "dead" || (current.kind === "alive" && current.startToken !== expectedStartToken))
+						return true;
 					if (Date.now() >= deadline) return false;
 					await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
-				} while (true);
+				}
 			},
 		};
 	}
@@ -396,16 +430,17 @@ export interface KeychainReadOptions {
 	readonly spawn?: (reference: string) => KeychainReadProcess;
 }
 
-
 export async function readKeychainReference(reference: string, options: KeychainReadOptions = {}): Promise<string> {
 	const outputLimit = options.outputLimit ?? KEYCHAIN_OUTPUT_LIMIT;
 	const timeoutMs = options.timeoutMs ?? KEYCHAIN_TIMEOUT_MS;
-	const child = options.spawn?.(reference) ?? Bun.spawn(["/usr/bin/security", "find-generic-password", "-w", "-s", reference], {
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "ignore",
-		env: {},
-	});
+	const child =
+		options.spawn?.(reference) ??
+		Bun.spawn(["/usr/bin/security", "find-generic-password", "-w", "-s", reference], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+			env: {},
+		});
 	const reader = child.stdout.getReader();
 	let cancellation: Promise<void> | undefined;
 	const cancelReader = (): Promise<void> => {
@@ -415,7 +450,13 @@ export async function readKeychainReference(reference: string, options: Keychain
 	let boundedFailure: LifecycleE4ClientError | undefined;
 	const timer = setTimeout(() => {
 		if (!boundedFailure) {
-			boundedFailure = new LifecycleE4ClientError({ kind: "auth", status: 0, code: "secret_reference_timeout", correlation: {}, body: "[redacted]" });
+			boundedFailure = new LifecycleE4ClientError({
+				kind: "auth",
+				status: 0,
+				code: "secret_reference_timeout",
+				correlation: {},
+				body: "[redacted]",
+			});
 		}
 		child.kill("SIGKILL");
 		void cancelReader();
@@ -434,7 +475,13 @@ export async function readKeychainReference(reference: string, options: Keychain
 					if (boundedFailure || size > outputLimit) {
 						chunk.fill(0);
 						if (!boundedFailure) {
-							boundedFailure = new LifecycleE4ClientError({ kind: "auth", status: 0, code: "secret_reference_oversized", correlation: {}, body: "[redacted]" });
+							boundedFailure = new LifecycleE4ClientError({
+								kind: "auth",
+								status: 0,
+								code: "secret_reference_oversized",
+								correlation: {},
+								body: "[redacted]",
+							});
 							child.kill("SIGKILL");
 						}
 						await cancelReader();
@@ -454,7 +501,13 @@ export async function readKeychainReference(reference: string, options: Keychain
 		combined = Buffer.concat(chunks, size);
 		const value = combined.toString("utf8").trim();
 		if (exitCode !== 0 || value.length === 0) {
-			throw new LifecycleE4ClientError({ kind: "auth", status: 0, code: "secret_reference_unavailable", correlation: {}, body: "[redacted]" });
+			throw new LifecycleE4ClientError({
+				kind: "auth",
+				status: 0,
+				code: "secret_reference_unavailable",
+				correlation: {},
+				body: "[redacted]",
+			});
 		}
 		return value;
 	} finally {
@@ -463,21 +516,32 @@ export async function readKeychainReference(reference: string, options: Keychain
 		for (const chunk of chunks) chunk.fill(0);
 	}
 }
-async function defaultResolveRemoteSecurity(auth: Exclude<BreadboardAuth, { readonly kind: "process-secret" }>): Promise<ResolvedRemoteSecurity> {
+async function defaultResolveRemoteSecurity(
+	auth: Exclude<BreadboardAuth, { readonly kind: "process-secret" }>,
+): Promise<ResolvedRemoteSecurity> {
 	const resolved = await readKeychainReference(auth.reference);
 	if (auth.kind === "keychain-reference") return { bearerToken: resolved };
 	try {
 		const parsed: unknown = JSON.parse(resolved);
-		if (typeof parsed !== "object" || parsed === null || !("certificatePem" in parsed) || !("privateKeyPem" in parsed)) throw new Error("invalid identity");
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			!("certificatePem" in parsed) ||
+			!("privateKeyPem" in parsed)
+		)
+			throw new Error("invalid identity");
 		const identity = parsed as { certificatePem?: unknown; privateKeyPem?: unknown };
-		if (typeof identity.certificatePem !== "string" || typeof identity.privateKeyPem !== "string") throw new Error("invalid identity");
+		if (typeof identity.certificatePem !== "string" || typeof identity.privateKeyPem !== "string")
+			throw new Error("invalid identity");
 		return { certificatePem: identity.certificatePem, privateKeyPem: identity.privateKeyPem };
 	} catch {
 		throw new LifecycleE4ClientError({ kind: "tls", code: "tls_transport_error" });
 	}
 }
 
-function pinnedCheckServerIdentity(pin: string | undefined): (hostname: string, certificate: PeerCertificate) => Error | undefined {
+function pinnedCheckServerIdentity(
+	pin: string | undefined,
+): (hostname: string, certificate: PeerCertificate) => Error | undefined {
 	return (hostname, certificate) => {
 		const hostnameError = checkServerIdentity(hostname, certificate);
 		if (hostnameError || pin === undefined) return hostnameError;
@@ -497,7 +561,8 @@ const LIFECYCLE_RESPONSE_LIMIT = 1024 * 1024;
 function createBoundHttpsFetch(security: ResolvedRemoteSecurity, spkiPin: string | undefined): typeof fetch {
 	return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 		const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url);
-		if (url.protocol !== "https:") throw Object.assign(new Error("TLS required"), { code: "ERR_TLS_CERT_ALTNAME_INVALID" });
+		if (url.protocol !== "https:")
+			throw Object.assign(new Error("TLS required"), { code: "ERR_TLS_CERT_ALTNAME_INVALID" });
 		const { promise, resolve, reject } = Promise.withResolvers<Response>();
 		let settled = false;
 		const fail = (error: unknown): void => {
@@ -505,48 +570,64 @@ function createBoundHttpsFetch(security: ResolvedRemoteSecurity, spkiPin: string
 			settled = true;
 			reject(error);
 		};
-		const request = httpsRequest(url, {
-			method: init?.method,
-			headers: init?.headers as Record<string, string> | undefined,
-			cert: security.certificatePem,
-			key: security.privateKeyPem,
-			checkServerIdentity: pinnedCheckServerIdentity(spkiPin),
-		}, response => {
-			const declared = response.headers["content-length"];
-			const contentLength = typeof declared === "string" ? Number(declared) : Number.NaN;
-			if (Number.isFinite(contentLength) && contentLength > LIFECYCLE_RESPONSE_LIMIT) {
-				const error = new LifecycleE4ClientError({ kind: "http", status: 0, code: "response_too_large", correlation: {}, body: "[redacted]" });
-				response.destroy(error);
-				fail(error);
-				return;
-			}
-			const chunks: Buffer[] = [];
-			let received = 0;
-			response.on("data", chunk => {
-				if (settled) return;
-				const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-				received += bytes.byteLength;
-				if (received > LIFECYCLE_RESPONSE_LIMIT) {
-					for (const buffered of chunks) buffered.fill(0);
-					const error = new LifecycleE4ClientError({ kind: "http", status: 0, code: "response_too_large", correlation: {}, body: "[redacted]" });
+		const request = httpsRequest(
+			url,
+			{
+				method: init?.method,
+				headers: init?.headers as Record<string, string> | undefined,
+				cert: security.certificatePem,
+				key: security.privateKeyPem,
+				checkServerIdentity: pinnedCheckServerIdentity(spkiPin),
+			},
+			response => {
+				const declared = response.headers["content-length"];
+				const contentLength = typeof declared === "string" ? Number(declared) : Number.NaN;
+				if (Number.isFinite(contentLength) && contentLength > LIFECYCLE_RESPONSE_LIMIT) {
+					const error = new LifecycleE4ClientError({
+						kind: "http",
+						status: 0,
+						code: "response_too_large",
+						correlation: {},
+						body: "[redacted]",
+					});
 					response.destroy(error);
 					fail(error);
 					return;
 				}
-				chunks.push(bytes);
-			});
-			response.once("error", fail);
-			response.once("end", () => {
-				if (settled) return;
-				const headers = new Headers();
-				for (const [name, value] of Object.entries(response.headers)) {
-					if (Array.isArray(value)) for (const item of value) headers.append(name, item);
-					else if (value !== undefined) headers.set(name, String(value));
-				}
-				settled = true;
-				resolve(new Response(Buffer.concat(chunks, received), { status: response.statusCode ?? 500, headers }));
-			});
-		});
+				const chunks: Buffer[] = [];
+				let received = 0;
+				response.on("data", chunk => {
+					if (settled) return;
+					const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+					received += bytes.byteLength;
+					if (received > LIFECYCLE_RESPONSE_LIMIT) {
+						for (const buffered of chunks) buffered.fill(0);
+						const error = new LifecycleE4ClientError({
+							kind: "http",
+							status: 0,
+							code: "response_too_large",
+							correlation: {},
+							body: "[redacted]",
+						});
+						response.destroy(error);
+						fail(error);
+						return;
+					}
+					chunks.push(bytes);
+				});
+				response.once("error", fail);
+				response.once("end", () => {
+					if (settled) return;
+					const headers = new Headers();
+					for (const [name, value] of Object.entries(response.headers)) {
+						if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+						else if (value !== undefined) headers.set(name, String(value));
+					}
+					settled = true;
+					resolve(new Response(Buffer.concat(chunks, received), { status: response.statusCode ?? 500, headers }));
+				});
+			},
+		);
 		request.once("error", fail);
 		const abort = (): void => {
 			request.destroy(new DOMException("Aborted", "AbortError"));
@@ -591,13 +672,19 @@ abstract class ModeStrategy {
 		this.makeOwnerCredential = dependencies.randomOwnerCredential ?? randomOwnerCredential;
 		this.clientInstanceId = this.makeCredential();
 		this.registrationCredential = this.makeCredential();
-		this.createClient = dependencies.createClient ?? (options => createLifecycleE4Client({
-			baseUrl: options.baseUrl,
-			timeoutMs: options.timeoutMs,
-			expectedSessionContract: { contractId: P30_SESSION_CONTRACT_ID, schemaSha256: P30_SESSION_SCHEMA_SHA256 },
-			...(options.bearerToken === undefined ? {} : { bearerToken: options.bearerToken }),
-			...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-		}));
+		this.createClient =
+			dependencies.createClient ??
+			(options =>
+				createLifecycleE4Client({
+					baseUrl: options.baseUrl,
+					timeoutMs: options.timeoutMs,
+					expectedSessionContract: {
+						contractId: P30_SESSION_CONTRACT_ID,
+						schemaSha256: P30_SESSION_SCHEMA_SHA256,
+					},
+					...(options.bearerToken === undefined ? {} : { bearerToken: options.bearerToken }),
+					...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+				}));
 		this.stateChanged = dependencies.stateChanged ?? (() => undefined);
 	}
 
@@ -624,9 +711,11 @@ abstract class ModeStrategy {
 		return false;
 	}
 
-
 	protected transition(name: LifecycleStateName, attempt = 0): void {
-		const allowed = this.currentState === undefined || INITIAL_STATES.has(name) || ALLOWED_TRANSITIONS[this.currentState]?.has(name);
+		const allowed =
+			this.currentState === undefined ||
+			INITIAL_STATES.has(name) ||
+			ALLOWED_TRANSITIONS[this.currentState]?.has(name);
 		if (!allowed) throw new Error(`illegal lifecycle transition ${this.currentState} -> ${name}`);
 		this.currentState = name;
 		this.stateChanged(lifecycleState(this.config.mode, name, attempt));
@@ -637,9 +726,11 @@ abstract class ModeStrategy {
 		let security: ResolvedRemoteSecurity = {};
 		if (auth?.kind === "process-secret") security = { bearerToken: auth.value };
 		else if (auth) security = await (this.dependencies.resolveRemoteSecurity ?? defaultResolveRemoteSecurity)(auth);
-		if (this.config.mode !== "remote") return security.bearerToken === undefined ? {} : { bearerToken: security.bearerToken };
+		if (this.config.mode !== "remote")
+			return security.bearerToken === undefined ? {} : { bearerToken: security.bearerToken };
 		const pin = this.config.tls?.kind === "system-trust" ? this.config.tls.spkiPin : undefined;
-		const needsBoundFetch = pin !== undefined || security.certificatePem !== undefined || security.privateKeyPem !== undefined;
+		const needsBoundFetch =
+			pin !== undefined || security.certificatePem !== undefined || security.privateKeyPem !== undefined;
 		return {
 			...(security.bearerToken === undefined ? {} : { bearerToken: security.bearerToken }),
 			...(needsBoundFetch ? { fetch: createBoundHttpsFetch(security, pin) } : {}),
@@ -710,7 +801,10 @@ abstract class ModeStrategy {
 						registrationCredential: context.registrationCredential,
 					});
 					if (context.ownerCredential !== undefined && context.ownerGeneration !== undefined) {
-						await context.client.renewOwner({ ownerGeneration: context.ownerGeneration, ownerCredential: credentialText(context.ownerCredential) });
+						await context.client.renewOwner({
+							ownerGeneration: context.ownerGeneration,
+							ownerCredential: credentialText(context.ownerCredential),
+						});
 					}
 				} catch (error) {
 					if (this.context !== context) return;
@@ -747,7 +841,11 @@ abstract class ModeStrategy {
 			}),
 			...(context.ownerGeneration === undefined ? {} : { ownerGeneration: context.ownerGeneration }),
 		});
-		return { kind: "ready", state: lifecycleState(this.config.mode, "ready") as LifecycleState & { readonly name: "ready" }, handle };
+		return {
+			kind: "ready",
+			state: lifecycleState(this.config.mode, "ready") as LifecycleState & { readonly name: "ready" },
+			handle,
+		};
 	}
 
 	protected readyResult(context: ReadyContext): LifecycleResult {
@@ -760,7 +858,9 @@ abstract class ModeStrategy {
 	protected projectObservedResult(binding: LifecycleEngineBinding): LifecycleResult {
 		return {
 			kind: "observed",
-			state: lifecycleState(this.config.mode, "compatible-observed") as LifecycleState & { readonly name: "compatible-observed" },
+			state: lifecycleState(this.config.mode, "compatible-observed") as LifecycleState & {
+				readonly name: "compatible-observed";
+			},
 			handle: Object.freeze({ mode: this.config.mode as Exclude<BreadboardRunConfig["mode"], "off">, binding }),
 		};
 	}
@@ -784,7 +884,10 @@ abstract class ModeStrategy {
 				signal: this.abortController.signal.aborted ? undefined : this.abortController.signal,
 			});
 			this.transition("detached");
-			return { kind: "detached", state: lifecycleState(this.config.mode, "detached") as LifecycleState & { readonly name: "detached" } };
+			return {
+				kind: "detached",
+				state: lifecycleState(this.config.mode, "detached") as LifecycleState & { readonly name: "detached" },
+			};
 		} catch (error) {
 			return mappedFailure(this.config.mode, error);
 		} finally {
@@ -800,10 +903,18 @@ class OffModeStrategy extends ModeStrategy {
 		this.stateChanged(state);
 		return { kind: "off", state };
 	}
-	async status(): Promise<LifecycleResult> { return this.connect(); }
-	async stop(): Promise<LifecycleResult> { return lifecycleFailure("off", "failed", "mode_forbidden"); }
-	async restart(): Promise<LifecycleResult> { return lifecycleFailure("off", "failed", "mode_forbidden"); }
-	async close(): Promise<LifecycleResult> { return this.connect(); }
+	async status(): Promise<LifecycleResult> {
+		return this.connect();
+	}
+	async stop(): Promise<LifecycleResult> {
+		return lifecycleFailure("off", "failed", "mode_forbidden");
+	}
+	async restart(): Promise<LifecycleResult> {
+		return lifecycleFailure("off", "failed", "mode_forbidden");
+	}
+	async close(): Promise<LifecycleResult> {
+		return this.connect();
+	}
 }
 
 class ConnectOnlyModeStrategy extends ModeStrategy {
@@ -844,9 +955,15 @@ class ConnectOnlyModeStrategy extends ModeStrategy {
 		}
 	}
 
-	async stop(): Promise<LifecycleResult> { return lifecycleFailure(this.config.mode, "failed", "mode_forbidden"); }
-	async restart(): Promise<LifecycleResult> { return lifecycleFailure(this.config.mode, "failed", "mode_forbidden"); }
-	async close(): Promise<LifecycleResult> { return this.context ? this.detach() : lifecycleFailure(this.config.mode, "failed", "endpoint_unreachable"); }
+	async stop(): Promise<LifecycleResult> {
+		return lifecycleFailure(this.config.mode, "failed", "mode_forbidden");
+	}
+	async restart(): Promise<LifecycleResult> {
+		return lifecycleFailure(this.config.mode, "failed", "mode_forbidden");
+	}
+	async close(): Promise<LifecycleResult> {
+		return this.context ? this.detach() : lifecycleFailure(this.config.mode, "failed", "endpoint_unreachable");
+	}
 }
 
 class LocalOwnedModeStrategy extends ModeStrategy {
@@ -860,25 +977,29 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	#hardSignalCommitActive = false;
 	#connectPromise: Promise<LifecycleResult> | undefined;
 
-
 	constructor(config: BreadboardRunConfig, dependencies: LifecycleSupervisorDependencies) {
 		super(config, dependencies);
 		if (!dependencies.store) throw new Error("local-owned requires a local authority store");
 		this.#store = dependencies.store;
 		this.#process = dependencies.process ?? new DefaultLifecycleProcessAdapter();
-		this.#endpointAbsent = dependencies.endpointAbsent ?? (async client => {
-			try {
-				await client.handshake({ signal: this.abortController.signal });
-				return false;
-			} catch (error) {
-				return error instanceof LifecycleE4ClientError && error.failure.kind === "http" && error.failure.status === 0 ? true : "ambiguous";
-			}
-		});
+		this.#endpointAbsent =
+			dependencies.endpointAbsent ??
+			(async client => {
+				try {
+					await client.handshake({ signal: this.abortController.signal });
+					return false;
+				} catch (error) {
+					return error instanceof LifecycleE4ClientError &&
+						error.failure.kind === "http" &&
+						error.failure.status === 0
+						? true
+						: "ambiguous";
+				}
+			});
 	}
 	override abortRequiresQuiescence(): boolean {
 		return this.#hardSignalCommitActive;
 	}
-
 
 	async connect(): Promise<LifecycleResult> {
 		if (this.context) return this.projectReadyResult(this.context);
@@ -898,12 +1019,14 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	async #connectAttempt(attempt: number): Promise<LifecycleResult> {
 		if (this.context) return this.projectReadyResult(this.context);
 		const endpoint = this.config.endpoint;
-		if (!endpoint || !this.config.engineArtifact || !this.config.ownerExitPolicy) return lifecycleFailure("local-owned", "failed", "engine_artifact_unavailable", attempt);
+		if (!endpoint || !this.config.engineArtifact || !this.config.ownerExitPolicy)
+			return lifecycleFailure("local-owned", "failed", "engine_artifact_unavailable", attempt);
 		const deadline = this.clock.now() + this.config.startupTimeoutMs;
 		try {
 			this.transition("claiming", attempt);
 			while (this.clock.now() < deadline) {
-				if (this.abortController.signal.aborted) return lifecycleFailure("local-owned", "request-aborted", "request_aborted", attempt);
+				if (this.abortController.signal.aborted)
+					return lifecycleFailure("local-owned", "request-aborted", "request_aborted", attempt);
 				const decision = await this.#store.withExclusiveLock(endpoint, async () => {
 					const current = await this.#store.readCurrentForRecovery(endpoint);
 					if (current) return { kind: "record" as const, record: current };
@@ -915,8 +1038,10 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 					return await this.#store.claimStart(endpoint);
 				});
 				if (decision.kind === "record") return await this.#adoptOrRecover(decision.record, attempt);
-				if (decision.kind === "recoverable") return await this.#resumePendingStart(decision.claim, attempt, this.config.ownerExitPolicy);
-				if (decision.kind === "unbound") return await this.#resumeUnboundPendingStart(decision.claim, attempt, this.config.ownerExitPolicy);
+				if (decision.kind === "recoverable")
+					return await this.#resumePendingStart(decision.claim, attempt, this.config.ownerExitPolicy);
+				if (decision.kind === "unbound")
+					return await this.#resumeUnboundPendingStart(decision.claim, attempt, this.config.ownerExitPolicy);
 				if (decision.kind === "dead-bound") {
 					return lifecycleFailure("local-owned", "recovery-needed", "endpoint_unreachable", attempt);
 				}
@@ -941,7 +1066,12 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		return lifecycleFailure("local-owned", "request-aborted", "request_aborted", attempt);
 	}
 
-	async #runClaimedStart(claim: LocalStartClaim, attempt: number, policy: OwnerExitPolicy, restart: boolean): Promise<LifecycleResult> {
+	async #runClaimedStart(
+		claim: LocalStartClaim,
+		attempt: number,
+		policy: OwnerExitPolicy,
+		restart: boolean,
+	): Promise<LifecycleResult> {
 		return await this.#coldStart(claim, attempt, policy, restart);
 	}
 
@@ -952,12 +1082,13 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		return error instanceof LifecycleE4ClientError && error.failure.kind === "owner-conflict";
 	}
 
-
 	#isAmbiguousControlRequest(error: unknown): boolean {
 		if (!(error instanceof LifecycleE4ClientError)) return false;
-		return error.failure.kind === "timeout" ||
+		return (
+			error.failure.kind === "timeout" ||
 			error.failure.kind === "caller-abort" ||
-			(error.failure.kind === "http" && error.failure.status === 0);
+			(error.failure.kind === "http" && error.failure.status === 0)
+		);
 	}
 
 	async #retryAmbiguousControlRequest<T>(operation: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
@@ -997,7 +1128,9 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 							ownerCredential,
 							signal: this.abortController.signal,
 						});
-						const rolledBackClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.rollbackOwnerAttempt(endpoint, claim));
+						const rolledBackClaim = await this.#store.withExclusiveLock(endpoint, () =>
+							this.#store.rollbackOwnerAttempt(endpoint, claim),
+						);
 						return { owner: predecessor, claim: rolledBackClaim };
 					} catch (predecessorError) {
 						if (!this.#isOwnerExpired(predecessorError)) throw predecessorError;
@@ -1021,7 +1154,9 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				}
 				if (!this.#isOwnerExpired(error)) throw error;
 			}
-			const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.markOwnerAttempt(endpoint, claim));
+			const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () =>
+				this.#store.markOwnerAttempt(endpoint, claim),
+			);
 			try {
 				const owner = await bound.acquireOwner({
 					expectedOwnerGeneration: priorAttemptGeneration,
@@ -1032,20 +1167,23 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			} catch (error) {
 				if (!this.#isOwnerExpired(error)) throw error;
 			}
-			const rolledBackClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.rollbackOwnerAttempt(endpoint, attemptedClaim));
+			const rolledBackClaim = await this.#store.withExclusiveLock(endpoint, () =>
+				this.#store.rollbackOwnerAttempt(endpoint, attemptedClaim),
+			);
 			try {
-				const owner = priorAttemptGeneration === 1
-					? await bound.acquireOwner({
-						expectedOwnerGeneration: 0,
-						bootstrapCredential: pending.bootstrapCredential,
-						ownerCredential,
-						signal: this.abortController.signal,
-					})
-					: await bound.acquireOwner({
-						expectedOwnerGeneration: priorAttemptGeneration - 1,
-						ownerCredential,
-						signal: this.abortController.signal,
-					});
+				const owner =
+					priorAttemptGeneration === 1
+						? await bound.acquireOwner({
+								expectedOwnerGeneration: 0,
+								bootstrapCredential: pending.bootstrapCredential,
+								ownerCredential,
+								signal: this.abortController.signal,
+							})
+						: await bound.acquireOwner({
+								expectedOwnerGeneration: priorAttemptGeneration - 1,
+								ownerCredential,
+								signal: this.abortController.signal,
+							});
 				return { owner, claim: rolledBackClaim };
 			} catch (error) {
 				if (!this.#isOwnerConflict(error)) throw error;
@@ -1057,7 +1195,9 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			});
 			return { owner, claim: rolledBackClaim };
 		}
-		const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () => this.#store.markOwnerAttempt(endpoint, claim));
+		const attemptedClaim = await this.#store.withExclusiveLock(endpoint, () =>
+			this.#store.markOwnerAttempt(endpoint, claim),
+		);
 		const owner = await bound.acquireOwner({
 			expectedOwnerGeneration: 0,
 			bootstrapCredential: pending.bootstrapCredential,
@@ -1066,7 +1206,11 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		});
 		return { owner, claim: attemptedClaim };
 	}
-	async #resumeUnboundPendingStart(claim: LocalStartClaim, attempt: number, ownerExitPolicy: OwnerExitPolicy): Promise<LifecycleResult> {
+	async #resumeUnboundPendingStart(
+		claim: LocalStartClaim,
+		attempt: number,
+		ownerExitPolicy: OwnerExitPolicy,
+	): Promise<LifecycleResult> {
 		const artifact = this.config.engineArtifact;
 		const endpoint = this.config.endpoint;
 		if (
@@ -1078,7 +1222,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			claim.argvSha256 !== artifact.argvSha256 ||
 			claim.engineArtifactSha256 !== artifact.engineSourceSha256 ||
 			claim.servedBackendCommit !== artifact.servedBackendCommit
-		) return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
+		)
+			return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
 		const recoveryDeadline = this.clock.now() + this.config.startupTimeoutMs;
 		let reconnectAttempt = 0;
 		while (this.clock.now() < recoveryDeadline) {
@@ -1106,7 +1251,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				binding.artifactRevision.engineArtifactSha256 !== artifact.engineSourceSha256 ||
 				binding.artifactRevision.servedBackendCommit !== artifact.servedBackendCommit ||
 				binding.artifactRevision.servedBackendDirty !== false
-			) return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
+			)
+				return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
 			const observation = await this.#process.observe(binding.process.pid);
 			if (observation.kind !== "alive" || observation.startToken !== binding.process.osProcessStartToken) {
 				return lifecycleFailure("local-owned", "recovery-needed", "process_identity_unavailable", attempt);
@@ -1114,7 +1260,10 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			const boundClaim = await this.#store.withExclusiveLock(endpoint, async () => {
 				await this.#store.verifyStartClaim(endpoint, claim);
 				const lockedObservation = await this.#process.observe(binding.process.pid);
-				if (lockedObservation.kind !== "alive" || lockedObservation.startToken !== binding.process.osProcessStartToken) {
+				if (
+					lockedObservation.kind !== "alive" ||
+					lockedObservation.startToken !== binding.process.osProcessStartToken
+				) {
 					throw new ProcessIdentityValidationError("unbound pending engine identity changed");
 				}
 				return await this.#store.bindStartClaimProcess(
@@ -1144,7 +1293,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		ownerExitPolicy: OwnerExitPolicy,
 		recoveredBound?: BoundLifecycleE4Client,
 	): Promise<LifecycleResult> {
-		if (this.abortController.signal.aborted) return lifecycleFailure("local-owned", "request-aborted", "request_aborted", attempt);
+		if (this.abortController.signal.aborted)
+			return lifecycleFailure("local-owned", "request-aborted", "request_aborted", attempt);
 		const artifact = this.config.engineArtifact;
 		const endpoint = this.config.endpoint;
 		if (
@@ -1158,7 +1308,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			claim.argvSha256 !== artifact.argvSha256 ||
 			claim.engineArtifactSha256 !== artifact.engineSourceSha256 ||
 			claim.servedBackendCommit !== artifact.servedBackendCommit
-		) return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
+		)
+			return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
 		const control = await this.#process.controlFor(claim.enginePid, claim.engineProcessStartToken);
 		if (!control) return lifecycleFailure("local-owned", "identity-changed", "process_identity_unavailable", attempt);
 		const pending = await this.#store.withExclusiveLock(endpoint, async () => {
@@ -1166,11 +1317,13 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			return await this.#store.readPendingSecret(claim);
 		});
 		try {
-			const bound = recoveredBound ?? await this.withReconnect(async reconnectAttempt => {
-				this.transition("connecting", reconnectAttempt);
-				this.transition("handshaking", reconnectAttempt);
-				return await this.handshake();
-			});
+			const bound =
+				recoveredBound ??
+				(await this.withReconnect(async reconnectAttempt => {
+					this.transition("connecting", reconnectAttempt);
+					this.transition("handshaking", reconnectAttempt);
+					return await this.handshake();
+				}));
 			if (
 				bound.binding.process.pid !== claim.enginePid ||
 				bound.binding.process.osProcessStartToken !== claim.engineProcessStartToken ||
@@ -1179,7 +1332,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				bound.binding.artifactRevision.engineArtifactSha256 !== artifact.engineSourceSha256 ||
 				bound.binding.artifactRevision.servedBackendCommit !== artifact.servedBackendCommit ||
 				bound.binding.artifactRevision.servedBackendDirty !== false
-			) return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
+			)
+				return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
 			this.transition("acquiring-owner", attempt);
 			const acquired = await this.#acquirePendingOwner(bound, claim, pending);
 			const owner = acquired.owner;
@@ -1191,23 +1345,28 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				if (observation.kind !== "alive" || observation.startToken !== claim.engineProcessStartToken) {
 					throw new ProcessIdentityValidationError("pending engine process identity changed");
 				}
-				const committed = await this.#store.commit(endpoint, null, {
-					engineInstanceId: bound.binding.engineInstanceId,
-					engineBootId: bound.binding.engineBootId,
-					launchId: claim.launchId as string,
-					ownerGeneration: owner.ownerGeneration,
-					pid: claim.enginePid as number,
-					osProcessStartToken: claim.engineProcessStartToken as string,
-					normalizedEndpoint: endpoint,
-					executableSha256: artifact.executableSha256,
-					executablePathSha256: executablePathSha256(artifact.executablePath),
-					argvSha256: artifact.argvSha256,
-					engineArtifactSha256: artifact.engineSourceSha256,
-					servedBackendCommit: artifact.servedBackendCommit,
-					ownerExitPolicy,
-					createdAt: now,
-					lastVerifiedAt: now,
-				}, { ownerCredential: pending.ownerCredential });
+				const committed = await this.#store.commit(
+					endpoint,
+					null,
+					{
+						engineInstanceId: bound.binding.engineInstanceId,
+						engineBootId: bound.binding.engineBootId,
+						launchId: claim.launchId as string,
+						ownerGeneration: owner.ownerGeneration,
+						pid: claim.enginePid as number,
+						osProcessStartToken: claim.engineProcessStartToken as string,
+						normalizedEndpoint: endpoint,
+						executableSha256: artifact.executableSha256,
+						executablePathSha256: executablePathSha256(artifact.executablePath),
+						argvSha256: artifact.argvSha256,
+						engineArtifactSha256: artifact.engineSourceSha256,
+						servedBackendCommit: artifact.servedBackendCommit,
+						ownerExitPolicy,
+						createdAt: now,
+						lastVerifiedAt: now,
+					},
+					{ ownerCredential: pending.ownerCredential },
+				);
 				await this.#store.releaseStartClaim(endpoint, claim.token);
 				return committed;
 			});
@@ -1240,7 +1399,6 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		}
 	}
 
-
 	async status(): Promise<LifecycleResult> {
 		if (this.context) return this.projectObservedResult(this.context.binding);
 		const endpoint = this.config.endpoint;
@@ -1248,15 +1406,26 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		if (!endpoint || !artifact) return lifecycleFailure("local-owned", "failed", "engine_artifact_unavailable");
 		try {
 			const record = await this.#store.probeCurrent(endpoint);
-			if (!record) return { kind: "stopped", state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" } };
-			if (!this.#recordMatchesConfig(record)) return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
+			if (!record)
+				return {
+					kind: "stopped",
+					state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" },
+				};
+			if (!this.#recordMatchesConfig(record))
+				return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
 			const observation = await this.#process.observe(record.pid);
-			if (observation.kind === "dead") return { kind: "stopped", state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" } };
-			if (observation.kind !== "alive" || observation.startToken !== record.osProcessStartToken) return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
+			if (observation.kind === "dead")
+				return {
+					kind: "stopped",
+					state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" },
+				};
+			if (observation.kind !== "alive" || observation.startToken !== record.osProcessStartToken)
+				return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
 			this.transition("connecting");
 			this.transition("handshaking");
 			const bound = await this.handshake();
-			if (!this.#bindingMatchesRecord(bound.binding, record)) return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
+			if (!this.#bindingMatchesRecord(bound.binding, record))
+				return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
 			return this.observedResult(bound.binding);
 		} catch (error) {
 			return mappedFailure("local-owned", error);
@@ -1264,11 +1433,15 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	}
 
 	async #adoptOrRecover(record: LocalAuthorityRecord, attempt: number, recoverDead = true): Promise<LifecycleResult> {
-		if (!this.#recordMatchesConfig(record)) return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
+		if (!this.#recordMatchesConfig(record))
+			return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
 		const observation = await this.#process.observe(record.pid);
 		if (observation.kind === "dead") {
 			if (!recoverDead) {
-				return { kind: "stopped", state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" } };
+				return {
+					kind: "stopped",
+					state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" },
+				};
 			}
 			const retired = await this.#store.withExclusiveLock(record.normalizedEndpoint, async () => {
 				const current = await this.#store.readCurrentForRecovery(record.normalizedEndpoint);
@@ -1291,7 +1464,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			this.transition("handshaking", reconnectAttempt);
 			return await this.handshake();
 		});
-		if (!this.#bindingMatchesRecord(bound.binding, record)) return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
+		if (!this.#bindingMatchesRecord(bound.binding, record))
+			return lifecycleFailure("local-owned", "identity-changed", "identity_changed", attempt);
 		const control = await this.#process.controlFor(record.pid, record.osProcessStartToken);
 		if (!control) return lifecycleFailure("local-owned", "identity-changed", "process_identity_unavailable", attempt);
 		const secret = await this.#store.readSecret(record);
@@ -1299,23 +1473,37 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			this.transition("acquiring-owner", attempt);
 			let ownerGeneration = record.ownerGeneration;
 			try {
-				await bound.renewOwner({ ownerGeneration, ownerCredential: credentialText(secret.ownerCredential), signal: this.abortController.signal });
-			} catch (error) {
-				if (!(error instanceof LifecycleE4ClientError) || error.failure.kind !== "owner-expired") throw error;
-				ownerGeneration = (await bound.acquireOwner({
-					expectedOwnerGeneration: ownerGeneration,
+				await bound.renewOwner({
+					ownerGeneration,
 					ownerCredential: credentialText(secret.ownerCredential),
 					signal: this.abortController.signal,
-				})).ownerGeneration;
+				});
+			} catch (error) {
+				if (!(error instanceof LifecycleE4ClientError) || error.failure.kind !== "owner-expired") throw error;
+				ownerGeneration = (
+					await bound.acquireOwner({
+						expectedOwnerGeneration: ownerGeneration,
+						ownerCredential: credentialText(secret.ownerCredential),
+						signal: this.abortController.signal,
+					})
+				).ownerGeneration;
 			}
 			const now = new Date(this.clock.now()).toISOString();
-			const updated = ownerGeneration === record.ownerGeneration
-				? record
-				: await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.commit(record.normalizedEndpoint, record, {
-					...record,
-					ownerGeneration,
-					lastVerifiedAt: now,
-				}, secret));
+			const updated =
+				ownerGeneration === record.ownerGeneration
+					? record
+					: await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+							this.#store.commit(
+								record.normalizedEndpoint,
+								record,
+								{
+									...record,
+									ownerGeneration,
+									lastVerifiedAt: now,
+								},
+								secret,
+							),
+						);
 			const registered = await this.register(bound);
 			const context: ReadyContext = {
 				...registered,
@@ -1342,7 +1530,14 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		const bootstrapCredential = this.makeSecret();
 		const ownerCredential = this.makeOwnerCredential();
 		try {
-			return await this.#coldStartWithCredentials(claim, attempt, ownerExitPolicy, restart, bootstrapCredential, ownerCredential);
+			return await this.#coldStartWithCredentials(
+				claim,
+				attempt,
+				ownerExitPolicy,
+				restart,
+				bootstrapCredential,
+				ownerCredential,
+			);
 		} finally {
 			bootstrapCredential.fill(0);
 			ownerCredential.fill(0);
@@ -1359,18 +1554,26 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	): Promise<LifecycleResult> {
 		const artifact = this.config.engineArtifact;
 		const endpoint = this.config.endpoint;
-		if (!artifact || !endpoint) return lifecycleFailure("local-owned", "failed", "engine_artifact_unavailable", attempt);
+		if (!artifact || !endpoint)
+			return lifecycleFailure("local-owned", "failed", "engine_artifact_unavailable", attempt);
 		this.transition(restart ? "restart-starting" : "starting", attempt);
 		if (this.abortController.signal.aborted) return await this.#abortUnspawnedStart(claim, attempt);
 		const launchId = this.makeCredential();
-		let prepared = await this.#store.withExclusiveLock(endpoint, () => this.#store.prepareStartClaim(endpoint, claim.token, {
-			launchId,
-			executableSha256: artifact.executableSha256,
-			executablePathSha256: executablePathSha256(artifact.executablePath),
-			argvSha256: artifact.argvSha256,
-			engineArtifactSha256: artifact.engineSourceSha256,
-			servedBackendCommit: artifact.servedBackendCommit,
-		}, { bootstrapCredential, ownerCredential }));
+		let prepared = await this.#store.withExclusiveLock(endpoint, () =>
+			this.#store.prepareStartClaim(
+				endpoint,
+				claim.token,
+				{
+					launchId,
+					executableSha256: artifact.executableSha256,
+					executablePathSha256: executablePathSha256(artifact.executablePath),
+					argvSha256: artifact.argvSha256,
+					engineArtifactSha256: artifact.engineSourceSha256,
+					servedBackendCommit: artifact.servedBackendCommit,
+				},
+				{ bootstrapCredential, ownerCredential },
+			),
+		);
 		if (this.abortController.signal.aborted) {
 			bootstrapCredential.fill(0);
 			return await this.#abortUnspawnedStart(prepared, attempt);
@@ -1386,7 +1589,9 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			});
 			if ("kind" in spawned) {
 				bootstrapCredential.fill(0);
-				await this.#store.withExclusiveLock(endpoint, () => this.#store.releaseStartClaim(endpoint, prepared.token));
+				await this.#store.withExclusiveLock(endpoint, () =>
+					this.#store.releaseStartClaim(endpoint, prepared.token),
+				);
 				return await this.restartAfterConfirmedDeath();
 			}
 			child = spawned;
@@ -1418,17 +1623,18 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		if (ownerExitPolicy === "detached") child.unref();
 
 		let bound: BoundLifecycleE4Client | undefined;
-		for (let reconnectAttempt = 0; reconnectAttempt < RESTART_DELAYS_MS.length && this.clock.now() < deadline; reconnectAttempt++) {
+		for (
+			let reconnectAttempt = 0;
+			reconnectAttempt < RESTART_DELAYS_MS.length && this.clock.now() < deadline;
+			reconnectAttempt++
+		) {
 			this.transition("connecting", reconnectAttempt);
 			this.transition("handshaking", reconnectAttempt);
 			const handshake = this.handshake().then(
 				value => ({ kind: "bound" as const, value }),
 				error => ({ kind: "failure" as const, error }),
 			);
-			const raced = await Promise.race([
-				handshake,
-				child.exited.then(() => ({ kind: "exited" as const })),
-			]);
+			const raced = await Promise.race([handshake, child.exited.then(() => ({ kind: "exited" as const }))]);
 			if (raced.kind === "exited") {
 				bootstrapCredential.fill(0);
 				return await this.#recoverStartupDeath(prepared, attempt);
@@ -1470,9 +1676,14 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		}
 		prepared = await this.#store.withExclusiveLock(endpoint, () => this.#store.markOwnerAttempt(endpoint, prepared));
 		this.transition("acquiring-owner", attempt);
-		let owner;
+		let owner: Awaited<ReturnType<BoundLifecycleE4Client["acquireOwner"]>>;
 		try {
-			owner = await bound.acquireOwner({ expectedOwnerGeneration: 0, bootstrapCredential, ownerCredential: credentialText(ownerCredential), signal: this.abortController.signal });
+			owner = await bound.acquireOwner({
+				expectedOwnerGeneration: 0,
+				bootstrapCredential,
+				ownerCredential: credentialText(ownerCredential),
+				signal: this.abortController.signal,
+			});
 		} catch (error) {
 			if (this.abortController.signal.aborted) {
 				return lifecycleFailure("local-owned", "request-aborted", "request_aborted", attempt);
@@ -1486,23 +1697,28 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		try {
 			record = await this.#store.withExclusiveLock(endpoint, async () => {
 				await this.#store.verifyStartClaim(endpoint, prepared);
-				const committed = await this.#store.commit(endpoint, null, {
-					engineInstanceId: bound.binding.engineInstanceId,
-					engineBootId: bound.binding.engineBootId,
-					launchId,
-					ownerGeneration: owner.ownerGeneration,
-					pid: child.pid,
-					osProcessStartToken: observation.startToken,
-					normalizedEndpoint: endpoint,
-					executableSha256: artifact.executableSha256,
-					executablePathSha256: executablePathSha256(artifact.executablePath),
-					argvSha256: artifact.argvSha256,
-					engineArtifactSha256: artifact.engineSourceSha256,
-					servedBackendCommit: artifact.servedBackendCommit,
-					ownerExitPolicy,
-					createdAt: now,
-					lastVerifiedAt: now,
-				}, { ownerCredential });
+				const committed = await this.#store.commit(
+					endpoint,
+					null,
+					{
+						engineInstanceId: bound.binding.engineInstanceId,
+						engineBootId: bound.binding.engineBootId,
+						launchId,
+						ownerGeneration: owner.ownerGeneration,
+						pid: child.pid,
+						osProcessStartToken: observation.startToken,
+						normalizedEndpoint: endpoint,
+						executableSha256: artifact.executableSha256,
+						executablePathSha256: executablePathSha256(artifact.executablePath),
+						argvSha256: artifact.argvSha256,
+						engineArtifactSha256: artifact.engineSourceSha256,
+						servedBackendCommit: artifact.servedBackendCommit,
+						ownerExitPolicy,
+						createdAt: now,
+						lastVerifiedAt: now,
+					},
+					{ ownerCredential },
+				);
 				await this.#store.releaseStartClaim(endpoint, prepared.token);
 				return committed;
 			});
@@ -1568,22 +1784,21 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		return await this.restartAfterConfirmedDeath();
 	}
 
-
-
-
-
 	#recordMatchesConfig(record: LocalAuthorityRecord): boolean {
 		const artifact = this.config.engineArtifact;
-		return artifact !== undefined &&
+		return (
+			artifact !== undefined &&
 			record.executableSha256 === artifact.executableSha256 &&
 			record.executablePathSha256 === executablePathSha256(artifact.executablePath) &&
 			record.argvSha256 === artifact.argvSha256 &&
 			record.engineArtifactSha256 === artifact.engineSourceSha256 &&
-			record.servedBackendCommit === artifact.servedBackendCommit;
+			record.servedBackendCommit === artifact.servedBackendCommit
+		);
 	}
 
 	#bindingMatchesRecord(binding: LifecycleEngineBinding, record: LocalAuthorityRecord): boolean {
-		return this.#recordMatchesConfig(record) &&
+		return (
+			this.#recordMatchesConfig(record) &&
 			binding.engineInstanceId === record.engineInstanceId &&
 			binding.engineBootId === record.engineBootId &&
 			binding.launchId === record.launchId &&
@@ -1591,7 +1806,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			binding.process.osProcessStartToken === record.osProcessStartToken &&
 			binding.artifactRevision.engineArtifactSha256 === record.engineArtifactSha256 &&
 			binding.artifactRevision.servedBackendCommit === record.servedBackendCommit &&
-			binding.artifactRevision.servedBackendDirty === false;
+			binding.artifactRevision.servedBackendDirty === false
+		);
 	}
 
 	#monitorOwnedChild(context: ReadyContext): void {
@@ -1616,7 +1832,13 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		const ownerCredential = context.ownerCredential;
 		const ownerGeneration = context.ownerGeneration;
 		const endpoint = this.config.endpoint;
-		if (!record || !ownerCredential || ownerGeneration === undefined || !endpoint || !this.#recordMatchesConfig(record)) {
+		if (
+			!record ||
+			!ownerCredential ||
+			ownerGeneration === undefined ||
+			!endpoint ||
+			!this.#recordMatchesConfig(record)
+		) {
 			return { kind: "invalid" };
 		}
 		return await this.#store.withExclusiveLock(endpoint, async () => {
@@ -1640,7 +1862,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 	}
 
 	#sameAuthorityRecord(left: LocalAuthorityRecord, right: LocalAuthorityRecord): boolean {
-		return left.recordRevision === right.recordRevision &&
+		return (
+			left.recordRevision === right.recordRevision &&
 			left.engineInstanceId === right.engineInstanceId &&
 			left.engineBootId === right.engineBootId &&
 			left.launchId === right.launchId &&
@@ -1653,7 +1876,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			left.argvSha256 === right.argvSha256 &&
 			left.engineArtifactSha256 === right.engineArtifactSha256 &&
 			left.servedBackendCommit === right.servedBackendCommit &&
-			left.ownerCredentialVerifier === right.ownerCredentialVerifier;
+			left.ownerCredentialVerifier === right.ownerCredentialVerifier
+		);
 	}
 
 	async #detachRequesterBestEffort(context: ReadyContext): Promise<void> {
@@ -1673,16 +1897,19 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 
 	async #rollbackDrain(context: ReadyContext, drainGeneration: number): Promise<boolean> {
 		try {
-			const rollback = await this.#retryAmbiguousControlRequest(signal => this.#withRevalidatedAuthority(
-				context,
-				client => client.rollbackDrain({
-					ownerGeneration: context.ownerGeneration as number,
-					ownerCredential: credentialText(context.ownerCredential as Buffer),
-					drainGeneration,
-					signal,
-				}),
-				{ ignoreAbort: true },
-			));
+			const rollback = await this.#retryAmbiguousControlRequest(signal =>
+				this.#withRevalidatedAuthority(
+					context,
+					client =>
+						client.rollbackDrain({
+							ownerGeneration: context.ownerGeneration as number,
+							ownerCredential: credentialText(context.ownerCredential as Buffer),
+							drainGeneration,
+							signal,
+						}),
+					{ ignoreAbort: true },
+				),
+			);
 			return rollback.kind === "valid";
 		} catch {
 			return false;
@@ -1731,7 +1958,7 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		const ownerCredential = context.ownerCredential;
 		const ownerGeneration = context.ownerGeneration;
 		const ownerCredentialText = credentialText(ownerCredential);
-		let control = context.process ?? await this.#process.controlFor(record.pid, record.osProcessStartToken);
+		let control = context.process ?? (await this.#process.controlFor(record.pid, record.osProcessStartToken));
 		this.transition("draining");
 		let drainGeneration: number | undefined;
 		let hardDecisionRecorded = false;
@@ -1742,19 +1969,24 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			registrationCredential: context.registrationCredential,
 			admissionEpoch: context.registration.admissionEpoch,
 		};
-		let controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.prepareControlAttempt(
-			record.normalizedEndpoint,
-			record,
-			restart ? "restart" : "stop",
-			this.makeCredential(),
-			currentRequester,
-		));
+		let controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+			this.#store.prepareControlAttempt(
+				record.normalizedEndpoint,
+				record,
+				restart ? "restart" : "stop",
+				this.makeCredential(),
+				currentRequester,
+			),
+		);
 		let controlRequestId = controlAttempt.controlRequestId;
 		const clearControlAttempt = async (): Promise<void> => {
-			await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.clearControlAttempt(record.normalizedEndpoint, controlAttempt));
+			await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+				this.#store.clearControlAttempt(record.normalizedEndpoint, controlAttempt),
+			);
 		};
 		const abortBeforeHardCommit = async (activeDrainGeneration: number): Promise<LifecycleResult | undefined> => {
-			if (!this.abortController.signal.aborted || controlAttempt.phase === "hard-signal-commit-pending") return undefined;
+			if (!this.abortController.signal.aborted || controlAttempt.phase === "hard-signal-commit-pending")
+				return undefined;
 			if (!(await this.#rollbackDrain(context, activeDrainGeneration))) {
 				return lifecycleFailure("local-owned", "drain-recovery-failed", "drain_recovery_failed");
 			}
@@ -1769,23 +2001,24 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			} else {
 				for (let requesterAttempt = 0; requesterAttempt < 2; requesterAttempt++) {
 					const requesterSecret = await this.#store.readControlAttemptSecret(controlAttempt);
-					let drain;
+					let drain: Awaited<ReturnType<BoundLifecycleE4Client["beginControlDrain"]>>;
 					try {
 						try {
-							const drainAuthority = await this.#retryAmbiguousControlRequest(signal => this.#withRevalidatedAuthority(
-								context,
-								client => client.beginControlDrain({
-									ownerGeneration,
-									controlRequestId,
-									ownerCredential: ownerCredentialText,
-									registrationId: controlAttempt.registrationId,
-									requesterRegistrationGeneration: controlAttempt.requesterRegistrationGeneration,
-									requesterClientInstanceId: controlAttempt.requesterClientInstanceId,
-									registrationCredential: credentialText(requesterSecret.requesterRegistrationCredential),
-									expectedAdmissionEpoch: controlAttempt.expectedAdmissionEpoch,
-									signal,
-								}),
-							));
+							const drainAuthority = await this.#retryAmbiguousControlRequest(signal =>
+								this.#withRevalidatedAuthority(context, client =>
+									client.beginControlDrain({
+										ownerGeneration,
+										controlRequestId,
+										ownerCredential: ownerCredentialText,
+										registrationId: controlAttempt.registrationId,
+										requesterRegistrationGeneration: controlAttempt.requesterRegistrationGeneration,
+										requesterClientInstanceId: controlAttempt.requesterClientInstanceId,
+										registrationCredential: credentialText(requesterSecret.requesterRegistrationCredential),
+										expectedAdmissionEpoch: controlAttempt.expectedAdmissionEpoch,
+										signal,
+									}),
+								),
+							);
 							if (drainAuthority.kind === "invalid") {
 								return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
 							}
@@ -1798,7 +2031,7 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 							) {
 								const expiredAttempt = controlAttempt;
 								const replacementRequestId = this.makeCredential();
-								controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () => (
+								controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
 									this.#store.replaceExpiredBeginControlAttempt(
 										record.normalizedEndpoint,
 										record,
@@ -1806,8 +2039,8 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 										restart ? "restart" : "stop",
 										replacementRequestId,
 										currentRequester,
-									)
-								));
+									),
+								);
 								controlRequestId = controlAttempt.controlRequestId;
 								if (controlAttempt.phase !== "begin-pending") {
 									drainGeneration = controlAttempt.drainGeneration;
@@ -1826,11 +2059,13 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 						requesterSecret.requesterRegistrationCredential.fill(0);
 					}
 					drainGeneration = drain.drainGeneration;
-					controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.markControlAttemptDraining(
-						record.normalizedEndpoint,
-						controlAttempt,
-						drain.drainGeneration,
-					));
+					controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+						this.#store.markControlAttemptDraining(
+							record.normalizedEndpoint,
+							controlAttempt,
+							drain.drainGeneration,
+						),
+					);
 					break;
 				}
 			}
@@ -1857,16 +2092,17 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			}
 
 			if (controlAttempt.phase === "draining") {
-				const gracefulAuthority = await this.#retryAmbiguousControlRequest(signal => this.#withRevalidatedAuthority(
-					context,
-					client => client.recordGracefulControl({
-						ownerGeneration,
-						ownerCredential: ownerCredentialText,
-						drainGeneration: activeDrainGeneration,
-						outcome: "accepted",
-						signal,
-					}),
-				));
+				const gracefulAuthority = await this.#retryAmbiguousControlRequest(signal =>
+					this.#withRevalidatedAuthority(context, client =>
+						client.recordGracefulControl({
+							ownerGeneration,
+							ownerCredential: ownerCredentialText,
+							drainGeneration: activeDrainGeneration,
+							outcome: "accepted",
+							signal,
+						}),
+					),
+				);
 				if (gracefulAuthority.kind === "invalid") {
 					return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
 				}
@@ -1879,32 +2115,35 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 					await clearControlAttempt();
 					return await this.#rollbackResult(context);
 				}
-				controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.advanceControlAttempt(
-					record.normalizedEndpoint,
-					controlAttempt,
-					"graceful-accepted",
-				));
+				controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+					this.#store.advanceControlAttempt(record.normalizedEndpoint, controlAttempt, "graceful-accepted"),
+				);
 			}
 
 			const abortAfterGraceful = await abortBeforeHardCommit(activeDrainGeneration);
 			if (abortAfterGraceful) return abortAfterGraceful;
-			let exited = controlAttempt.phase === "hard-signal-pending" || controlAttempt.phase === "hard-signal-commit-pending"
-				? false
-				: await this.#waitForExactExit(record, control, this.config.requestTimeoutMs);
+			let exited =
+				controlAttempt.phase === "hard-signal-pending" || controlAttempt.phase === "hard-signal-commit-pending"
+					? false
+					: await this.#waitForExactExit(record, control, this.config.requestTimeoutMs);
 			if (!exited) {
-				if (controlAttempt.phase !== "hard-signal-pending" && controlAttempt.phase !== "hard-signal-commit-pending") {
+				if (
+					controlAttempt.phase !== "hard-signal-pending" &&
+					controlAttempt.phase !== "hard-signal-commit-pending"
+				) {
 					const abortAfterWait = await abortBeforeHardCommit(activeDrainGeneration);
 					if (abortAfterWait) return abortAfterWait;
-					const authorizationAuthority = await this.#retryAmbiguousControlRequest(signal => this.#withRevalidatedAuthority(
-						context,
-						client => client.recordGracefulControl({
-							ownerGeneration,
-							ownerCredential: ownerCredentialText,
-							drainGeneration: activeDrainGeneration,
-							outcome: "timeout",
-							signal,
-						}),
-					));
+					const authorizationAuthority = await this.#retryAmbiguousControlRequest(signal =>
+						this.#withRevalidatedAuthority(context, client =>
+							client.recordGracefulControl({
+								ownerGeneration,
+								ownerCredential: ownerCredentialText,
+								drainGeneration: activeDrainGeneration,
+								outcome: "timeout",
+								signal,
+							}),
+						),
+					);
 					if (authorizationAuthority.kind === "invalid") {
 						return lifecycleFailure("local-owned", "identity-changed", "identity_changed");
 					}
@@ -1920,34 +2159,37 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 					if (authorization.result !== "hard_signal_decision_pending" || !authorization.signalPermitted) {
 						throw new Error("hard signal authorization unavailable");
 					}
-					controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.advanceControlAttempt(
-						record.normalizedEndpoint,
-						controlAttempt,
-						"hard-signal-pending",
-					));
+					controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+						this.#store.advanceControlAttempt(record.normalizedEndpoint, controlAttempt, "hard-signal-pending"),
+					);
 				}
 				const abortAfterAuthorization = await abortBeforeHardCommit(activeDrainGeneration);
 				if (abortAfterAuthorization) return abortAfterAuthorization;
 				const preparationAttempt = await this.#withRevalidatedAuthority(context, async client => {
-					const rollbackDrain = () => this.#retryAmbiguousControlRequest(signal => client.rollbackDrain({
-						ownerGeneration,
-						ownerCredential: ownerCredentialText,
-						drainGeneration: activeDrainGeneration,
-						signal,
-					}));
+					const rollbackDrain = () =>
+						this.#retryAmbiguousControlRequest(signal =>
+							client.rollbackDrain({
+								ownerGeneration,
+								ownerCredential: ownerCredentialText,
+								drainGeneration: activeDrainGeneration,
+								signal,
+							}),
+						);
 					control ??= await this.#process.controlFor(record.pid, record.osProcessStartToken);
 					if (!control) {
 						await rollbackDrain();
 						return { kind: "rolled-back" as const };
 					}
-					const preparedSignal = await this.#retryAmbiguousControlRequest(signal => client.prepareHardSignal({
-						ownerGeneration,
-						ownerCredential: ownerCredentialText,
-						drainGeneration: activeDrainGeneration,
-						pid: record.pid,
-						osProcessStartToken: record.osProcessStartToken,
-						signal,
-					}));
+					const preparedSignal = await this.#retryAmbiguousControlRequest(signal =>
+						client.prepareHardSignal({
+							ownerGeneration,
+							ownerCredential: ownerCredentialText,
+							drainGeneration: activeDrainGeneration,
+							pid: record.pid,
+							osProcessStartToken: record.osProcessStartToken,
+							signal,
+						}),
+					);
 					return { kind: "prepared" as const, preparedSignal };
 				});
 				if (preparationAttempt.kind === "invalid") {
@@ -1963,11 +2205,13 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 				if (abortAfterPreparation) return abortAfterPreparation;
 				this.#hardSignalCommitActive = true;
 				if (controlAttempt.phase === "hard-signal-pending") {
-					controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () => this.#store.advanceControlAttempt(
-						record.normalizedEndpoint,
-						controlAttempt,
-						"hard-signal-commit-pending",
-					));
+					controlAttempt = await this.#store.withExclusiveLock(record.normalizedEndpoint, () =>
+						this.#store.advanceControlAttempt(
+							record.normalizedEndpoint,
+							controlAttempt,
+							"hard-signal-commit-pending",
+						),
+					);
 				}
 				const signalControl = control;
 				if (!signalControl) throw new Error("hard signal process control unavailable after preparation");
@@ -1976,17 +2220,22 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 					const signalClient = client;
 					let signalPermit: HardSignalPermitResponse;
 					try {
-						signalPermit = await this.#retryAmbiguousControlRequest(signal => signalClient.commitHardSignal({
-							ownerGeneration,
-							ownerCredential: ownerCredentialText,
-							drainGeneration: activeDrainGeneration,
-							authorizationId: preparedSignal.authorizationId,
-							pid: record.pid,
-							osProcessStartToken: record.osProcessStartToken,
-							signal,
-						}));
+						signalPermit = await this.#retryAmbiguousControlRequest(signal =>
+							signalClient.commitHardSignal({
+								ownerGeneration,
+								ownerCredential: ownerCredentialText,
+								drainGeneration: activeDrainGeneration,
+								authorizationId: preparedSignal.authorizationId,
+								pid: record.pid,
+								osProcessStartToken: record.osProcessStartToken,
+								signal,
+							}),
+						);
 					} catch (error) {
-						if (error instanceof LifecycleE4ClientError && error.failure.kind === "hard-signal-authorization-expired") {
+						if (
+							error instanceof LifecycleE4ClientError &&
+							error.failure.kind === "hard-signal-authorization-expired"
+						) {
 							hardDecisionRecorded = false;
 						}
 						throw error;
@@ -1995,30 +2244,38 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 						throw new Error("hard signal commit authorization mismatch");
 					}
 					const immediateObservation = await this.#process.observe(record.pid);
-					if (immediateObservation.kind !== "alive" || immediateObservation.startToken !== record.osProcessStartToken) {
-						if (immediateObservation.kind !== "dead") throw new Error("process identity changed after hard signal commit");
-						await this.#retryAmbiguousControlRequest(signal => signalClient.recordHardSignalOutcome({
-							ownerGeneration,
-							ownerCredential: ownerCredentialText,
-							drainGeneration: activeDrainGeneration,
-							authorizationId: signalPermit.authorizationId,
-							outcome: "process_exited",
-							signal,
-						}));
+					if (
+						immediateObservation.kind !== "alive" ||
+						immediateObservation.startToken !== record.osProcessStartToken
+					) {
+						if (immediateObservation.kind !== "dead")
+							throw new Error("process identity changed after hard signal commit");
+						await this.#retryAmbiguousControlRequest(signal =>
+							signalClient.recordHardSignalOutcome({
+								ownerGeneration,
+								ownerCredential: ownerCredentialText,
+								drainGeneration: activeDrainGeneration,
+								authorizationId: signalPermit.authorizationId,
+								outcome: "process_exited",
+								signal,
+							}),
+						);
 						return { outcome: "process_exited" as const };
 					}
 					const outcome = await signalControl.sendHardSignal(signalPermit.expiresAtUnix);
 					if (outcome === "authorization_expired" || outcome === "abandoned") {
 						throw new Error("hard signal permit became unusable after commit");
 					}
-					await this.#retryAmbiguousControlRequest(signal => signalClient.recordHardSignalOutcome({
-						ownerGeneration,
-						ownerCredential: ownerCredentialText,
-						drainGeneration: activeDrainGeneration,
-						authorizationId: signalPermit.authorizationId,
-						outcome,
-						signal,
-					}));
+					await this.#retryAmbiguousControlRequest(signal =>
+						signalClient.recordHardSignalOutcome({
+							ownerGeneration,
+							ownerCredential: ownerCredentialText,
+							drainGeneration: activeDrainGeneration,
+							authorizationId: signalPermit.authorizationId,
+							outcome,
+							signal,
+						}),
+					);
 					return { outcome };
 				});
 				if (hardAttempt.kind === "invalid") {
@@ -2034,10 +2291,13 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			this.context = undefined;
 			ownerCredential.fill(0);
 			if (!restart) this.transition("stopped");
-			return { kind: "stopped", state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" } };
+			return {
+				kind: "stopped",
+				state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" },
+			};
 		} catch (error) {
-			const expiredAuthorization = error instanceof LifecycleE4ClientError
-				&& error.failure.kind === "hard-signal-authorization-expired";
+			const expiredAuthorization =
+				error instanceof LifecycleE4ClientError && error.failure.kind === "hard-signal-authorization-expired";
 			if (
 				drainGeneration !== undefined &&
 				!hardDecisionRecorded &&
@@ -2065,7 +2325,10 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			if (!endpoint) return lifecycleFailure("local-owned", "failed", "endpoint_unreachable");
 			const record = await this.#store.probeCurrent(endpoint);
 			if (!record) {
-				return { kind: "stopped", state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" } };
+				return {
+					kind: "stopped",
+					state: lifecycleState("local-owned", "stopped") as LifecycleState & { readonly name: "stopped" },
+				};
 			}
 			const adopted = await this.#adoptOrRecover(record, 0, false);
 			if (adopted.kind !== "ready") return adopted;
@@ -2104,8 +2367,10 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 
 	async restartAfterConfirmedDeath(): Promise<LifecycleResult> {
 		const now = this.clock.now();
-		while (this.#restartStarts.length > 0 && now - (this.#restartStarts[0] as number) >= RESTART_WINDOW_MS) this.#restartStarts.shift();
-		if (this.#restartStarts.length >= RESTART_DELAYS_MS.length) return lifecycleFailure("local-owned", "failed", "restart_budget_exhausted", this.#restartStarts.length);
+		while (this.#restartStarts.length > 0 && now - (this.#restartStarts[0] as number) >= RESTART_WINDOW_MS)
+			this.#restartStarts.shift();
+		if (this.#restartStarts.length >= RESTART_DELAYS_MS.length)
+			return lifecycleFailure("local-owned", "failed", "restart_budget_exhausted", this.#restartStarts.length);
 		const attempt = this.#restartStarts.length;
 		this.#restartStarts.push(now);
 		this.transition("backing-off", attempt + 1);
@@ -2125,11 +2390,14 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		const ownerCredential = context.ownerCredential;
 		const ownerGeneration = context.ownerGeneration;
 		if (!endpoint || !ownerCredential || ownerGeneration === undefined) return false;
-		const release = (client: BoundLifecycleE4Client) => this.#retryAmbiguousControlRequest(signal => client.releaseOwner({
-			ownerGeneration,
-			ownerCredential: credentialText(ownerCredential),
-			signal,
-		}));
+		const release = (client: BoundLifecycleE4Client) =>
+			this.#retryAmbiguousControlRequest(signal =>
+				client.releaseOwner({
+					ownerGeneration,
+					ownerCredential: credentialText(ownerCredential),
+					signal,
+				}),
+			);
 		if (this.#releaseReplayClient) {
 			const replayClient = this.#releaseReplayClient;
 			return await this.#store.withExclusiveLock(endpoint, async () => {
@@ -2162,13 +2430,15 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 		}
 		try {
 			if (this.#detachedClosePhase === "detach-pending") {
-				await this.#retryAmbiguousControlRequest(signal => context.client.detachClient({
-					registrationId: context.registration.registrationId,
-					registrationGeneration: context.registration.registrationGeneration,
-					clientInstanceId: context.clientInstanceId,
-					registrationCredential: context.registrationCredential,
-					signal,
-				}));
+				await this.#retryAmbiguousControlRequest(signal =>
+					context.client.detachClient({
+						registrationId: context.registration.registrationId,
+						registrationGeneration: context.registration.registrationGeneration,
+						clientInstanceId: context.clientInstanceId,
+						registrationCredential: context.registrationCredential,
+						signal,
+					}),
+				);
 				this.#detachedClosePhase = "release-pending";
 			}
 			if (!(await this.#releaseOwnerForDetachedClose(context))) {
@@ -2177,7 +2447,10 @@ class LocalOwnedModeStrategy extends ModeStrategy {
 			}
 			this.#clearDetachedClose(context);
 			this.transition("detached");
-			return { kind: "detached", state: lifecycleState("local-owned", "detached") as LifecycleState & { readonly name: "detached" } };
+			return {
+				kind: "detached",
+				state: lifecycleState("local-owned", "detached") as LifecycleState & { readonly name: "detached" },
+			};
 		} catch (error) {
 			if (!this.#isAmbiguousControlRequest(error)) this.#clearDetachedClose(context);
 			return mappedFailure("local-owned", error);
@@ -2201,15 +2474,33 @@ export class LifecycleSupervisor {
 		else this.#strategy = new ConnectOnlyModeStrategy(config, dependencies);
 	}
 
-	connect(): Promise<LifecycleResult> { return this.#strategy.connect(); }
-	start(): Promise<LifecycleResult> { return this.#strategy.start(); }
-	status(): Promise<LifecycleResult> { return this.#strategy.status(); }
-	stop(options: StopOptions): Promise<LifecycleResult> { return this.#strategy.stop(options); }
-	restart(options: StopOptions): Promise<LifecycleResult> { return this.#strategy.restart(options); }
-	update(): Promise<LifecycleResult> { return this.#strategy.update(); }
-	close(options: StopOptions): Promise<LifecycleResult> { return this.#strategy.close(options); }
-	abort(): void { this.#strategy.abort(); }
-	abortRequiresQuiescence(): boolean { return this.#strategy.abortRequiresQuiescence(); }
+	connect(): Promise<LifecycleResult> {
+		return this.#strategy.connect();
+	}
+	start(): Promise<LifecycleResult> {
+		return this.#strategy.start();
+	}
+	status(): Promise<LifecycleResult> {
+		return this.#strategy.status();
+	}
+	stop(options: StopOptions): Promise<LifecycleResult> {
+		return this.#strategy.stop(options);
+	}
+	restart(options: StopOptions): Promise<LifecycleResult> {
+		return this.#strategy.restart(options);
+	}
+	update(): Promise<LifecycleResult> {
+		return this.#strategy.update();
+	}
+	close(options: StopOptions): Promise<LifecycleResult> {
+		return this.#strategy.close(options);
+	}
+	abort(): void {
+		this.#strategy.abort();
+	}
+	abortRequiresQuiescence(): boolean {
+		return this.#strategy.abortRequiresQuiescence();
+	}
 	abortResult(): LifecycleResult {
 		return lifecycleFailure(this.config.mode, "request-aborted", "request_aborted");
 	}
@@ -2335,15 +2626,17 @@ export async function dispatchLifecycleAction(
 				timeout.promise.then(() => ({ kind: "timeout" as const })),
 			]);
 			clearTimeout(timeoutHandle);
-			result = settled.kind === "settled"
-				? settled.value
-				: controller.abortRequiresQuiescence?.()
-					? await actionPromise
-					: controller.abortResult();
+			result =
+				settled.kind === "settled"
+					? settled.value
+					: controller.abortRequiresQuiescence?.()
+						? await actionPromise
+						: controller.abortResult();
 		}
-		const closeResult = result.kind === "ready" && (options.closeReady === true || signal !== undefined)
-			? await closeOnce()
-			: undefined;
+		const closeResult =
+			result.kind === "ready" && (options.closeReady === true || signal !== undefined)
+				? await closeOnce()
+				: undefined;
 		return {
 			result,
 			...(closeResult === undefined ? {} : { closeResult }),

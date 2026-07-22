@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, constants, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { constants, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { JSONC } from "bun";
@@ -53,19 +53,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function trustedGitExecutable(): Promise<string> {
-	const executable = process.platform === "darwin"
-		? "/usr/bin/git"
-		: process.platform === "linux"
-			? "/usr/bin/git"
-			: undefined;
+	const executable =
+		process.platform === "darwin" ? "/usr/bin/git" : process.platform === "linux" ? "/usr/bin/git" : undefined;
 	invariant(executable !== undefined, `unsupported platform ${process.platform}`);
 	const metadata = await lstat(executable).catch(() => undefined);
-	invariant(metadata !== undefined && metadata.isFile() && !metadata.isSymbolicLink(), "trusted Git executable is not a regular file");
+	invariant(metadata !== undefined, "trusted Git executable does not exist");
+	invariant(metadata.isFile() && !metadata.isSymbolicLink(), "trusted Git executable is not a regular file");
 	invariant(metadata.uid === 0, "trusted Git executable is not root-owned");
 	invariant((metadata.mode & 0o022) === 0, "trusted Git executable is group- or other-writable");
 	return executable;
 }
-
 
 function gitEnvironment(): Record<string, string> {
 	return {
@@ -138,12 +135,18 @@ async function runGit(
 	}
 }
 const GIT_CONFIG_OVERRIDES = [
-	"-c", "core.fsmonitor=false",
-	"-c", "core.hooksPath=/dev/null",
-	"-c", "core.filemode=true",
-	"-c", "core.ignoreStat=false",
-	"-c", "core.untrackedCache=false",
-	"-c", "core.excludesFile=/dev/null",
+	"-c",
+	"core.fsmonitor=false",
+	"-c",
+	"core.hooksPath=/dev/null",
+	"-c",
+	"core.filemode=true",
+	"-c",
+	"core.ignoreStat=false",
+	"-c",
+	"core.untrackedCache=false",
+	"-c",
+	"core.excludesFile=/dev/null",
 ] as const;
 
 interface HeadTreeEntry {
@@ -176,7 +179,10 @@ function parseHeadTree(bytes: Uint8Array): HeadTreeEntry[] {
 		const match = /^(100644|100755|120000) blob ([0-9a-f]{40,64})$/.exec(header);
 		invariant(match !== null, "backend worktree is dirty");
 		const pathBytes = record.subarray(tab + 1);
-		invariant(pathBytes.byteLength > 0 && pathBytes.byteLength <= MAX_TREE_PATH_BYTES, "backend tree path is invalid");
+		invariant(
+			pathBytes.byteLength > 0 && pathBytes.byteLength <= MAX_TREE_PATH_BYTES,
+			"backend tree path is invalid",
+		);
 		const path = decoder.decode(pathBytes);
 		invariant(
 			!isAbsolute(path) &&
@@ -203,7 +209,10 @@ function parseBatchBlobs(bytes: Uint8Array, objectIds: readonly string[]): Reado
 		const match = /^([0-9a-f]{40,64}) blob ([0-9]+)$/.exec(header);
 		invariant(match !== null && match[1] === expectedObjectId, "backend blob response does not match the tree");
 		const size = Number(match[2]);
-		invariant(Number.isSafeInteger(size) && size >= 0 && size <= MAX_BLOB_BYTES, "backend blob exceeds the verification limit");
+		invariant(
+			Number.isSafeInteger(size) && size >= 0 && size <= MAX_BLOB_BYTES,
+			"backend blob exceeds the verification limit",
+		);
 		totalBytes += size;
 		invariant(totalBytes <= MAX_TREE_BYTES, "backend tree bytes exceed the verification limit");
 		const start = newline + 1;
@@ -245,7 +254,8 @@ async function materializeIgnoreRules(
 	let closed = false;
 	try {
 		for (const entry of verified.entries) {
-			if (entry.mode === "120000" || (entry.path !== ".gitignore" && !entry.path.endsWith(`${sep}.gitignore`))) continue;
+			if (entry.mode === "120000" || (entry.path !== ".gitignore" && !entry.path.endsWith(`${sep}.gitignore`)))
+				continue;
 			const expectedBlob = verified.blobs.get(entry.objectId);
 			invariant(expectedBlob !== undefined, "backend tracked blob is missing");
 			await writeSnapshotFile(join(snapshotRoot, entry.path), expectedBlob, 0o400);
@@ -277,11 +287,7 @@ async function materializeExecutionSnapshot(
 			invariant(entry.mode !== "120000", "execution snapshot cannot contain tracked symlinks");
 			const expectedBlob = verified.blobs.get(entry.objectId);
 			invariant(expectedBlob !== undefined, "backend tracked blob is missing");
-			await writeSnapshotFile(
-				join(snapshotRoot, entry.path),
-				expectedBlob,
-				entry.mode === "100755" ? 0o500 : 0o400,
-			);
+			await writeSnapshotFile(join(snapshotRoot, entry.path), expectedBlob, entry.mode === "100755" ? 0o500 : 0o400);
 		}
 		return {
 			root: snapshotRoot,
@@ -321,15 +327,19 @@ async function inspectPinnedBackendGit(
 		await runGit(executable, root, ["rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"]),
 	);
 	const [inspectedRoot, commit, tree, ...extra] = identityOutput.trim().split("\n");
-	invariant(extra.length === 0 && inspectedRoot !== undefined && commit !== undefined && tree !== undefined, "backend Git identity is malformed");
-	invariant(await realpath(inspectedRoot) === await realpath(root), "backend Git root does not match");
+	invariant(
+		extra.length === 0 && inspectedRoot !== undefined && commit !== undefined && tree !== undefined,
+		"backend Git identity is malformed",
+	);
+	invariant((await realpath(inspectedRoot)) === (await realpath(root)), "backend Git root does not match");
 	const treeBytes = await runGit(executable, root, ["ls-tree", "-rz", "--full-tree", "-r", "HEAD"]);
 	const entries = parseHeadTree(treeBytes);
 	const objectIds = [...new Set(entries.map(entry => entry.objectId))];
 	const objectInput = new TextEncoder().encode(`${objectIds.join("\n")}\n`);
-	const batchBytes = objectIds.length === 0
-		? new Uint8Array()
-		: await runGit(executable, root, ["cat-file", "--batch"], objectInput, MAX_TREE_BYTES + MAX_GIT_OUTPUT_BYTES);
+	const batchBytes =
+		objectIds.length === 0
+			? new Uint8Array()
+			: await runGit(executable, root, ["cat-file", "--batch"], objectInput, MAX_TREE_BYTES + MAX_GIT_OUTPUT_BYTES);
 	const blobs = parseBatchBlobs(batchBytes, objectIds);
 	for (const entry of entries) {
 		const expectedBlob = blobs.get(entry.objectId);
@@ -344,7 +354,10 @@ async function inspectPinnedBackendGit(
 			const metadata = await tracked.stat();
 			invariant(metadata.type === "regular", "backend tracked file type does not match");
 			invariant(((metadata.mode & 0o111) !== 0) === (entry.mode === "100755"), "backend worktree is dirty");
-			invariant(metadata.size <= BigInt(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes), "backend tracked file exceeds the verification limit");
+			invariant(
+				metadata.size <= BigInt(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes),
+				"backend tracked file exceeds the verification limit",
+			);
 			const bytes = await tracked.read(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes);
 			invariant(bytes.equals(expectedBlob), "backend worktree is dirty");
 		} finally {
@@ -357,7 +370,9 @@ async function inspectPinnedBackendGit(
 		maxPathBytes: Math.min(MAX_TREE_PATH_BYTES, DARWIN_PINNED_DIRECTORY_LIMITS.maxRelativePathBytes),
 		maxTotalPathBytes: DARWIN_PINNED_DIRECTORY_LIMITS.maxTotalPathBytes,
 	});
-	const untracked = leaves.filter(path => path !== ".git" && !path.startsWith(`.git${sep}`) && !trackedPaths.has(path));
+	const untracked = leaves.filter(
+		path => path !== ".git" && !path.startsWith(`.git${sep}`) && !trackedPaths.has(path),
+	);
 	const verified = { entries, blobs };
 	const classificationSnapshot = await materializeIgnoreRules(executable, verified);
 	try {
@@ -380,7 +395,10 @@ async function inspectPinnedBackendGit(
 				const line = records[index + 1] as string;
 				const pattern = records[index + 2] as string;
 				const path = records[index + 3] as string;
-				const sourcePath = relative(classificationSnapshot.root, isAbsolute(source) ? source : resolve(classificationSnapshot.root, source));
+				const sourcePath = relative(
+					classificationSnapshot.root,
+					isAbsolute(source) ? source : resolve(classificationSnapshot.root, source),
+				);
 				invariant(
 					!sourcePath.startsWith(`..${sep}`) &&
 						(sourcePath === ".gitignore" || sourcePath.endsWith(`${sep}.gitignore`)) &&
@@ -391,7 +409,10 @@ async function inspectPinnedBackendGit(
 				);
 				ignoredByCommittedRules.add(path);
 			}
-			invariant(untracked.every(path => ignoredByCommittedRules.has(path)), "backend worktree is dirty");
+			invariant(
+				untracked.every(path => ignoredByCommittedRules.has(path)),
+				"backend worktree is dirty",
+			);
 		}
 	} finally {
 		await classificationSnapshot.close();
@@ -414,8 +435,7 @@ async function verifyCustomInspection(
 	const assertRootIdentity = async (): Promise<void> => {
 		const current = await lstat(root).catch(() => undefined);
 		invariant(
-			current !== undefined &&
-				current.isDirectory() &&
+			current?.isDirectory() &&
 				!current.isSymbolicLink() &&
 				current.dev === metadata.dev &&
 				current.ino === metadata.ino,
@@ -482,9 +502,15 @@ export function verifyPinnedReferences(
 	packageJson: { readonly dependencies?: Readonly<Record<string, string>> },
 	lockText: string,
 ): void {
-	invariant(manifest.artifactPath.startsWith("./") && !isAbsolute(manifest.artifactPath), "artifact path must be repository-relative");
+	invariant(
+		manifest.artifactPath.startsWith("./") && !isAbsolute(manifest.artifactPath),
+		"artifact path must be repository-relative",
+	);
 	const dependency = `file:${manifest.artifactPath}`;
-	invariant(packageJson.dependencies?.[manifest.packageName] === dependency, "package.json dependency is not the pinned artifact");
+	invariant(
+		packageJson.dependencies?.[manifest.packageName] === dependency,
+		"package.json dependency is not the pinned artifact",
+	);
 	let parsed: unknown;
 	try {
 		parsed = JSONC.parse(lockText);
@@ -498,7 +524,10 @@ export function verifyPinnedReferences(
 	invariant(isRecord(codingAgent), "lockfile coding-agent workspace is malformed");
 	const dependencies = codingAgent.dependencies;
 	invariant(isRecord(dependencies), "lockfile coding-agent dependencies are malformed");
-	invariant(dependencies[manifest.packageName] === dependency, "lockfile coding-agent dependency is not the pinned artifact");
+	invariant(
+		dependencies[manifest.packageName] === dependency,
+		"lockfile coding-agent dependency is not the pinned artifact",
+	);
 	const packages = parsed.packages;
 	invariant(isRecord(packages), "lockfile packages are malformed");
 	const packageRecord = packages[manifest.packageName];
@@ -510,7 +539,10 @@ export function verifyPinnedReferences(
 		packageRecord[0] === `${manifest.packageName}@${manifest.artifactPath}`,
 		"lockfile SDK package resolution is not the pinned artifact",
 	);
-	invariant(packageRecord[2] === `sha512-${manifest.artifactSha512Base64}`, "lockfile integrity does not match the manifest");
+	invariant(
+		packageRecord[2] === `sha512-${manifest.artifactSha512Base64}`,
+		"lockfile integrity does not match the manifest",
+	);
 }
 
 async function installedFiles(root: string, prefix = ""): Promise<string[]> {
@@ -519,7 +551,7 @@ async function installedFiles(root: string, prefix = ""): Promise<string[]> {
 	for (const entry of entries) {
 		const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
 		invariant(!entry.isSymbolicLink(), `installed package contains symlink ${relative}`);
-		if (entry.isDirectory()) files.push(...await installedFiles(root, relative));
+		if (entry.isDirectory()) files.push(...(await installedFiles(root, relative)));
 		else {
 			invariant(entry.isFile(), `installed package contains non-file ${relative}`);
 			files.push(relative);
@@ -539,20 +571,34 @@ export async function verifyBreadboardSdkProvenance(
 	invariant(manifest.packageName === "@breadboard/sdk", "unexpected package name");
 	invariant(manifest.packageVersion === "0.2.2", "unexpected package version");
 	invariant(/^([0-9a-f]{64})$/.test(manifest.artifactSha256), "invalid artifact SHA-256");
-	invariant(manifest.backendRootEnvironmentVariable === "BREADBOARD_P30_BACKEND_ROOT", "unexpected backend root environment variable");
+	invariant(
+		manifest.backendRootEnvironmentVariable === "BREADBOARD_P30_BACKEND_ROOT",
+		"unexpected backend root environment variable",
+	);
 
 	const artifactPath = resolve(packageRoot, manifest.artifactPath);
 	const artifactRelative = relative(packageRoot, artifactPath);
-	invariant(artifactRelative !== "" && !artifactRelative.startsWith("..") && !isAbsolute(artifactRelative), "artifact escapes the package root");
+	invariant(
+		artifactRelative !== "" && !artifactRelative.startsWith("..") && !isAbsolute(artifactRelative),
+		"artifact escapes the package root",
+	);
 	const artifactStat = await lstat(artifactPath);
-	invariant(artifactStat.isFile() && artifactStat.nlink === 1 && !artifactStat.isSymbolicLink(), "artifact is not a single-link regular file");
+	invariant(
+		artifactStat.isFile() && artifactStat.nlink === 1 && !artifactStat.isSymbolicLink(),
+		"artifact is not a single-link regular file",
+	);
 	invariant(artifactStat.size === manifest.artifactSizeBytes, "artifact size changed");
 	const artifact = await readFile(artifactPath);
 	invariant(sha256(artifact) === manifest.artifactSha256, "artifact SHA-256 changed");
-	invariant(createHash("sha512").update(artifact).digest("base64") === manifest.artifactSha512Base64, "artifact SHA-512 changed");
+	invariant(
+		createHash("sha512").update(artifact).digest("base64") === manifest.artifactSha512Base64,
+		"artifact SHA-512 changed",
+	);
 
 	const workspaceRoot = resolve(packageRoot, "../..");
-	const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+	const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as {
+		dependencies?: Record<string, string>;
+	};
 	const lockText = await readFile(join(workspaceRoot, "bun.lock"), "utf8");
 	verifyPinnedReferences(manifest, packageJson, lockText);
 	await verifyBackendIdentity(manifest, backendRoot ?? process.env[manifest.backendRootEnvironmentVariable], inspect);
@@ -560,12 +606,19 @@ export async function verifyBreadboardSdkProvenance(
 	const installedRoot = join(workspaceRoot, "node_modules", "@breadboard", "sdk");
 	const expectedFiles = Object.keys(manifest.installedFilesSha256).sort();
 	const actualFiles = await installedFiles(installedRoot);
-	invariant(JSON.stringify(actualFiles) === JSON.stringify(expectedFiles), "installed file inventory differs from the artifact manifest");
+	invariant(
+		JSON.stringify(actualFiles) === JSON.stringify(expectedFiles),
+		"installed file inventory differs from the artifact manifest",
+	);
 	for (const relative of expectedFiles) {
 		const bytes = await readFile(join(installedRoot, relative));
 		invariant(sha256(bytes) === manifest.installedFilesSha256[relative], `installed bytes changed for ${relative}`);
 	}
-	const installedPackage = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8")) as { name?: string; version?: string; types?: string };
+	const installedPackage = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8")) as {
+		name?: string;
+		version?: string;
+		types?: string;
+	};
 	invariant(installedPackage.name === manifest.packageName, "installed package name changed");
 	invariant(installedPackage.version === manifest.packageVersion, "installed package version changed");
 	invariant(installedPackage.types === "dist/index.d.ts", "installed package types entry changed");
@@ -574,11 +627,13 @@ export async function verifyBreadboardSdkProvenance(
 
 if (import.meta.main) {
 	const manifest = await verifyBreadboardSdkProvenance();
-	process.stdout.write(`${JSON.stringify({
-		package: `${manifest.packageName}@${manifest.packageVersion}`,
-		artifactSha256: manifest.artifactSha256,
-		backendCommit: manifest.backendCommit,
-		backendTree: manifest.backendTree,
-		installedFiles: Object.keys(manifest.installedFilesSha256).length,
-	})}\n`);
+	process.stdout.write(
+		`${JSON.stringify({
+			package: `${manifest.packageName}@${manifest.packageVersion}`,
+			artifactSha256: manifest.artifactSha256,
+			backendCommit: manifest.backendCommit,
+			backendTree: manifest.backendTree,
+			installedFiles: Object.keys(manifest.installedFilesSha256).length,
+		})}\n`,
+	);
 }

@@ -1,14 +1,14 @@
 import { join } from "node:path";
-import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
+import { restoreLifecycleTerminal, writeLifecyclePresentation } from "../breadboard/lifecycle/lifecycle-presenter";
+import { type LifecycleResult, lifecycleFailure, lifecycleState } from "../breadboard/lifecycle/lifecycle-state";
 import {
 	dispatchLifecycleAction,
 	type LifecycleActionExecution,
 	LifecycleSupervisor,
 } from "../breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "../breadboard/lifecycle/local-authority-store";
-import { restoreLifecycleTerminal, writeLifecyclePresentation } from "../breadboard/lifecycle/lifecycle-presenter";
-import { lifecycleFailure, lifecycleState, type LifecycleResult } from "../breadboard/lifecycle/lifecycle-state";
 import {
 	BREADBOARD_ENGINE_MODES,
 	BreadboardRunConfigError,
@@ -55,17 +55,19 @@ export default class Engine extends Command {
 			});
 			let execution: LifecycleActionExecution;
 			if (config.mode === "off") {
-				const result: LifecycleResult = action === "status"
-					? {
-							kind: "off",
-							state: lifecycleState("off", "off", 0, "engine_mode_off") as LifecycleResult & never,
-						}
-					: lifecycleFailure("off", "failed", "mode_forbidden");
+				const result: LifecycleResult =
+					action === "status"
+						? {
+								kind: "off",
+								state: lifecycleState("off", "off", 0, "engine_mode_off") as LifecycleResult & never,
+							}
+						: lifecycleFailure("off", "failed", "mode_forbidden");
 				execution = { result };
 			} else {
-				const store = config.mode === "local-owned"
-					? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
-					: undefined;
+				const store =
+					config.mode === "local-owned"
+						? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
+						: undefined;
 				const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
 				terminalOwnedByDispatch = true;
 				execution = await dispatchLifecycleAction(supervisor, action, {
@@ -82,11 +84,12 @@ export default class Engine extends Command {
 			if (execution.signal !== undefined) exitCode = execution.signal === "SIGINT" ? 130 : 143;
 			process.exitCode = exitCode;
 		} catch (error) {
-			const message = error instanceof BreadboardRunConfigError
-				? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
-				: error instanceof Error
-					? error.message
-					: String(error);
+			const message =
+				error instanceof BreadboardRunConfigError
+					? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
+					: error instanceof Error
+						? error.message
+						: String(error);
 			process.stderr.write(`${message}\n`);
 			process.exitCode = 1;
 		} finally {

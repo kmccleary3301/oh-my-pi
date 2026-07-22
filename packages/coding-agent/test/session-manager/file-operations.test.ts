@@ -221,6 +221,17 @@ describe("SessionManager temp cwd session dirs", () => {
 
 describe("SessionManager legacy session migration persistence", () => {
 	let tempDir: string;
+	const terminalEnvKeys = [
+		"ZELLIJ_PANE_ID",
+		"ZELLIJ_SESSION_NAME",
+		"TMUX_PANE",
+		"CMUX_SURFACE_ID",
+		"KITTY_WINDOW_ID",
+		"WEZTERM_PANE",
+		"TERM_SESSION_ID",
+		"WT_SESSION",
+	] as const;
+	let originalTerminalEnv: Partial<Record<(typeof terminalEnvKeys)[number], string | undefined>>;
 
 	function makeAssistantMessage() {
 		return {
@@ -247,10 +258,20 @@ describe("SessionManager legacy session migration persistence", () => {
 	}
 
 	beforeEach(() => {
+		originalTerminalEnv = {};
+		for (const key of terminalEnvKeys) {
+			originalTerminalEnv[key] = Bun.env[key];
+			delete Bun.env[key];
+		}
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-manager-legacy-"));
 	});
 
 	afterEach(() => {
+		for (const key of terminalEnvKeys) {
+			const original = originalTerminalEnv[key];
+			if (original === undefined) delete Bun.env[key];
+			else Bun.env[key] = original;
+		}
 		removeSyncWithRetries(tempDir);
 	});
 

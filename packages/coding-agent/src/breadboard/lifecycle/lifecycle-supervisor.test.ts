@@ -1,19 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
 	BoundLifecycleE4Client,
 	CommitHardSignalInput,
-	HardSignalPermitResponse,
 	GracefulControlInput,
+	HardSignalPermitResponse,
 	LifecycleE4Client,
 	LifecycleEngineBinding,
 	PrepareHardSignalInput,
 } from "@breadboard/sdk";
 import { LifecycleE4ClientError } from "@breadboard/sdk";
-import { LocalAuthorityStore } from "./local-authority-store";
+import { presentLifecycle, writeLifecyclePresentation } from "./lifecycle-presenter";
+import { lifecycleFailure } from "./lifecycle-state";
 import * as lifecycleModule from "./lifecycle-supervisor";
 import {
 	dispatchLifecycleAction,
@@ -23,14 +24,18 @@ import {
 	type LifecycleSignal,
 	type LifecycleSignalTarget,
 	LifecycleSupervisor,
-	type ProcessObservation,
 	lifecycleChildEnvironment,
-	type SpawnedEngineProcess,
+	type ProcessObservation,
 	readKeychainReference,
+	type SpawnedEngineProcess,
 } from "./lifecycle-supervisor";
-import { presentLifecycle, writeLifecyclePresentation } from "./lifecycle-presenter";
-import { lifecycleFailure } from "./lifecycle-state";
-import { executablePathSha256, resolveBreadboardRunConfig, type BreadboardRunConfig, type EngineArtifact } from "./run-config";
+import { LocalAuthorityStore } from "./local-authority-store";
+import {
+	type BreadboardRunConfig,
+	type EngineArtifact,
+	executablePathSha256,
+	resolveBreadboardRunConfig,
+} from "./run-config";
 
 const roots: string[] = [];
 const executableSha256 = `sha256:${"a".repeat(64)}` as const;
@@ -44,11 +49,19 @@ const artifact: EngineArtifact = {
 	engineSourceSha256,
 	servedBackendCommit: backendCommit,
 };
-const common = { workspacePath: "/workspace", canonicalizeWorkspace: () => "/canonical/workspace", environment: {} as Record<string, string | undefined> };
+const common = {
+	workspacePath: "/workspace",
+	canonicalizeWorkspace: () => "/canonical/workspace",
+	environment: {} as Record<string, string | undefined>,
+};
 
-function resolved(mode: "off" | "local-external" | "remote" | "local-owned", ownerExitPolicy?: "attached" | "detached"): BreadboardRunConfig {
+function resolved(
+	mode: "off" | "local-external" | "remote" | "local-owned",
+	ownerExitPolicy?: "attached" | "detached",
+): BreadboardRunConfig {
 	if (mode === "off") return resolveBreadboardRunConfig({ ...common, cli: { engineMode: "off" } });
-	if (mode === "local-external") return resolveBreadboardRunConfig({ ...common, cli: { engineMode: mode, engineUrl: "http://127.0.0.1:7777" } });
+	if (mode === "local-external")
+		return resolveBreadboardRunConfig({ ...common, cli: { engineMode: mode, engineUrl: "http://127.0.0.1:7777" } });
 	if (mode === "remote") {
 		return resolveBreadboardRunConfig({
 			...common,
@@ -63,7 +76,11 @@ function resolved(mode: "off" | "local-external" | "remote" | "local-owned", own
 	});
 }
 
-function bindingFor(pid: number, launchId: string, overrides: Partial<LifecycleEngineBinding> = {}): LifecycleEngineBinding {
+function bindingFor(
+	pid: number,
+	launchId: string,
+	overrides: Partial<LifecycleEngineBinding> = {},
+): LifecycleEngineBinding {
 	const engineInstanceId = `engine_instance_${pid}_abcdefghijklmnopqrstuvwxyz`;
 	const engineBootId = `engine_boot_${pid}_abcdefghijklmnopqrstuvwxyz012`;
 	const startToken = `darwin:${pid}:1`;
@@ -77,9 +94,20 @@ function bindingFor(pid: number, launchId: string, overrides: Partial<LifecycleE
 		sessionSchemaSha256: "sha256:5757652c22d6aa2eb7a1cc8be1a40021d3f6a15df18d69ca22dc1916a400dbd4",
 		sessionReplayContractDigest: {} as LifecycleEngineBinding["sessionReplayContractDigest"],
 		liveness: { status: "live" },
-		process: { engineInstanceId, engineBootId, startedAt: "2026-07-17T00:00:00.000Z", startedAtUnix: 1, pid, osProcessStartToken: startToken },
+		process: {
+			engineInstanceId,
+			engineBootId,
+			startedAt: "2026-07-17T00:00:00.000Z",
+			startedAtUnix: 1,
+			pid,
+			osProcessStartToken: startToken,
+		},
 		launch: { launchId, source: "supervisor" },
-		artifactRevision: { engineArtifactSha256: engineSourceSha256, servedBackendCommit: backendCommit, servedBackendDirty: false },
+		artifactRevision: {
+			engineArtifactSha256: engineSourceSha256,
+			servedBackendCommit: backendCommit,
+			servedBackendDirty: false,
+		},
 		protocol: { protocolVersion: "1.0" },
 		sessionContract: {
 			contractId: "p30-e4-session-v1",
@@ -119,12 +147,21 @@ interface ClientBehavior {
 	readonly gracefulOutcome?: "shutdown_started" | "rollback_permitted";
 }
 
-function boundClient(binding: LifecycleEngineBinding, calls: string[], behavior: ClientBehavior = {}): BoundLifecycleE4Client {
+function boundClient(
+	binding: LifecycleEngineBinding,
+	calls: string[],
+	behavior: ClientBehavior = {},
+): BoundLifecycleE4Client {
 	return {
 		binding,
 		acquireOwner: async input => {
 			calls.push("acquire-owner");
-			if (!("bootstrapCredential" in input) || !ArrayBuffer.isView(input.bootstrapCredential) || input.bootstrapCredential.byteLength !== 32) throw new Error("bootstrap rotation missing");
+			if (
+				!("bootstrapCredential" in input) ||
+				!ArrayBuffer.isView(input.bootstrapCredential) ||
+				input.bootstrapCredential.byteLength !== 32
+			)
+				throw new Error("bootstrap rotation missing");
 			return { result: "acquired", ownerGeneration: 1 } as never;
 		},
 		renewOwner: async () => {
@@ -161,12 +198,20 @@ function boundClient(binding: LifecycleEngineBinding, calls: string[], behavior:
 			calls.push(`graceful:${input.outcome}`);
 			if (behavior.gracefulError) throw behavior.gracefulError;
 			return input.outcome === "timeout" || input.outcome === "uncertain"
-				? { result: "hard_signal_decision_pending", signalPermitted: true } as never
-				: { result: behavior.gracefulOutcome ?? (input.outcome === "definitive_rejection" ? "rollback_permitted" : "shutdown_started") } as never;
+				? ({ result: "hard_signal_decision_pending", signalPermitted: true } as never)
+				: ({
+						result:
+							behavior.gracefulOutcome ??
+							(input.outcome === "definitive_rejection" ? "rollback_permitted" : "shutdown_started"),
+					} as never);
 		},
 		prepareHardSignal: async () => {
 			calls.push("prepare-hard-signal");
-			return { result: "prepared", authorizationId: "authorization_abcdefghijklmnopqrstuvwxyz", expiresAtUnix: Math.floor(Date.now() / 1_000) + 30 } as never;
+			return {
+				result: "prepared",
+				authorizationId: "authorization_abcdefghijklmnopqrstuvwxyz",
+				expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
+			} as never;
 		},
 		commitHardSignal: async input => {
 			calls.push("commit-hard-signal");
@@ -175,7 +220,14 @@ function boundClient(binding: LifecycleEngineBinding, calls: string[], behavior:
 		recordHardSignalOutcome: async input => {
 			calls.push(`hard-signal:${input.outcome}`);
 			if (behavior.hardSignalError) throw behavior.hardSignalError;
-			return { result: input.outcome === "abandoned" ? "rollback_permitted" : input.outcome === "process_exited" ? "process_exited" : "signal_sent" } as never;
+			return {
+				result:
+					input.outcome === "abandoned"
+						? "rollback_permitted"
+						: input.outcome === "process_exited"
+							? "process_exited"
+							: "signal_sent",
+			} as never;
 		},
 		rollbackDrain: async () => {
 			calls.push("rollback");
@@ -184,7 +236,9 @@ function boundClient(binding: LifecycleEngineBinding, calls: string[], behavior:
 	} as BoundLifecycleE4Client;
 }
 
-async function temporaryStore(seams: ConstructorParameters<typeof LocalAuthorityStore>[1] = {}): Promise<LocalAuthorityStore> {
+async function temporaryStore(
+	seams: ConstructorParameters<typeof LocalAuthorityStore>[1] = {},
+): Promise<LocalAuthorityStore> {
 	const root = await mkdtemp(join(tmpdir(), "omp-supervisor-"));
 	roots.push(root);
 	return new LocalAuthorityStore(root, seams);
@@ -198,8 +252,14 @@ describe("LifecycleSupervisor mode authority", () => {
 	test("off performs zero client, store, process, or secret I/O", async () => {
 		let touched = 0;
 		const supervisor = new LifecycleSupervisor(resolved("off"), {
-			createClient: () => { touched++; throw new Error("forbidden"); },
-			resolveRemoteSecurity: async () => { touched++; return {}; },
+			createClient: () => {
+				touched++;
+				throw new Error("forbidden");
+			},
+			resolveRemoteSecurity: async () => {
+				touched++;
+				return {};
+			},
 		});
 		expect((await supervisor.status()).kind).toBe("off");
 		expect((await supervisor.start()).state.reason).toBe("mode_forbidden");
@@ -212,7 +272,12 @@ describe("LifecycleSupervisor mode authority", () => {
 	test("local-external and remote forbidden actions cannot construct a client", async () => {
 		for (const mode of ["local-external", "remote"] as const) {
 			let touched = 0;
-			const supervisor = new LifecycleSupervisor(resolved(mode), { createClient: () => { touched++; throw new Error("must not connect"); } });
+			const supervisor = new LifecycleSupervisor(resolved(mode), {
+				createClient: () => {
+					touched++;
+					throw new Error("must not connect");
+				},
+			});
 			expect((await supervisor.start()).state.reason).toBe("mode_forbidden");
 			expect((await supervisor.stop({ consumerClosed: true })).state.reason).toBe("mode_forbidden");
 			expect((await supervisor.restart({ consumerClosed: true })).state.reason).toBe("mode_forbidden");
@@ -230,7 +295,9 @@ describe("LifecycleSupervisor mode authority", () => {
 				launch: { launchId: "external_launch_abcdefghijklmnopqrstuvwxyz", source: "external_unmanaged" },
 			});
 			const bound = boundClient(binding, calls);
-			const supervisor = new LifecycleSupervisor(resolved(mode), { createClient: () => ({ handshake: async () => bound }) });
+			const supervisor = new LifecycleSupervisor(resolved(mode), {
+				createClient: () => ({ handshake: async () => bound }),
+			});
 			const observed = await supervisor.status();
 			expect(observed).toMatchObject({ kind: "observed", state: { name: "compatible-observed" } });
 			expect(presentLifecycle(observed).summary).toContain("compatible, observed only");
@@ -301,7 +368,6 @@ describe("LifecycleSupervisor mode authority", () => {
 		expect((await supervisor.close({ consumerClosed: true })).kind).toBe("detached");
 	});
 
-
 	test("remote keychain and mTLS security bind to the endpoint-scoped client", async () => {
 		for (const auth of [
 			{ kind: "keychain-reference", reference: "test-token" },
@@ -313,12 +379,19 @@ describe("LifecycleSupervisor mode authority", () => {
 				selectedConfig: { auth },
 			});
 			let received: { bearerToken?: string; fetch?: typeof fetch } = {};
-			const binding = bindingFor(99, "external_launch_abcdefghijklmnopqrstuvwxyz", { endpoint: "https://engine.example", launch: { launchId: "external_launch_abcdefghijklmnopqrstuvwxyz", source: "external_unmanaged" } });
+			const binding = bindingFor(99, "external_launch_abcdefghijklmnopqrstuvwxyz", {
+				endpoint: "https://engine.example",
+				launch: { launchId: "external_launch_abcdefghijklmnopqrstuvwxyz", source: "external_unmanaged" },
+			});
 			const supervisor = new LifecycleSupervisor(config, {
-				resolveRemoteSecurity: async value => value.kind === "keychain-reference"
-					? { bearerToken: "resolved-token" }
-					: { certificatePem: "certificate", privateKeyPem: "key" },
-				createClient: options => { received = options; return { handshake: async () => boundClient(binding, []) }; },
+				resolveRemoteSecurity: async value =>
+					value.kind === "keychain-reference"
+						? { bearerToken: "resolved-token" }
+						: { certificatePem: "certificate", privateKeyPem: "key" },
+				createClient: options => {
+					received = options;
+					return { handshake: async () => boundClient(binding, []) };
+				},
 			});
 			expect((await supervisor.status()).kind).toBe("observed");
 			if (auth.kind === "keychain-reference") expect(received.bearerToken).toBe("resolved-token");
@@ -375,7 +448,9 @@ describe("LifecycleSupervisor mode authority", () => {
 				BREADBOARD_ENGINE_LAUNCH_ID: "launch_environment_abcdefghijklmnopqrstuvwxyz",
 				BREADBOARD_LIFECYCLE_BOOTSTRAP_FD: "3",
 			});
-			expect(lifecycleChildEnvironment("launch_environment_abcdefghijklmnopqrstuvwxyz")).not.toHaveProperty("BREADBOARD_HOSTILE_PARENT_SECRET");
+			expect(lifecycleChildEnvironment("launch_environment_abcdefghijklmnopqrstuvwxyz")).not.toHaveProperty(
+				"BREADBOARD_HOSTILE_PARENT_SECRET",
+			);
 			expect(lifecycleChildEnvironment("launch_environment_abcdefghijklmnopqrstuvwxyz")).not.toHaveProperty("HOME");
 		} finally {
 			delete process.env.BREADBOARD_HOSTILE_PARENT_SECRET;
@@ -403,32 +478,57 @@ describe("LifecycleSupervisor mode authority", () => {
 				reaped = true;
 				return code;
 			});
-			await expect(readKeychainReference("synthetic-reference", {
-				outputLimit: testCase.outputLimit,
-				timeoutMs: testCase.timeoutMs,
-				spawn: () => ({
-					stdout,
-					exited,
-					kill: () => {
-						killed = true;
-						exit.resolve(137);
-					},
+			await expect(
+				readKeychainReference("synthetic-reference", {
+					outputLimit: testCase.outputLimit,
+					timeoutMs: testCase.timeoutMs,
+					spawn: () => ({
+						stdout,
+						exited,
+						kill: () => {
+							killed = true;
+							exit.resolve(137);
+						},
+					}),
 				}),
-			})).rejects.toMatchObject({ failure: { code: testCase.code } });
+			).rejects.toMatchObject({ failure: { code: testCase.code } });
 			expect({ killed, cancelled, reaped }).toEqual({ killed: true, cancelled: true, reaped: true });
 			expect([...chunk].every(byte => byte === 0)).toBe(true);
 		}
 	});
 
-
 	test("typed transport failures remain distinct", async () => {
 		const cases = [
-			[new LifecycleE4ClientError({ kind: "auth", status: 401, code: "auth", correlation: {}, body: "[redacted]" }), "auth-failed"],
+			[
+				new LifecycleE4ClientError({
+					kind: "auth",
+					status: 401,
+					code: "auth",
+					correlation: {},
+					body: "[redacted]",
+				}),
+				"auth-failed",
+			],
 			[new LifecycleE4ClientError({ kind: "tls", code: "tls_transport_error" }), "tls-failed"],
-			[new LifecycleE4ClientError({ kind: "identity-changed", status: 409, code: "identity", correlation: {}, body: "[redacted]" }), "identity-changed"],
+			[
+				new LifecycleE4ClientError({
+					kind: "identity-changed",
+					status: 409,
+					code: "identity",
+					correlation: {},
+					body: "[redacted]",
+				}),
+				"identity-changed",
+			],
 		] as const;
 		for (const [failure, state] of cases) {
-			const supervisor = new LifecycleSupervisor(resolved("remote"), { createClient: () => ({ handshake: async () => { throw failure; } }) });
+			const supervisor = new LifecycleSupervisor(resolved("remote"), {
+				createClient: () => ({
+					handshake: async () => {
+						throw failure;
+					},
+				}),
+			});
 			expect((await supervisor.connect()).state.name).toBe(state);
 		}
 	});
@@ -467,7 +567,8 @@ describe("LifecycleSupervisor local-owned authority", () => {
 					exited,
 					unref: () => events.push("unref"),
 					sendHardSignal: async authorizationExpiresAtUnix => {
-						if (authorizationExpiresAtUnix !== undefined && authorizationExpiresAtUnix * 1_000 <= Date.now()) return "authorization_expired";
+						if (authorizationExpiresAtUnix !== undefined && authorizationExpiresAtUnix * 1_000 <= Date.now())
+							return "authorization_expired";
 						if (processTokens.get(pid) !== startToken) return "abandoned";
 						events.push("hard-control");
 						dead.add(pid);
@@ -482,7 +583,7 @@ describe("LifecycleSupervisor local-owned authority", () => {
 							suppressNextExitNotification = false;
 							return true;
 						}
-						return timeoutMs === 0 ? dead.has(pid) : waitResults.shift() ?? dead.has(pid);
+						return timeoutMs === 0 ? dead.has(pid) : (waitResults.shift() ?? dead.has(pid));
 					},
 				};
 				try {
@@ -503,10 +604,14 @@ describe("LifecycleSupervisor local-owned authority", () => {
 				handles.set(pid, handle);
 				return handle;
 			},
-			observe: async pid => dead.has(pid)
-				? ({ kind: "dead" } as ProcessObservation)
-				: ({ kind: "alive", startToken: processTokens.get(pid) ?? `darwin:${pid}:unknown` } as ProcessObservation),
-			controlFor: async (pid, token) => token === processTokens.get(pid) ? handles.get(pid) ?? null : null,
+			observe: async pid =>
+				dead.has(pid)
+					? ({ kind: "dead" } as ProcessObservation)
+					: ({
+							kind: "alive",
+							startToken: processTokens.get(pid) ?? `darwin:${pid}:unknown`,
+						} as ProcessObservation),
+			controlFor: async (pid, token) => (token === processTokens.get(pid) ? (handles.get(pid) ?? null) : null),
 		};
 		return {
 			adapter,
@@ -516,33 +621,50 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			bootstrapBuffers,
 			current: () => ({ pid: currentPid, launchId: currentLaunch }),
 			spawnCount: () => spawnCount,
-			crash: (pid = currentPid) => { dead.add(pid); exitResolvers.get(pid)?.(1); },
+			crash: (pid = currentPid) => {
+				dead.add(pid);
+				exitResolvers.get(pid)?.(1);
+			},
 			rotateIdentity: (pid = currentPid) => processTokens.set(pid, `darwin:${pid}:2`),
-			exitOnNextWait: () => { gracefulExitOnWait = true; },
+			exitOnNextWait: () => {
+				gracefulExitOnWait = true;
+			},
 			exitSilentlyOnNextWait: () => {
 				suppressNextExitNotification = true;
 				gracefulExitOnWait = true;
 			},
-			unboundNext: () => { returnUnbound = true; },
+			unboundNext: () => {
+				returnUnbound = true;
+			},
 		};
 	}
 
-	function clientFactory(process: ReturnType<typeof processHarness>, calls: string[], behavior: ClientBehavior = {}): () => LifecycleE4Client {
-		return () => ({ handshake: async () => {
-			const current = process.current();
-			return boundClient(bindingFor(current.pid, current.launchId), calls, behavior);
-		} });
+	function clientFactory(
+		process: ReturnType<typeof processHarness>,
+		calls: string[],
+		behavior: ClientBehavior = {},
+	): () => LifecycleE4Client {
+		return () => ({
+			handshake: async () => {
+				const current = process.current();
+				return boundClient(bindingFor(current.pid, current.launchId), calls, behavior);
+			},
+		});
 	}
 
 	test("cold start commits recoverable owner before registration and wipes exact bootstrap buffer", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
 		const calls: string[] = [];
-		const supervisor = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient: clientFactory(process, calls) });
+		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls),
+		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect(calls.slice(0, 3)).toEqual(["acquire-owner", "register:local-owned", "renew-owner"].slice(0, 2));
 		expect(process.bootstrapBuffers).toHaveLength(1);
-		expect([...process.bootstrapBuffers[0] as Buffer].every(byte => byte === 0)).toBe(true);
+		expect([...(process.bootstrapBuffers[0] as Buffer)].every(byte => byte === 0)).toBe(true);
 		const current = await store.readCurrent("http://127.0.0.1:7777");
 		expect(current?.pid).toBe(process.current().pid);
 		expect(current).toMatchObject({
@@ -709,7 +831,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		});
 		expect((await first.connect()).kind).toBe("failure");
 		expect(await store.readCurrent("http://127.0.0.1:7777")).not.toBeNull();
-		const second = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient: clientFactory(process, []) });
+		const second = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, []),
+		});
 		expect((await second.connect()).kind).toBe("ready");
 		expect(process.spawnCount()).toBe(1);
 	});
@@ -737,15 +863,27 @@ describe("LifecycleSupervisor local-owned authority", () => {
 	test("preserves a recoverable pending claim without hard control on pre-owner handshake failure", async () => {
 		const process = processHarness();
 		const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
-		const failure = new LifecycleE4ClientError({ kind: "auth", status: 401, code: "unauthorized", correlation: {}, body: "[redacted]" });
+		const failure = new LifecycleE4ClientError({
+			kind: "auth",
+			status: 401,
+			code: "unauthorized",
+			correlation: {},
+			body: "[redacted]",
+		});
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => ({ handshake: async () => { throw failure; } }),
+			createClient: () => ({
+				handshake: async () => {
+					throw failure;
+				},
+			}),
 		});
 		expect((await supervisor.connect()).state.reason).toBe("auth_failed");
 		expect(process.events).not.toContain("hard-control");
-		const preserved = await store.withExclusiveLock("http://127.0.0.1:7777", () => store.claimStart("http://127.0.0.1:7777"));
+		const preserved = await store.withExclusiveLock("http://127.0.0.1:7777", () =>
+			store.claimStart("http://127.0.0.1:7777"),
+		);
 		expect(preserved.kind).toBe("recoverable");
 		if (preserved.kind === "recoverable") {
 			expect(preserved.claim).toMatchObject({
@@ -759,7 +897,6 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		}
 	});
 
-
 	test("pure local status never spawns, owns, or registers", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
@@ -767,7 +904,10 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const status = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => { clientTouches++; throw new Error("forbidden"); },
+			createClient: () => {
+				clientTouches++;
+				throw new Error("forbidden");
+			},
 		});
 		expect((await status.status()).kind).toBe("stopped");
 		expect(process.spawnCount()).toBe(0);
@@ -781,18 +921,35 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		let firstHandshake = true;
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const createClient = () => ({ handshake: async () => {
-			if (firstHandshake) {
-				firstHandshake = false;
-				entered.resolve();
-				await release.promise;
-			}
-			const current = process.current();
-			return boundClient(bindingFor(current.pid, current.launchId), calls);
-		} });
-		const clock = { now: Date.now, sleep: async () => { await Promise.resolve(); } };
-		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient, clock });
-		const second = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient, clock });
+		const createClient = () => ({
+			handshake: async () => {
+				if (firstHandshake) {
+					firstHandshake = false;
+					entered.resolve();
+					await release.promise;
+				}
+				const current = process.current();
+				return boundClient(bindingFor(current.pid, current.launchId), calls);
+			},
+		});
+		const clock = {
+			now: Date.now,
+			sleep: async () => {
+				await Promise.resolve();
+			},
+		};
+		const first = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+			clock,
+		});
+		const second = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+			clock,
+		});
 		const firstResult = first.connect();
 		await entered.promise;
 		const secondResult = second.connect();
@@ -814,14 +971,19 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		await store.withExclusiveLock(endpoint, async () => {
 			const claimed = await store.claimStart(endpoint);
 			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
-			const prepared = await store.prepareStartClaim(endpoint, claimed.claim.token, {
-				launchId,
-				executableSha256: artifact.executableSha256,
-				engineArtifactSha256: artifact.engineSourceSha256,
-				servedBackendCommit: artifact.servedBackendCommit,
-				executablePathSha256: executablePathSha256(artifact.executablePath),
-				argvSha256: artifact.argvSha256,
-			}, { bootstrapCredential: pendingBootstrap, ownerCredential: Buffer.from("o".repeat(43), "ascii") });
+			const prepared = await store.prepareStartClaim(
+				endpoint,
+				claimed.claim.token,
+				{
+					launchId,
+					executableSha256: artifact.executableSha256,
+					engineArtifactSha256: artifact.engineSourceSha256,
+					servedBackendCommit: artifact.servedBackendCommit,
+					executablePathSha256: executablePathSha256(artifact.executablePath),
+					argvSha256: artifact.argvSha256,
+				},
+				{ bootstrapCredential: pendingBootstrap, ownerCredential: Buffer.from("o".repeat(43), "ascii") },
+			);
 			const transfer = Buffer.from(pendingBootstrap);
 			const child = await process.adapter.spawnVerified(artifact, launchId, transfer, async (pid, startToken) => {
 				await store.bindStartClaimProcess(endpoint, prepared.token, pid, startToken);
@@ -853,14 +1015,19 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const orphaned = await store.withExclusiveLock(endpoint, async () => {
 			const claimed = await store.claimStart(endpoint);
 			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
-			return await store.prepareStartClaim(endpoint, claimed.claim.token, {
-				launchId: "launch_orphaned_unbound_abcdefghijklmnopqrst",
-				executableSha256: configuredArtifact.executableSha256,
-				executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
-				argvSha256: configuredArtifact.argvSha256,
-				engineArtifactSha256: configuredArtifact.engineSourceSha256,
-				servedBackendCommit: configuredArtifact.servedBackendCommit,
-			}, { bootstrapCredential: bootstrap, ownerCredential: owner });
+			return await store.prepareStartClaim(
+				endpoint,
+				claimed.claim.token,
+				{
+					launchId: "launch_orphaned_unbound_abcdefghijklmnopqrst",
+					executableSha256: configuredArtifact.executableSha256,
+					executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
+					argvSha256: configuredArtifact.argvSha256,
+					engineArtifactSha256: configuredArtifact.engineSourceSha256,
+					servedBackendCommit: configuredArtifact.servedBackendCommit,
+				},
+				{ bootstrapCredential: bootstrap, ownerCredential: owner },
+			);
 		});
 		bootstrap.fill(0);
 		owner.fill(0);
@@ -885,7 +1052,9 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			},
 			clock: {
 				now: () => now,
-				sleep: async milliseconds => { now += milliseconds; },
+				sleep: async milliseconds => {
+					now += milliseconds;
+				},
 			},
 		});
 		const result = await recovered.connect();
@@ -894,19 +1063,20 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect(absenceChecks).toBe(1);
 		expect(process.spawnCount()).toBe(1);
 		expect(await store.readCurrent(endpoint)).toMatchObject({ pid: process.current().pid });
-		await expect(store.withExclusiveLock(endpoint, () => store.bindStartClaimProcess(
-			endpoint,
-			orphaned.token,
-			9999,
-			"darwin:9999:late",
-		))).rejects.toBeDefined();
+		await expect(
+			store.withExclusiveLock(endpoint, () =>
+				store.bindStartClaimProcess(endpoint, orphaned.token, 9999, "darwin:9999:late"),
+			),
+		).rejects.toBeDefined();
 	});
-
 
 	test("recovers a stale-createdAt dead-starter claim within a fresh bounded handshake window", async () => {
 		const process = processHarness();
 		let enginePid = 0;
-		const store = await temporaryStore({ now: () => 1_000, isLockOwnerAlive: async owner => owner.pid === enginePid });
+		const store = await temporaryStore({
+			now: () => 1_000,
+			isLockOwnerAlive: async owner => owner.pid === enginePid,
+		});
 		const config = resolved("local-owned");
 		const configuredArtifact = config.engineArtifact as EngineArtifact;
 		const endpoint = config.endpoint as string;
@@ -916,14 +1086,19 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		await store.withExclusiveLock(endpoint, async () => {
 			const claimed = await store.claimStart(endpoint);
 			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
-			await store.prepareStartClaim(endpoint, claimed.claim.token, {
-				launchId,
-				executableSha256: configuredArtifact.executableSha256,
-				executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
-				argvSha256: configuredArtifact.argvSha256,
-				engineArtifactSha256: configuredArtifact.engineSourceSha256,
-				servedBackendCommit: configuredArtifact.servedBackendCommit,
-			}, { bootstrapCredential: bootstrap, ownerCredential: owner });
+			await store.prepareStartClaim(
+				endpoint,
+				claimed.claim.token,
+				{
+					launchId,
+					executableSha256: configuredArtifact.executableSha256,
+					executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
+					argvSha256: configuredArtifact.argvSha256,
+					engineArtifactSha256: configuredArtifact.engineSourceSha256,
+					servedBackendCommit: configuredArtifact.servedBackendCommit,
+				},
+				{ bootstrapCredential: bootstrap, ownerCredential: owner },
+			);
 			const transfer = Buffer.from(bootstrap);
 			const child = await process.adapter.spawnVerified(configuredArtifact, launchId, transfer, async () => {});
 			if ("kind" in child) throw new Error("expected bound spawned process");
@@ -966,14 +1141,19 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		await store.withExclusiveLock(endpoint, async () => {
 			const claimed = await store.claimStart(endpoint);
 			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
-			await store.prepareStartClaim(endpoint, claimed.claim.token, {
-				launchId,
-				executableSha256: configuredArtifact.executableSha256,
-				executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
-				argvSha256: configuredArtifact.argvSha256,
-				engineArtifactSha256: configuredArtifact.engineSourceSha256,
-				servedBackendCommit: configuredArtifact.servedBackendCommit,
-			}, { bootstrapCredential: bootstrap, ownerCredential: owner });
+			await store.prepareStartClaim(
+				endpoint,
+				claimed.claim.token,
+				{
+					launchId,
+					executableSha256: configuredArtifact.executableSha256,
+					executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
+					argvSha256: configuredArtifact.argvSha256,
+					engineArtifactSha256: configuredArtifact.engineSourceSha256,
+					servedBackendCommit: configuredArtifact.servedBackendCommit,
+				},
+				{ bootstrapCredential: bootstrap, ownerCredential: owner },
+			);
 			const transfer = Buffer.from(bootstrap);
 			const child = await process.adapter.spawnVerified(configuredArtifact, launchId, transfer, async () => {});
 			if ("kind" in child) throw new Error("expected bound spawned process");
@@ -989,7 +1169,10 @@ describe("LifecycleSupervisor local-owned authority", () => {
 				handshake: async () => boundClient(bindingFor(enginePid + 1, launchId), []),
 			}),
 		});
-		expect((await recovered.connect()).state).toMatchObject({ name: "recovery-needed", reason: "process_identity_unavailable" });
+		expect((await recovered.connect()).state).toMatchObject({
+			name: "recovery-needed",
+			reason: "process_identity_unavailable",
+		});
 		expect(process.spawnCount()).toBe(1);
 		const preserved = await store.withExclusiveLock(endpoint, () => store.claimStart(endpoint));
 		expect(preserved.kind).toBe("unbound");
@@ -999,7 +1182,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const store = await temporaryStore();
 		const process = processHarness();
 		const calls: string[] = [];
-		const first = new LifecycleSupervisor(resolved("local-owned", "detached"), { store, process: process.adapter, createClient: clientFactory(process, calls) });
+		const first = new LifecycleSupervisor(resolved("local-owned", "detached"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls),
+		});
 		expect((await first.connect()).kind).toBe("ready");
 		expect((await first.close({ consumerClosed: true })).kind).toBe("detached");
 		calls.length = 0;
@@ -1008,7 +1195,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			cli: { engineMode: "local-owned" },
 			selectedConfig: { engineArtifact: { ...artifact, argv: ["--different"] } },
 		});
-		const adopter = new LifecycleSupervisor(changed, { store, process: process.adapter, createClient: clientFactory(process, calls) });
+		const adopter = new LifecycleSupervisor(changed, {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls),
+		});
 		expect((await adopter.connect()).state.reason).toBe("identity_changed");
 		expect(calls).toEqual([]);
 	});
@@ -1017,10 +1208,18 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const store = await temporaryStore();
 		const process = processHarness();
 		const calls: string[] = [];
-		const first = new LifecycleSupervisor(resolved("local-owned", "detached"), { store, process: process.adapter, createClient: clientFactory(process, calls) });
+		const first = new LifecycleSupervisor(resolved("local-owned", "detached"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls),
+		});
 		expect((await first.connect()).kind).toBe("ready");
 		expect((await first.close({ consumerClosed: true })).kind).toBe("detached");
-		const adopter = new LifecycleSupervisor(resolved("local-owned", "attached"), { store, process: process.adapter, createClient: clientFactory(process, calls) });
+		const adopter = new LifecycleSupervisor(resolved("local-owned", "attached"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls),
+		});
 		expect((await adopter.connect()).kind).toBe("ready");
 		expect((await adopter.close({ consumerClosed: true })).kind).toBe("detached");
 		expect(calls.filter(call => call === "release-owner")).toHaveLength(2);
@@ -1064,7 +1263,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 									}
 									throw timeout;
 								}
-								return { result: "draining", controlRequestId: input.controlRequestId, drainGeneration: 2 } as never;
+								return {
+									result: "draining",
+									controlRequestId: input.controlRequestId,
+									drainGeneration: 2,
+								} as never;
 							},
 						};
 					},
@@ -1100,17 +1303,23 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				return {
-					...boundClient(bindingFor(current.pid, current.launchId), []),
-					beginControlDrain: async input => {
-						requestIds.push(input.controlRequestId);
-						if (responseLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						return { result: "draining", controlRequestId: input.controlRequestId, drainGeneration: 2 } as never;
-					},
-				};
-			} }),
+			createClient: () => ({
+				handshake: async () => {
+					const current = process.current();
+					return {
+						...boundClient(bindingFor(current.pid, current.launchId), []),
+						beginControlDrain: async input => {
+							requestIds.push(input.controlRequestId);
+							if (responseLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return {
+								result: "draining",
+								controlRequestId: input.controlRequestId,
+								drainGeneration: 2,
+							} as never;
+						},
+					};
+				},
+			}),
 		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("failure");
@@ -1124,105 +1333,119 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect(requestIds).toHaveLength(4);
 		expect((await readdir(store.root)).some(name => name.endsWith(".control.json"))).toBe(false);
 	});
-	test.each(["before-request", "lost-response"] as const)("recovers durable begin-pending after %s controller crash", async crashPoint => {
-		const store = await temporaryStore();
-		const process = processHarness();
-		const endpoint = "http://127.0.0.1:7777";
-		const registrations: Array<{
-			readonly input: Parameters<BoundLifecycleE4Client["registerClient"]>[0];
-			readonly registrationId: string;
-			readonly admissionEpoch: number;
-		}> = [];
-		const beginRequests: Array<Record<string, unknown>> = [];
-		let responseLosses = crashPoint === "lost-response" ? 3 : 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				registerClient: async input => {
-					const registrationId = `registration_${input.clientInstanceId}`;
-					const admissionEpoch = 40 + registrations.length;
-					registrations.push({ input, registrationId, admissionEpoch });
+	test.each(["before-request", "lost-response"] as const)(
+		"recovers durable begin-pending after %s controller crash",
+		async crashPoint => {
+			const store = await temporaryStore();
+			const process = processHarness();
+			const endpoint = "http://127.0.0.1:7777";
+			const registrations: Array<{
+				readonly input: Parameters<BoundLifecycleE4Client["registerClient"]>[0];
+				readonly registrationId: string;
+				readonly admissionEpoch: number;
+			}> = [];
+			const beginRequests: Array<Record<string, unknown>> = [];
+			let responseLosses = crashPoint === "lost-response" ? 3 : 0;
+			const createClient = (): LifecycleE4Client => ({
+				handshake: async () => {
+					const current = process.current();
+					const base = boundClient(bindingFor(current.pid, current.launchId), []);
 					return {
-						result: "registered",
-						registrationId,
-						registrationGeneration: 1,
-						clientInstanceId: input.clientInstanceId,
-						admissionEpoch,
-						expiresAtUnix: 100,
-					} as never;
+						...base,
+						registerClient: async input => {
+							const registrationId = `registration_${input.clientInstanceId}`;
+							const admissionEpoch = 40 + registrations.length;
+							registrations.push({ input, registrationId, admissionEpoch });
+							return {
+								result: "registered",
+								registrationId,
+								registrationGeneration: 1,
+								clientInstanceId: input.clientInstanceId,
+								admissionEpoch,
+								expiresAtUnix: 100,
+							} as never;
+						},
+						beginControlDrain: async input => {
+							const { signal: _, ...request } = input;
+							beginRequests.push(request);
+							if (responseLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return {
+								result: "draining",
+								controlRequestId: input.controlRequestId,
+								drainGeneration: 2,
+							} as never;
+						},
+					};
 				},
-				beginControlDrain: async input => {
-					const { signal: _, ...request } = input;
-					beginRequests.push(request);
-					if (responseLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-					return { result: "draining", controlRequestId: input.controlRequestId, drainGeneration: 2 } as never;
-				},
-			};
-		} });
-		const starter = new LifecycleSupervisor(resolved("local-owned"), {
-			store,
-			process: process.adapter,
-			createClient,
-		});
-		expect((await starter.connect()).kind).toBe("ready");
-		if (crashPoint === "before-request") {
-			const prepare = store.prepareControlAttempt.bind(store);
-			store.prepareControlAttempt = async (...args: Parameters<typeof prepare>) => {
-				const pending = await prepare(...args);
-				throw new Error(`simulated controller death after ${pending.phase} persistence`);
-			};
-			await starter.stop({ consumerClosed: true }).catch(() => undefined);
-			store.prepareControlAttempt = prepare;
-			expect(beginRequests).toHaveLength(0);
-		} else {
-			expect((await starter.stop({ consumerClosed: true })).kind).toBe("failure");
-			expect(beginRequests).toHaveLength(3);
-		}
-		const record = await store.readCurrent(endpoint);
-		if (!record) throw new Error("authority record missing after controller crash");
-		const pending = await store.readControlAttempt(endpoint, record);
-		expect(pending).toMatchObject({ operation: "stop", phase: "begin-pending" });
-		const controlName = (await readdir(store.root)).find(name => name.endsWith(".control.json"));
-		if (!controlName) throw new Error("durable control attempt missing");
-		const publicControl = JSON.parse(await readFile(join(store.root, controlName), "utf8")) as Record<string, unknown>;
-		const credentialRef = typeof publicControl.requesterCredentialRef === "string" ? publicControl.requesterCredentialRef : undefined;
-		const credentialMode = credentialRef === undefined ? undefined : (await stat(join(store.root, credentialRef))).mode & 0o777;
-		const originalRegistration = registrations[0];
-		if (!originalRegistration) throw new Error("original requester registration missing");
-		const successor = new LifecycleSupervisor(resolved("local-owned"), {
-			store,
-			process: process.adapter,
-			createClient,
-		});
-		expect((await successor.connect()).kind).toBe("ready");
-		expect(registrations).toHaveLength(2);
-		expect(registrations[1]?.registrationId).not.toBe(originalRegistration.registrationId);
-		process.exitSilentlyOnNextWait();
-		expect((await successor.stop({ consumerClosed: true })).kind).toBe("stopped");
-		expect(beginRequests).toHaveLength(crashPoint === "lost-response" ? 4 : 1);
-		const replay = beginRequests.at(-1);
-		expect(replay).toMatchObject({
-			controlRequestId: pending?.controlRequestId,
-			registrationId: originalRegistration.registrationId,
-			requesterRegistrationGeneration: 1,
-			requesterClientInstanceId: originalRegistration.input.clientInstanceId,
-			registrationCredential: originalRegistration.input.registrationCredential,
-			expectedAdmissionEpoch: originalRegistration.admissionEpoch,
-		});
-		for (const request of beginRequests.slice(1)) expect(request).toEqual(beginRequests[0]);
-		expect(publicControl).toMatchObject({
-			expectedAdmissionEpoch: originalRegistration.admissionEpoch,
-			requesterCredentialRef: expect.stringMatching(/\.control\.secret\./),
-			requesterCredentialVerifier: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
-		});
-		expect(JSON.stringify(publicControl)).not.toContain(originalRegistration.input.registrationCredential);
-		expect(credentialMode).toBe(0o600);
-		const remainingNames = await readdir(store.root);
-		expect(remainingNames).not.toContain(controlName);
-		expect(remainingNames).not.toContain(credentialRef as string);
-	});
+			});
+			const starter = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
+			expect((await starter.connect()).kind).toBe("ready");
+			if (crashPoint === "before-request") {
+				const prepare = store.prepareControlAttempt.bind(store);
+				store.prepareControlAttempt = async (...args: Parameters<typeof prepare>) => {
+					const pending = await prepare(...args);
+					throw new Error(`simulated controller death after ${pending.phase} persistence`);
+				};
+				await starter.stop({ consumerClosed: true }).catch(() => undefined);
+				store.prepareControlAttempt = prepare;
+				expect(beginRequests).toHaveLength(0);
+			} else {
+				expect((await starter.stop({ consumerClosed: true })).kind).toBe("failure");
+				expect(beginRequests).toHaveLength(3);
+			}
+			const record = await store.readCurrent(endpoint);
+			if (!record) throw new Error("authority record missing after controller crash");
+			const pending = await store.readControlAttempt(endpoint, record);
+			expect(pending).toMatchObject({ operation: "stop", phase: "begin-pending" });
+			const controlName = (await readdir(store.root)).find(name => name.endsWith(".control.json"));
+			if (!controlName) throw new Error("durable control attempt missing");
+			const publicControl = JSON.parse(await readFile(join(store.root, controlName), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			const credentialRef =
+				typeof publicControl.requesterCredentialRef === "string" ? publicControl.requesterCredentialRef : undefined;
+			const credentialMode =
+				credentialRef === undefined ? undefined : (await stat(join(store.root, credentialRef))).mode & 0o777;
+			const originalRegistration = registrations[0];
+			if (!originalRegistration) throw new Error("original requester registration missing");
+			const successor = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
+			expect((await successor.connect()).kind).toBe("ready");
+			expect(registrations).toHaveLength(2);
+			expect(registrations[1]?.registrationId).not.toBe(originalRegistration.registrationId);
+			process.exitSilentlyOnNextWait();
+			expect((await successor.stop({ consumerClosed: true })).kind).toBe("stopped");
+			expect(beginRequests).toHaveLength(crashPoint === "lost-response" ? 4 : 1);
+			const replay = beginRequests.at(-1);
+			expect(replay).toMatchObject({
+				controlRequestId: pending?.controlRequestId,
+				registrationId: originalRegistration.registrationId,
+				requesterRegistrationGeneration: 1,
+				requesterClientInstanceId: originalRegistration.input.clientInstanceId,
+				registrationCredential: originalRegistration.input.registrationCredential,
+				expectedAdmissionEpoch: originalRegistration.admissionEpoch,
+			});
+			for (const request of beginRequests.slice(1)) expect(request).toEqual(beginRequests[0]);
+			expect(publicControl).toMatchObject({
+				expectedAdmissionEpoch: originalRegistration.admissionEpoch,
+				requesterCredentialRef: expect.stringMatching(/\.control\.secret\./),
+				requesterCredentialVerifier: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			});
+			expect(JSON.stringify(publicControl)).not.toContain(originalRegistration.input.registrationCredential);
+			expect(credentialMode).toBe(0o600);
+			const remainingNames = await readdir(store.root);
+			expect(remainingNames).not.toContain(controlName);
+			expect(remainingNames).not.toContain(credentialRef as string);
+		},
+	);
 	test("replaces an expired durable begin requester once with the current registration", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
@@ -1234,35 +1457,43 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		}> = [];
 		const beginRequests: Array<Record<string, unknown>> = [];
 		let expiredRollbacks = 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				registerClient: async input => {
-					const registrationId = `registration_${registrations.length}_${input.clientInstanceId}`;
-					const admissionEpoch = 60 + registrations.length;
-					registrations.push({ input, registrationId, admissionEpoch });
-					return {
-						result: "registered",
-						registrationId,
-						registrationGeneration: 1,
-						clientInstanceId: input.clientInstanceId,
-						admissionEpoch,
-						expiresAtUnix: 100,
-					} as never;
-				},
-				beginControlDrain: async input => {
-					const { signal: _, ...request } = input;
-					beginRequests.push(request);
-					if (input.registrationId === registrations[0]?.registrationId) {
-						expiredRollbacks++;
-						throw new LifecycleE4ClientError({ kind: "registration-expired", status: 409, code: "registration_expired", correlation: {}, body: "[redacted]" });
-					}
-					return { result: "draining", controlRequestId: input.controlRequestId, drainGeneration: 3 } as never;
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					registerClient: async input => {
+						const registrationId = `registration_${registrations.length}_${input.clientInstanceId}`;
+						const admissionEpoch = 60 + registrations.length;
+						registrations.push({ input, registrationId, admissionEpoch });
+						return {
+							result: "registered",
+							registrationId,
+							registrationGeneration: 1,
+							clientInstanceId: input.clientInstanceId,
+							admissionEpoch,
+							expiresAtUnix: 100,
+						} as never;
+					},
+					beginControlDrain: async input => {
+						const { signal: _, ...request } = input;
+						beginRequests.push(request);
+						if (input.registrationId === registrations[0]?.registrationId) {
+							expiredRollbacks++;
+							throw new LifecycleE4ClientError({
+								kind: "registration-expired",
+								status: 409,
+								code: "registration_expired",
+								correlation: {},
+								body: "[redacted]",
+							});
+						}
+						return { result: "draining", controlRequestId: input.controlRequestId, drainGeneration: 3 } as never;
+					},
+				};
+			},
+		});
 		const starter = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
@@ -1307,7 +1538,6 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect(beginRequests).toHaveLength(2);
 	});
 
-
 	test("replays two committed graceful-accepted responses before observing exact exit", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
@@ -1318,19 +1548,21 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				return {
-					...boundClient(bindingFor(current.pid, current.launchId), []),
-					recordGracefulControl: async input => {
-						if (input.outcome !== "accepted") throw new Error("unexpected graceful outcome");
-						acceptedRequests.push(input.drainGeneration);
-						if (acceptedTransitions === 0) acceptedTransitions++;
-						if (acceptedLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						return { result: "shutdown_started" } as never;
-					},
-				};
-			} }),
+			createClient: () => ({
+				handshake: async () => {
+					const current = process.current();
+					return {
+						...boundClient(bindingFor(current.pid, current.launchId), []),
+						recordGracefulControl: async input => {
+							if (input.outcome !== "accepted") throw new Error("unexpected graceful outcome");
+							acceptedRequests.push(input.drainGeneration);
+							if (acceptedTransitions === 0) acceptedTransitions++;
+							if (acceptedLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return { result: "shutdown_started" } as never;
+						},
+					};
+				},
+			}),
 		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("stopped");
@@ -1355,38 +1587,40 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				const base = boundClient(bindingFor(current.pid, current.launchId), []);
-				return {
-					...base,
-					recordGracefulControl: async input => {
-						if (input.outcome === "accepted") return { result: "shutdown_started" } as never;
-						if (input.outcome !== "timeout") throw new Error("unexpected graceful outcome");
-						timeoutRequests.push(input.drainGeneration);
-						if (timeoutTransitions === 0) timeoutTransitions++;
-						if (timeoutLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						return { result: "hard_signal_decision_pending", signalPermitted: true } as never;
-					},
-					prepareHardSignal: async input => {
-						prepareRequests.push(input.drainGeneration);
-						if (authorizationCreations === 0) authorizationCreations++;
-						if (prepareLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						return {
-							result: "prepared",
-							authorizationId: "authorization_replay_abcdefghijklmnop",
-							expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
-						} as never;
-					},
-					commitHardSignal: async (input: CommitHardSignalInput) => {
-						const { signal: _signal, ...request } = input;
-						commitRequests.push(request);
-						if (permitCreations === 0) permitCreations++;
-						if (commitLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						return hardSignalPermit(base.binding, input);
-					},
-				};
-			} }),
+			createClient: () => ({
+				handshake: async () => {
+					const current = process.current();
+					const base = boundClient(bindingFor(current.pid, current.launchId), []);
+					return {
+						...base,
+						recordGracefulControl: async input => {
+							if (input.outcome === "accepted") return { result: "shutdown_started" } as never;
+							if (input.outcome !== "timeout") throw new Error("unexpected graceful outcome");
+							timeoutRequests.push(input.drainGeneration);
+							if (timeoutTransitions === 0) timeoutTransitions++;
+							if (timeoutLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return { result: "hard_signal_decision_pending", signalPermitted: true } as never;
+						},
+						prepareHardSignal: async input => {
+							prepareRequests.push(input.drainGeneration);
+							if (authorizationCreations === 0) authorizationCreations++;
+							if (prepareLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return {
+								result: "prepared",
+								authorizationId: "authorization_replay_abcdefghijklmnop",
+								expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
+							} as never;
+						},
+						commitHardSignal: async (input: CommitHardSignalInput) => {
+							const { signal: _signal, ...request } = input;
+							commitRequests.push(request);
+							if (permitCreations === 0) permitCreations++;
+							if (commitLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return hardSignalPermit(base.binding, input);
+						},
+					};
+				},
+			}),
 		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("stopped");
@@ -1409,31 +1643,34 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		let commitLosses = 3;
 		const prepareRequests: Array<Record<string, unknown>> = [];
 		const commitRequests: Array<Record<string, unknown>> = [];
-		const createClient = () => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				recordGracefulControl: async (input: GracefulControlInput) => input.outcome === "timeout"
-					? { result: "hard_signal_decision_pending", signalPermitted: true } as never
-					: { result: "shutdown_started" } as never,
-				prepareHardSignal: async (input: PrepareHardSignalInput) => {
-					const { signal: _signal, ...request } = input;
-					prepareRequests.push(request);
-					return {
-						result: "prepared",
-						authorizationId: "authorization_commit_crash_abcdefghij",
-						expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
-					} as never;
-				},
-				commitHardSignal: async (input: CommitHardSignalInput) => {
-					const { signal: _signal, ...request } = input;
-					commitRequests.push(request);
-					if (commitLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-					return hardSignalPermit(base.binding, input);
-				},
-			};
-		} });
+		const createClient = () => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					recordGracefulControl: async (input: GracefulControlInput) =>
+						input.outcome === "timeout"
+							? ({ result: "hard_signal_decision_pending", signalPermitted: true } as never)
+							: ({ result: "shutdown_started" } as never),
+					prepareHardSignal: async (input: PrepareHardSignalInput) => {
+						const { signal: _signal, ...request } = input;
+						prepareRequests.push(request);
+						return {
+							result: "prepared",
+							authorizationId: "authorization_commit_crash_abcdefghij",
+							expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
+						} as never;
+					},
+					commitHardSignal: async (input: CommitHardSignalInput) => {
+						const { signal: _signal, ...request } = input;
+						commitRequests.push(request);
+						if (commitLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+						return hardSignalPermit(base.binding, input);
+					},
+				};
+			},
+		});
 		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 		expect((await first.connect()).kind).toBe("ready");
 		expect((await first.stop({ consumerClosed: true })).kind).toBe("failure");
@@ -1446,7 +1683,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		});
 		first.abort();
 		commitLosses = 0;
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+		});
 		expect((await recovered.connect()).kind).toBe("ready");
 		expect((await recovered.stop({ consumerClosed: true })).kind).toBe("stopped");
 		expect(commitRequests).toHaveLength(4);
@@ -1464,32 +1705,36 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				const base = boundClient(bindingFor(current.pid, current.launchId), []);
-				return {
-					...base,
-					recordGracefulControl: async input => input.outcome === "timeout"
-						? { result: "hard_signal_decision_pending", signalPermitted: true } as never
-						: { result: "shutdown_started" } as never,
-					prepareHardSignal: async () => ({
-						result: "prepared",
-						authorizationId: "authorization_committed_expired_abcde",
-						expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
-					}) as never,
-					commitHardSignal: async (input: CommitHardSignalInput) => hardSignalPermit(base.binding, input, 0),
-					recordHardSignalOutcome: async input => {
-						const { signal: _signal, ...request } = input;
-						outcomeRequests.push(request);
-						return { result: "signal_sent" } as never;
-					},
-					rollbackDrain: async input => {
-						const { signal: _signal, ...request } = input;
-						rollbackRequests.push(request);
-						return { result: "rolled_back" } as never;
-					},
-				};
-			} }),
+			createClient: () => ({
+				handshake: async () => {
+					const current = process.current();
+					const base = boundClient(bindingFor(current.pid, current.launchId), []);
+					return {
+						...base,
+						recordGracefulControl: async input =>
+							input.outcome === "timeout"
+								? ({ result: "hard_signal_decision_pending", signalPermitted: true } as never)
+								: ({ result: "shutdown_started" } as never),
+						prepareHardSignal: async () =>
+							({
+								result: "prepared",
+								authorizationId: "authorization_committed_expired_abcde",
+								expiresAtUnix: Math.floor(Date.now() / 1_000) + 30,
+							}) as never,
+						commitHardSignal: async (input: CommitHardSignalInput) => hardSignalPermit(base.binding, input, 0),
+						recordHardSignalOutcome: async input => {
+							const { signal: _signal, ...request } = input;
+							outcomeRequests.push(request);
+							return { result: "signal_sent" } as never;
+						},
+						rollbackDrain: async input => {
+							const { signal: _signal, ...request } = input;
+							rollbackRequests.push(request);
+							return { result: "rolled_back" } as never;
+						},
+					};
+				},
+			}),
 		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("failure");
@@ -1522,182 +1767,244 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				const base = boundClient(bindingFor(current.pid, current.launchId), []);
-				return {
-					...base,
-					recordGracefulControl: async input => input.outcome === "timeout"
-						? { result: "hard_signal_decision_pending", signalPermitted: true } as never
-						: { result: "shutdown_started" } as never,
-					prepareHardSignal: async input => {
-						const { signal: _signal, ...request } = input;
-						prepareRequests.push(request);
-						if (prepareLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						throw expired;
-					},
-					rollbackDrain: async input => {
-						const { signal: _signal, ...request } = input;
-						rollbackRequests.push(request);
-						if (rollbackLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
-						return { result: "rolled_back" } as never;
-					},
-				};
-			} }),
-		});
-		expect((await supervisor.connect()).kind).toBe("ready");
-		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("ready");
-		expect(prepareRequests).toHaveLength(3);
-		expect(prepareRequests.every(request => JSON.stringify(request) === JSON.stringify(prepareRequests[0]))).toBe(true);
-		expect(rollbackRequests).toHaveLength(3);
-		expect(rollbackRequests.every(request => JSON.stringify(request) === JSON.stringify(rollbackRequests[0]))).toBe(true);
-		expect(process.events).not.toContain("hard-control");
-	});
-
-	test.each([
-		["hard-signal-pending", "ready", true],
-		["hard-signal-commit-pending", "failure", false],
-	] as const)("handles rotated-owner %s recovery without replay or signaling", async (phase, expectedKind, rollbackPermitted) => {
-		const store = await temporaryStore();
-		const process = processHarness();
-		const endpoint = "http://127.0.0.1:7777";
-		const first = new LifecycleSupervisor(resolved("local-owned"), {
-			store,
-			process: process.adapter,
-			createClient: clientFactory(process, []),
-		});
-		expect((await first.connect()).kind).toBe("ready");
-		const originalRecord = await store.readCurrent(endpoint);
-		if (!originalRecord) throw new Error("authority record missing");
-		let attempt = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
-			endpoint,
-			originalRecord,
-			"stop",
-			"rotated_control_request_abcdefghijklmnopqrstu",
-			{
-				registrationId: "rotated_registration_abcdefghijklmnopqrstuv",
-				registrationGeneration: 1,
-				clientInstanceId: "rotated_client_abcdefghijklmnopqrstuvwxyz",
-				registrationCredential: "rotated_requester_credential_abcdefghijklmnop",
-				admissionEpoch: 7,
-			},
-		));
-		attempt = await store.withExclusiveLock(endpoint, () => store.markControlAttemptDraining(endpoint, attempt, 2));
-		attempt = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, attempt, "graceful-accepted"));
-		await store.withExclusiveLock(endpoint, async () => {
-			attempt = await store.advanceControlAttempt(endpoint, attempt, "hard-signal-pending");
-		});
-		if (phase === "hard-signal-commit-pending") {
-			attempt = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, attempt, phase));
-		}
-		first.abort();
-
-		const calls: string[] = [];
-		const prepareRequests: Array<Record<string, unknown>> = [];
-		const rollbackRequests: Array<Record<string, unknown>> = [];
-		const ownerExpired = new LifecycleE4ClientError({
-			kind: "owner-expired",
-			status: 410,
-			code: "owner_expired",
-			correlation: {},
-			body: "[redacted]",
-		});
-		const authorizationExpired = new LifecycleE4ClientError({
-			kind: "hard-signal-authorization-expired",
-			status: 410,
-			code: "hard_signal_authorization_expired",
-			correlation: {},
-			body: "[redacted]",
-		});
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), {
-			store,
-			process: process.adapter,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				const base = boundClient(bindingFor(current.pid, current.launchId), calls);
-				return {
-					...base,
-					renewOwner: async input => {
-						calls.push(`renew-owner:${input.ownerGeneration}`);
-						if (input.ownerGeneration === 1) throw ownerExpired;
-						return { result: "renewed", ownerGeneration: 2 } as never;
-					},
-					acquireOwner: async input => {
-						calls.push(`acquire-owner:${input.expectedOwnerGeneration}`);
-						return { result: "acquired", ownerGeneration: 2 } as never;
-					},
-					beginControlDrain: async () => {
-						throw new Error("durable hard-signal recovery must not begin another drain");
-					},
-					recordGracefulControl: async () => {
-						throw new Error("durable hard-signal recovery must not repeat graceful control");
-					},
-					prepareHardSignal: async input => {
-						const { signal: _signal, ...request } = input;
-						prepareRequests.push(request);
-						throw authorizationExpired;
-					},
-					rollbackDrain: async input => {
-						const { signal: _signal, ...request } = input;
-						rollbackRequests.push(request);
-						return { result: "rolled_back" } as never;
-					},
-				};
-			} }),
-		});
-		expect((await recovered.connect()).kind).toBe("ready");
-		expect((await recovered.stop({ consumerClosed: true })).kind).toBe(expectedKind);
-		expect(prepareRequests).toEqual([]);
-		expect(rollbackRequests).toEqual(rollbackPermitted
-			? [expect.objectContaining({ ownerGeneration: 2, drainGeneration: 2 })]
-			: []);
-		expect(calls).toContain("acquire-owner:1");
-		expect(process.events).not.toContain("hard-control");
-		const rotatedRecord = await store.readCurrent(endpoint);
-		if (!rotatedRecord) throw new Error("rotated authority record missing");
-		expect(await store.readControlAttempt(endpoint, rotatedRecord)).toEqual(rollbackPermitted ? null : attempt);
-	});
-
-	test.each([
-		["control-request echo mismatch", new LifecycleE4ClientError({ kind: "protocol", code: "drain_control_request_echo_mismatch", correlation: {}, body: "[redacted]" }), "incompatible_engine"],
-		["control-request binding conflict", new LifecycleE4ClientError({ kind: "drain-conflict", status: 409, code: "control_request_conflict", correlation: {}, body: "[redacted]" }), "drain_denied"],
-		["control-request capacity exhaustion", new LifecycleE4ClientError({ kind: "drain-conflict", status: 409, code: "control_request_capacity_exceeded", correlation: {}, body: "[redacted]" }), "drain_denied"],
-	] as const)("fails closed on typed %s without replay, signal, or request identifier exposure", async (_label, failure, reason) => {
-		const store = await temporaryStore();
-		const process = processHarness();
-		const calls: string[] = [];
-		let requestId = "";
-		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
-			store,
-			process: process.adapter,
 			createClient: () => ({
 				handshake: async () => {
 					const current = process.current();
+					const base = boundClient(bindingFor(current.pid, current.launchId), []);
 					return {
-						...boundClient(bindingFor(current.pid, current.launchId), calls),
-						beginControlDrain: async input => {
-							requestId = input.controlRequestId;
-							calls.push("begin-drain");
-							throw failure;
+						...base,
+						recordGracefulControl: async input =>
+							input.outcome === "timeout"
+								? ({ result: "hard_signal_decision_pending", signalPermitted: true } as never)
+								: ({ result: "shutdown_started" } as never),
+						prepareHardSignal: async input => {
+							const { signal: _signal, ...request } = input;
+							prepareRequests.push(request);
+							if (prepareLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							throw expired;
+						},
+						rollbackDrain: async input => {
+							const { signal: _signal, ...request } = input;
+							rollbackRequests.push(request);
+							if (rollbackLosses-- > 0) throw new LifecycleE4ClientError({ kind: "timeout" });
+							return { result: "rolled_back" } as never;
 						},
 					};
 				},
 			}),
 		});
 		expect((await supervisor.connect()).kind).toBe("ready");
-		const result = await supervisor.stop({ consumerClosed: true });
-		expect(result.state.reason).toBe(reason);
-		expect(calls.filter(call => call === "begin-drain")).toHaveLength(1);
-		expect(process.events).toEqual([]);
-		expect(JSON.stringify(result)).not.toContain(requestId);
+		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("ready");
+		expect(prepareRequests).toHaveLength(3);
+		expect(prepareRequests.every(request => JSON.stringify(request) === JSON.stringify(prepareRequests[0]))).toBe(
+			true,
+		);
+		expect(rollbackRequests).toHaveLength(3);
+		expect(rollbackRequests.every(request => JSON.stringify(request) === JSON.stringify(rollbackRequests[0]))).toBe(
+			true,
+		);
+		expect(process.events).not.toContain("hard-control");
 	});
+
+	test.each([
+		["hard-signal-pending", "ready", true],
+		["hard-signal-commit-pending", "failure", false],
+	] as const)(
+		"handles rotated-owner %s recovery without replay or signaling",
+		async (phase, expectedKind, rollbackPermitted) => {
+			const store = await temporaryStore();
+			const process = processHarness();
+			const endpoint = "http://127.0.0.1:7777";
+			const first = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient: clientFactory(process, []),
+			});
+			expect((await first.connect()).kind).toBe("ready");
+			const originalRecord = await store.readCurrent(endpoint);
+			if (!originalRecord) throw new Error("authority record missing");
+			let attempt = await store.withExclusiveLock(endpoint, () =>
+				store.prepareControlAttempt(
+					endpoint,
+					originalRecord,
+					"stop",
+					"rotated_control_request_abcdefghijklmnopqrstu",
+					{
+						registrationId: "rotated_registration_abcdefghijklmnopqrstuv",
+						registrationGeneration: 1,
+						clientInstanceId: "rotated_client_abcdefghijklmnopqrstuvwxyz",
+						registrationCredential: "rotated_requester_credential_abcdefghijklmnop",
+						admissionEpoch: 7,
+					},
+				),
+			);
+			attempt = await store.withExclusiveLock(endpoint, () =>
+				store.markControlAttemptDraining(endpoint, attempt, 2),
+			);
+			attempt = await store.withExclusiveLock(endpoint, () =>
+				store.advanceControlAttempt(endpoint, attempt, "graceful-accepted"),
+			);
+			await store.withExclusiveLock(endpoint, async () => {
+				attempt = await store.advanceControlAttempt(endpoint, attempt, "hard-signal-pending");
+			});
+			if (phase === "hard-signal-commit-pending") {
+				attempt = await store.withExclusiveLock(endpoint, () =>
+					store.advanceControlAttempt(endpoint, attempt, phase),
+				);
+			}
+			first.abort();
+
+			const calls: string[] = [];
+			const prepareRequests: Array<Record<string, unknown>> = [];
+			const rollbackRequests: Array<Record<string, unknown>> = [];
+			const ownerExpired = new LifecycleE4ClientError({
+				kind: "owner-expired",
+				status: 410,
+				code: "owner_expired",
+				correlation: {},
+				body: "[redacted]",
+			});
+			const authorizationExpired = new LifecycleE4ClientError({
+				kind: "hard-signal-authorization-expired",
+				status: 410,
+				code: "hard_signal_authorization_expired",
+				correlation: {},
+				body: "[redacted]",
+			});
+			const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient: () => ({
+					handshake: async () => {
+						const current = process.current();
+						const base = boundClient(bindingFor(current.pid, current.launchId), calls);
+						return {
+							...base,
+							renewOwner: async input => {
+								calls.push(`renew-owner:${input.ownerGeneration}`);
+								if (input.ownerGeneration === 1) throw ownerExpired;
+								return { result: "renewed", ownerGeneration: 2 } as never;
+							},
+							acquireOwner: async input => {
+								calls.push(`acquire-owner:${input.expectedOwnerGeneration}`);
+								return { result: "acquired", ownerGeneration: 2 } as never;
+							},
+							beginControlDrain: async () => {
+								throw new Error("durable hard-signal recovery must not begin another drain");
+							},
+							recordGracefulControl: async () => {
+								throw new Error("durable hard-signal recovery must not repeat graceful control");
+							},
+							prepareHardSignal: async input => {
+								const { signal: _signal, ...request } = input;
+								prepareRequests.push(request);
+								throw authorizationExpired;
+							},
+							rollbackDrain: async input => {
+								const { signal: _signal, ...request } = input;
+								rollbackRequests.push(request);
+								return { result: "rolled_back" } as never;
+							},
+						};
+					},
+				}),
+			});
+			expect((await recovered.connect()).kind).toBe("ready");
+			expect((await recovered.stop({ consumerClosed: true })).kind).toBe(expectedKind);
+			expect(prepareRequests).toEqual([]);
+			expect(rollbackRequests).toEqual(
+				rollbackPermitted ? [expect.objectContaining({ ownerGeneration: 2, drainGeneration: 2 })] : [],
+			);
+			expect(calls).toContain("acquire-owner:1");
+			expect(process.events).not.toContain("hard-control");
+			const rotatedRecord = await store.readCurrent(endpoint);
+			if (!rotatedRecord) throw new Error("rotated authority record missing");
+			expect(await store.readControlAttempt(endpoint, rotatedRecord)).toEqual(rollbackPermitted ? null : attempt);
+		},
+	);
+
+	test.each([
+		[
+			"control-request echo mismatch",
+			new LifecycleE4ClientError({
+				kind: "protocol",
+				code: "drain_control_request_echo_mismatch",
+				correlation: {},
+				body: "[redacted]",
+			}),
+			"incompatible_engine",
+		],
+		[
+			"control-request binding conflict",
+			new LifecycleE4ClientError({
+				kind: "drain-conflict",
+				status: 409,
+				code: "control_request_conflict",
+				correlation: {},
+				body: "[redacted]",
+			}),
+			"drain_denied",
+		],
+		[
+			"control-request capacity exhaustion",
+			new LifecycleE4ClientError({
+				kind: "drain-conflict",
+				status: 409,
+				code: "control_request_capacity_exceeded",
+				correlation: {},
+				body: "[redacted]",
+			}),
+			"drain_denied",
+		],
+	] as const)(
+		"fails closed on typed %s without replay, signal, or request identifier exposure",
+		async (_label, failure, reason) => {
+			const store = await temporaryStore();
+			const process = processHarness();
+			const calls: string[] = [];
+			let requestId = "";
+			const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient: () => ({
+					handshake: async () => {
+						const current = process.current();
+						return {
+							...boundClient(bindingFor(current.pid, current.launchId), calls),
+							beginControlDrain: async input => {
+								requestId = input.controlRequestId;
+								calls.push("begin-drain");
+								throw failure;
+							},
+						};
+					},
+				}),
+			});
+			expect((await supervisor.connect()).kind).toBe("ready");
+			const result = await supervisor.stop({ consumerClosed: true });
+			expect(result.state.reason).toBe(reason);
+			expect(calls.filter(call => call === "begin-drain")).toHaveLength(1);
+			expect(process.events).toEqual([]);
+			expect(JSON.stringify(result)).not.toContain(requestId);
+		},
+	);
 
 	test("drain denial detaches requester and never signals or rolls back", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
 		const calls: string[] = [];
-		const drainConflict = new LifecycleE4ClientError({ kind: "drain-conflict", status: 409, code: "clients_live", correlation: {}, body: "[redacted]" });
-		const supervisor = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient: clientFactory(process, calls, { drainError: drainConflict }) });
+		const drainConflict = new LifecycleE4ClientError({
+			kind: "drain-conflict",
+			status: 409,
+			code: "clients_live",
+			correlation: {},
+			body: "[redacted]",
+		});
+		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls, { drainError: drainConflict }),
+		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).state.reason).toBe("drain_denied");
 		expect(calls).toContain("detach-client");
@@ -1730,7 +2037,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const process = processHarness();
 		process.waitResults.push(false, false);
 		const calls: string[] = [];
-		const supervisor = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient: clientFactory(process, calls) });
+		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls),
+		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).state.reason).toBe("drain_recovery_failed");
 		expect(calls).toContain("hard-signal:sent");
@@ -1787,7 +2098,9 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect((await connecting).state.reason).toBe("request_aborted");
 		expect(process.spawnCount()).toBe(0);
 		expect([...bootstrap].every(byte => byte === 0)).toBe(true);
-		const next = await store.withExclusiveLock("http://127.0.0.1:7777", () => store.claimStart("http://127.0.0.1:7777"));
+		const next = await store.withExclusiveLock("http://127.0.0.1:7777", () =>
+			store.claimStart("http://127.0.0.1:7777"),
+		);
 		expect(next.kind).toBe("claimed");
 	});
 
@@ -1812,9 +2125,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		handshake.reject(new LifecycleE4ClientError({ kind: "caller-abort" }));
 		const result = await connecting;
 		expect(result.state.reason).toBe("request_aborted");
-		expect([...process.bootstrapBuffers[0] as Buffer].every(byte => byte === 0)).toBe(true);
+		expect([...(process.bootstrapBuffers[0] as Buffer)].every(byte => byte === 0)).toBe(true);
 		expect(process.events).not.toContain("hard-control");
-		const preserved = await store.withExclusiveLock("http://127.0.0.1:7777", () => store.claimStart("http://127.0.0.1:7777"));
+		const preserved = await store.withExclusiveLock("http://127.0.0.1:7777", () =>
+			store.claimStart("http://127.0.0.1:7777"),
+		);
 		expect(preserved.kind).toBe("recoverable");
 		if (preserved.kind === "recoverable") {
 			expect(preserved.claim).toMatchObject({
@@ -1850,10 +2165,11 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const result = await connecting;
 		expect(result.state).toMatchObject({ name: "request-aborted", reason: "request_aborted" });
 		expect(process.events).not.toContain("hard-control");
-		const claim = await store.withExclusiveLock("http://127.0.0.1:7777", () => store.claimStart("http://127.0.0.1:7777"));
+		const claim = await store.withExclusiveLock("http://127.0.0.1:7777", () =>
+			store.claimStart("http://127.0.0.1:7777"),
+		);
 		expect(claim.kind).toBe("occupied");
 	});
-
 
 	test("abort during authority commit preserves the adoptable authenticated record without hard control", async () => {
 		let supervisor: LifecycleSupervisor | undefined;
@@ -1966,7 +2282,9 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("stopped");
 		expect(calls).toContain("hard-signal:sent");
-		expect(process.events.indexOf("authorize-hard-signal")).toBeLessThan(process.events.indexOf("commit-hard-signal"));
+		expect(process.events.indexOf("authorize-hard-signal")).toBeLessThan(
+			process.events.indexOf("commit-hard-signal"),
+		);
 		expect(process.events.indexOf("commit-hard-signal")).toBeLessThan(process.events.indexOf("hard-control"));
 		expect(process.events.indexOf("hard-control")).toBeLessThan(process.events.indexOf("record-hard-signal-outcome"));
 	});
@@ -2024,11 +2342,12 @@ describe("LifecycleSupervisor local-owned authority", () => {
 					const client = boundClient(bindingFor(current.pid, current.launchId), calls);
 					return {
 						...client,
-						prepareHardSignal: async () => ({
-							result: "prepared",
-							authorizationId: "authorization_expired_abcdefghijklmnop",
-							expiresAtUnix: 1,
-						}) as never,
+						prepareHardSignal: async () =>
+							({
+								result: "prepared",
+								authorizationId: "authorization_expired_abcdefghijklmnop",
+								expiresAtUnix: 1,
+							}) as never,
 						commitHardSignal: async () => {
 							calls.push("commit-expired");
 							throw new LifecycleE4ClientError({
@@ -2051,12 +2370,15 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect(process.events).not.toContain("hard-control");
 	});
 
-
 	test("post-drain exceptions roll back before any hard signal", async () => {
 		const store = await temporaryStore();
 		const process = processHarness();
 		const calls: string[] = [];
-		const supervisor = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient: clientFactory(process, calls, { gracefulError: new Error("record failed") }) });
+		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient: clientFactory(process, calls, { gracefulError: new Error("record failed") }),
+		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("failure");
 		expect(calls).toContain("rollback");
@@ -2087,23 +2409,25 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: blockedProcess,
-			createClient: () => ({ handshake: async () => {
-				const current = process.current();
-				const base = boundClient(bindingFor(current.pid, current.launchId), calls);
-				return {
-					...base,
-					rollbackDrain: async () => {
-						calls.push("rollback-after-abort");
-						quiesced.resolve();
-						return { result: "rolled_back" } as never;
-					},
-					recordHardSignalOutcome: async input => {
-						calls.push(`hard-signal-after-abort:${input.outcome}`);
-						quiesced.resolve();
-						return { result: input.outcome === "process_exited" ? "process_exited" : "signal_sent" } as never;
-					},
-				};
-			} }),
+			createClient: () => ({
+				handshake: async () => {
+					const current = process.current();
+					const base = boundClient(bindingFor(current.pid, current.launchId), calls);
+					return {
+						...base,
+						rollbackDrain: async () => {
+							calls.push("rollback-after-abort");
+							quiesced.resolve();
+							return { result: "rolled_back" } as never;
+						},
+						recordHardSignalOutcome: async input => {
+							calls.push(`hard-signal-after-abort:${input.outcome}`);
+							quiesced.resolve();
+							return { result: input.outcome === "process_exited" ? "process_exited" : "signal_sent" } as never;
+						},
+					};
+				},
+			}),
 		});
 		expect((await supervisor.connect()).kind).toBe("ready");
 		const signals = new TestLifecycleSignalTarget();
@@ -2114,20 +2438,19 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			signalSettleTimeoutMs: 1,
 		});
 		let settledExecution: Awaited<typeof executionPromise> | undefined;
-		void executionPromise.then(execution => { settledExecution = execution; });
+		void executionPromise.then(execution => {
+			settledExecution = execution;
+		});
 		await waitEntered.promise;
 		signals.emit("SIGINT");
 		await Bun.sleep(10);
 		const settledBeforeRelease = settledExecution !== undefined;
 		expect(process.events).not.toContain("hard-control");
 		releaseWait.resolve(false);
-		const execution = settledExecution ?? await executionPromise;
+		const execution = settledExecution ?? (await executionPromise);
 		expect(settledBeforeRelease).toBe(true);
 		expect(execution).toMatchObject({ result: { state: { reason: "request_aborted" } }, signal: "SIGINT" });
-		expect(await Promise.race([
-			quiesced.promise.then(() => true),
-			Bun.sleep(50).then(() => false),
-		])).toBe(true);
+		expect(await Promise.race([quiesced.promise.then(() => true), Bun.sleep(50).then(() => false)])).toBe(true);
 		expect(process.events).not.toContain("hard-control");
 		expect(calls).toContain("rollback-after-abort");
 		expect(calls.some(call => call.startsWith("hard-signal-after-abort:"))).toBe(false);
@@ -2149,7 +2472,16 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect({ connected, calls, events: process.events, states }).toMatchObject({ connected: { kind: "ready" } });
 		states.length = 0;
 		expect((await supervisor.restart({ consumerClosed: true })).kind).toBe("ready");
-		expect(states).toEqual(["draining", "restart-stopping", "restart-starting", "connecting", "handshaking", "acquiring-owner", "registering-client", "ready"]);
+		expect(states).toEqual([
+			"draining",
+			"restart-stopping",
+			"restart-starting",
+			"connecting",
+			"handshaking",
+			"acquiring-owner",
+			"registering-client",
+			"ready",
+		]);
 		expect((await store.readCurrent("http://127.0.0.1:7777"))?.ownerExitPolicy).toBe("detached");
 	});
 
@@ -2162,7 +2494,12 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			clock: { now: () => 1_000, sleep: async milliseconds => { sleeps.push(milliseconds); } },
+			clock: {
+				now: () => 1_000,
+				sleep: async milliseconds => {
+					sleeps.push(milliseconds);
+				},
+			},
 			endpointAbsent: async () => true,
 			createClient: clientFactory(process, []),
 			stateChanged: state => {
@@ -2192,7 +2529,12 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const adopter = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			clock: { now: () => 1_000, sleep: async milliseconds => { sleeps.push(milliseconds); } },
+			clock: {
+				now: () => 1_000,
+				sleep: async milliseconds => {
+					sleeps.push(milliseconds);
+				},
+			},
 			endpointAbsent: async () => true,
 			createClient: clientFactory(process, []),
 			stateChanged: state => {
@@ -2201,10 +2543,7 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		});
 		expect((await adopter.connect()).kind).toBe("ready");
 		process.crash(adoptedPid);
-		expect(await Promise.race([
-			restarted.promise.then(() => true),
-			Bun.sleep(50).then(() => false),
-		])).toBe(true);
+		expect(await Promise.race([restarted.promise.then(() => true), Bun.sleep(50).then(() => false)])).toBe(true);
 		expect(sleeps).toContain(250);
 		expect(process.spawnCount()).toBe(2);
 		expect((await store.readCurrent(endpoint))?.pid).toBe(process.current().pid);
@@ -2264,11 +2603,20 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
 			store,
 			process: process.adapter,
-			createClient: () => { clients++; throw new Error("absent stop must not construct a client"); },
+			createClient: () => {
+				clients++;
+				throw new Error("absent stop must not construct a client");
+			},
 		});
 		expect((await supervisor.stop({ consumerClosed: true })).kind).toBe("stopped");
-		expect({ clients, spawns: process.spawnCount(), events: process.events }).toEqual({ clients: 0, spawns: 0, events: [] });
-		const claim = await store.withExclusiveLock("http://127.0.0.1:7777", () => store.claimStart("http://127.0.0.1:7777"));
+		expect({ clients, spawns: process.spawnCount(), events: process.events }).toEqual({
+			clients: 0,
+			spawns: 0,
+			events: [],
+		});
+		const claim = await store.withExclusiveLock("http://127.0.0.1:7777", () =>
+			store.claimStart("http://127.0.0.1:7777"),
+		);
 		expect(claim.kind).toBe("claimed");
 	});
 
@@ -2301,18 +2649,28 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			await store.withExclusiveLock(endpoint, async () => {
 				const claimed = await store.claimStart(endpoint);
 				if (claimed.kind !== "claimed") throw new Error("expected claimed start");
-				const prepared = await store.prepareStartClaim(endpoint, claimed.claim.token, {
-					launchId,
-					executableSha256: configuredArtifact.executableSha256,
-					executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
-					argvSha256: configuredArtifact.argvSha256,
-					engineArtifactSha256: configuredArtifact.engineSourceSha256,
-					servedBackendCommit: configuredArtifact.servedBackendCommit,
-				}, { bootstrapCredential: bootstrap, ownerCredential: owner });
+				const prepared = await store.prepareStartClaim(
+					endpoint,
+					claimed.claim.token,
+					{
+						launchId,
+						executableSha256: configuredArtifact.executableSha256,
+						executablePathSha256: executablePathSha256(configuredArtifact.executablePath),
+						argvSha256: configuredArtifact.argvSha256,
+						engineArtifactSha256: configuredArtifact.engineSourceSha256,
+						servedBackendCommit: configuredArtifact.servedBackendCommit,
+					},
+					{ bootstrapCredential: bootstrap, ownerCredential: owner },
+				);
 				const transfer = Buffer.from(bootstrap);
-				const spawned = await process.adapter.spawnVerified(configuredArtifact, launchId, transfer, async (pid, startToken) => {
-					await store.bindStartClaimProcess(endpoint, prepared.token, pid, startToken);
-				});
+				const spawned = await process.adapter.spawnVerified(
+					configuredArtifact,
+					launchId,
+					transfer,
+					async (pid, startToken) => {
+						await store.bindStartClaimProcess(endpoint, prepared.token, pid, startToken);
+					},
+				);
 				if ("kind" in spawned) throw new Error("expected bound spawned process");
 				enginePid = spawned.pid;
 				process.crash(spawned.pid);
@@ -2323,9 +2681,14 @@ describe("LifecycleSupervisor local-owned authority", () => {
 				store,
 				process: process.adapter,
 				endpointAbsent: async () => absent,
-				createClient: absent === true
-					? clientFactory(process, [])
-					: () => ({ handshake: async () => { throw new Error("endpoint absence override owns the probe"); } }),
+				createClient:
+					absent === true
+						? clientFactory(process, [])
+						: () => ({
+								handshake: async () => {
+									throw new Error("endpoint absence override owns the probe");
+								},
+							}),
 			});
 			const result = await supervisor.connect();
 			if (absent === true) {
@@ -2333,7 +2696,10 @@ describe("LifecycleSupervisor local-owned authority", () => {
 				expect(process.spawnCount()).toBe(2);
 				expect((await store.readCurrent(endpoint))?.pid).not.toBe(enginePid);
 			} else {
-				expect({ absent, result }).toMatchObject({ absent, result: { state: { name: "recovery-needed", reason: "endpoint_unreachable" } } });
+				expect({ absent, result }).toMatchObject({
+					absent,
+					result: { state: { name: "recovery-needed", reason: "endpoint_unreachable" } },
+				});
 				expect(process.spawnCount()).toBe(1);
 				const preserved = await store.withExclusiveLock(endpoint, () => store.claimStart(endpoint));
 				expect(preserved.kind).toBe("dead-bound");
@@ -2348,134 +2714,180 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		let acquired = false;
 		let acquireCalls = 0;
 		let renewCalls = 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				acquireOwner: async input => {
-					acquireCalls++;
-					if (!("bootstrapCredential" in input)) throw new Error("bootstrap CAS expected only once");
-					acquired = true;
-					throw new LifecycleE4ClientError({ kind: "timeout" });
-				},
-				renewOwner: async input => {
-					renewCalls++;
-					if (!acquired || input.ownerGeneration !== 1) throw new Error("generation-one owner was not acquired");
-					return { result: "renewed", ownerGeneration: 1 } as never;
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					acquireOwner: async input => {
+						acquireCalls++;
+						if (!("bootstrapCredential" in input)) throw new Error("bootstrap CAS expected only once");
+						acquired = true;
+						throw new LifecycleE4ClientError({ kind: "timeout" });
+					},
+					renewOwner: async input => {
+						renewCalls++;
+						if (!acquired || input.ownerGeneration !== 1)
+							throw new Error("generation-one owner was not acquired");
+						return { result: "renewed", ownerGeneration: 1 } as never;
+					},
+				};
+			},
+		});
 		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 		expect((await first.connect()).state.reason).toBe("endpoint_unreachable");
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+		});
 		expect((await recovered.connect()).kind).toBe("ready");
-		expect({ acquireCalls, renewCalls, spawns: process.spawnCount() }).toEqual({ acquireCalls: 1, renewCalls: 1, spawns: 1 });
+		expect({ acquireCalls, renewCalls, spawns: process.spawnCount() }).toEqual({
+			acquireCalls: 1,
+			renewCalls: 1,
+			spawns: 1,
+		});
 	});
 	test.each([
-		["generation-one bootstrap acquire was never delivered", new LifecycleE4ClientError({ kind: "timeout" }), "endpoint_unreachable"],
-		["generation-one bootstrap acquire was aborted before send", new LifecycleE4ClientError({ kind: "caller-abort" }), "request_aborted"],
-	] as const)("%s falls back only after definitive lower-generation proof", async (_name, initialFailure, firstReason) => {
-		const process = processHarness();
-		const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
-		const ownerExpired = () => new LifecycleE4ClientError({
-			kind: "owner-expired",
-			status: 410,
-			code: "owner_expired",
-			correlation: {},
-			body: "[redacted]",
-		});
-		const requests: Array<{ readonly expected: number; readonly bootstrap: boolean }> = [];
-		let firstAcquire = true;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			return {
-				...boundClient(bindingFor(current.pid, current.launchId), []),
-				renewOwner: async () => { throw ownerExpired(); },
-				acquireOwner: async input => {
-					requests.push({
-						expected: input.expectedOwnerGeneration,
-						bootstrap: "bootstrapCredential" in input,
-					});
-					if (firstAcquire) {
-						firstAcquire = false;
-						throw initialFailure;
-					}
-					if (input.expectedOwnerGeneration === 1) throw ownerExpired();
-					return { result: "acquired", ownerGeneration: 1 } as never;
+		[
+			"generation-one bootstrap acquire was never delivered",
+			new LifecycleE4ClientError({ kind: "timeout" }),
+			"endpoint_unreachable",
+		],
+		[
+			"generation-one bootstrap acquire was aborted before send",
+			new LifecycleE4ClientError({ kind: "caller-abort" }),
+			"request_aborted",
+		],
+	] as const)(
+		"%s falls back only after definitive lower-generation proof",
+		async (_name, initialFailure, firstReason) => {
+			const process = processHarness();
+			const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
+			const ownerExpired = () =>
+				new LifecycleE4ClientError({
+					kind: "owner-expired",
+					status: 410,
+					code: "owner_expired",
+					correlation: {},
+					body: "[redacted]",
+				});
+			const requests: Array<{ readonly expected: number; readonly bootstrap: boolean }> = [];
+			let firstAcquire = true;
+			const createClient = (): LifecycleE4Client => ({
+				handshake: async () => {
+					const current = process.current();
+					return {
+						...boundClient(bindingFor(current.pid, current.launchId), []),
+						renewOwner: async () => {
+							throw ownerExpired();
+						},
+						acquireOwner: async input => {
+							requests.push({
+								expected: input.expectedOwnerGeneration,
+								bootstrap: "bootstrapCredential" in input,
+							});
+							if (firstAcquire) {
+								firstAcquire = false;
+								throw initialFailure;
+							}
+							if (input.expectedOwnerGeneration === 1) throw ownerExpired();
+							return { result: "acquired", ownerGeneration: 1 } as never;
+						},
+					};
 				},
-			};
-		} });
-		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
-		expect((await first.connect()).state.reason).toBe(firstReason);
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
-		expect(await recovered.connect()).toMatchObject({ kind: "ready" });
-		expect(requests).toEqual([
-			{ expected: 0, bootstrap: true },
-			{ expected: 1, bootstrap: false },
-			{ expected: 0, bootstrap: true },
-		]);
-		expect(process.spawnCount()).toBe(1);
-	});
-
+			});
+			const first = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
+			expect((await first.connect()).state.reason).toBe(firstReason);
+			const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
+			expect(await recovered.connect()).toMatchObject({ kind: "ready" });
+			expect(requests).toEqual([
+				{ expected: 0, bootstrap: true },
+				{ expected: 1, bootstrap: false },
+				{ expected: 0, bootstrap: true },
+			]);
+			expect(process.spawnCount()).toBe(1);
+		},
+	);
 
 	test("response loss then owner expiry advances the durable attempt and recovers generation two without bootstrap replay", async () => {
 		const process = processHarness();
 		const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
 		const endpoint = "http://127.0.0.1:7777";
-		const ownerExpired = (): LifecycleE4ClientError => new LifecycleE4ClientError({
-			kind: "owner-expired",
-			status: 410,
-			code: "owner_expired",
-			correlation: {},
-			body: "[redacted]",
-		});
+		const ownerExpired = (): LifecycleE4ClientError =>
+			new LifecycleE4ClientError({
+				kind: "owner-expired",
+				status: 410,
+				code: "owner_expired",
+				correlation: {},
+				body: "[redacted]",
+			});
 		let remoteGeneration = 0;
 		let bootstrapRequests = 0;
 		let credentialRequests = 0;
 		const renewGenerations: number[] = [];
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				renewOwner: async input => {
-					renewGenerations.push(input.ownerGeneration);
-					if (input.ownerGeneration === 1) throw ownerExpired();
-					if (input.ownerGeneration !== remoteGeneration) throw new Error("unexpected recovered owner generation");
-					return { result: "renewed", ownerGeneration: remoteGeneration } as never;
-				},
-				acquireOwner: async input => {
-					if (input.expectedOwnerGeneration === 0) {
-						expect("bootstrapCredential" in input).toBe(true);
-						bootstrapRequests++;
-					} else {
-						expect("bootstrapCredential" in input).toBe(false);
-						credentialRequests++;
-					}
-					if (input.expectedOwnerGeneration !== remoteGeneration) {
-						throw new LifecycleE4ClientError({
-							kind: "owner-conflict",
-							status: 409,
-							code: "owner_generation_conflict",
-							correlation: {},
-							body: "[redacted]",
-						});
-					}
-					remoteGeneration++;
-					throw new LifecycleE4ClientError({ kind: "timeout" });
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					renewOwner: async input => {
+						renewGenerations.push(input.ownerGeneration);
+						if (input.ownerGeneration === 1) throw ownerExpired();
+						if (input.ownerGeneration !== remoteGeneration)
+							throw new Error("unexpected recovered owner generation");
+						return { result: "renewed", ownerGeneration: remoteGeneration } as never;
+					},
+					acquireOwner: async input => {
+						if (input.expectedOwnerGeneration === 0) {
+							expect("bootstrapCredential" in input).toBe(true);
+							bootstrapRequests++;
+						} else {
+							expect("bootstrapCredential" in input).toBe(false);
+							credentialRequests++;
+						}
+						if (input.expectedOwnerGeneration !== remoteGeneration) {
+							throw new LifecycleE4ClientError({
+								kind: "owner-conflict",
+								status: 409,
+								code: "owner_generation_conflict",
+								correlation: {},
+								body: "[redacted]",
+							});
+						}
+						remoteGeneration++;
+						throw new LifecycleE4ClientError({ kind: "timeout" });
+					},
+				};
+			},
+		});
 		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 		expect((await first.connect()).state.reason).toBe("endpoint_unreachable");
 		const afterFirst = await store.withExclusiveLock(endpoint, () => store.claimStart(endpoint));
 		expect(afterFirst).toMatchObject({ kind: "recoverable", claim: { ownerAttemptGeneration: 1 } });
-		const second = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		const second = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+		});
 		expect((await second.connect()).state.reason).toBe("endpoint_unreachable");
 		const afterSecond = await store.withExclusiveLock(endpoint, () => store.claimStart(endpoint));
 		expect(afterSecond).toMatchObject({ kind: "recoverable", claim: { ownerAttemptGeneration: 2 } });
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+		});
 		expect(await recovered.connect()).toMatchObject({ kind: "ready" });
 		expect({
 			remoteGeneration,
@@ -2499,68 +2911,85 @@ describe("LifecycleSupervisor local-owned authority", () => {
 			const process = processHarness();
 			const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
 			const endpoint = "http://127.0.0.1:7777";
-			const ownerFailure = (kind: "owner-expired" | "owner-conflict") => new LifecycleE4ClientError({
-				kind,
-				status: kind === "owner-expired" ? 410 : 409,
-				code: kind === "owner-expired" ? "owner_expired" : "owner_generation_conflict",
-				correlation: {},
-				body: "[redacted]",
-			});
+			const ownerFailure = (kind: "owner-expired" | "owner-conflict") =>
+				new LifecycleE4ClientError({
+					kind,
+					status: kind === "owner-expired" ? 410 : 409,
+					code: kind === "owner-expired" ? "owner_expired" : "owner_generation_conflict",
+					correlation: {},
+					body: "[redacted]",
+				});
 			const acquireRequests: Array<{ readonly expected: number; readonly bootstrap: boolean }> = [];
 			const renewRequests: number[] = [];
 			let acquireCall = 0;
 			let renewOneCalls = 0;
 			let delayedPriorWon = false;
-			const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-				const current = process.current();
-				return {
-					...boundClient(bindingFor(current.pid, current.launchId), []),
-					renewOwner: async input => {
-						renewRequests.push(input.ownerGeneration);
-						if (input.ownerGeneration === 2) {
-							if (delayedPriorWon) return { result: "renewed", ownerGeneration: 2 } as never;
-							throw ownerFailure("owner-conflict");
-						}
-						renewOneCalls++;
-						if (renewOneCalls === 1 || outcome !== "predecessor-live") throw ownerFailure("owner-expired");
-						return { result: "renewed", ownerGeneration: 1 } as never;
-					},
-					acquireOwner: async input => {
-						acquireCall++;
-						acquireRequests.push({
-							expected: input.expectedOwnerGeneration,
-							bootstrap: "bootstrapCredential" in input,
-						});
-						if (acquireCall <= 2) throw new LifecycleE4ClientError({ kind: "timeout" });
-						if (input.expectedOwnerGeneration !== 1 || "bootstrapCredential" in input) {
-							throw new Error("unexpected predecessor acquire");
-						}
-						if (outcome === "delayed-prior-wins") {
-							delayedPriorWon = true;
-							throw ownerFailure("owner-conflict");
-						}
-						return { result: "acquired", ownerGeneration: 2 } as never;
-					},
-				};
-			} });
-			const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+			const createClient = (): LifecycleE4Client => ({
+				handshake: async () => {
+					const current = process.current();
+					return {
+						...boundClient(bindingFor(current.pid, current.launchId), []),
+						renewOwner: async input => {
+							renewRequests.push(input.ownerGeneration);
+							if (input.ownerGeneration === 2) {
+								if (delayedPriorWon) return { result: "renewed", ownerGeneration: 2 } as never;
+								throw ownerFailure("owner-conflict");
+							}
+							renewOneCalls++;
+							if (renewOneCalls === 1 || outcome !== "predecessor-live") throw ownerFailure("owner-expired");
+							return { result: "renewed", ownerGeneration: 1 } as never;
+						},
+						acquireOwner: async input => {
+							acquireCall++;
+							acquireRequests.push({
+								expected: input.expectedOwnerGeneration,
+								bootstrap: "bootstrapCredential" in input,
+							});
+							if (acquireCall <= 2) throw new LifecycleE4ClientError({ kind: "timeout" });
+							if (input.expectedOwnerGeneration !== 1 || "bootstrapCredential" in input) {
+								throw new Error("unexpected predecessor acquire");
+							}
+							if (outcome === "delayed-prior-wins") {
+								delayedPriorWon = true;
+								throw ownerFailure("owner-conflict");
+							}
+							return { result: "acquired", ownerGeneration: 2 } as never;
+						},
+					};
+				},
+			});
+			const first = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
 			expect((await first.connect()).state.reason).toBe("endpoint_unreachable");
-			const second = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+			const second = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
 			expect((await second.connect()).state.reason).toBe("endpoint_unreachable");
 			const pending = await store.withExclusiveLock(endpoint, () => store.claimStart(endpoint));
 			expect(pending).toMatchObject({ kind: "recoverable", claim: { ownerAttemptGeneration: 2 } });
-			const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+			const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient,
+			});
 			expect(await recovered.connect()).toMatchObject({ kind: "ready" });
-			expect(acquireRequests).toEqual(outcome === "predecessor-live"
-				? [
-					{ expected: 0, bootstrap: true },
-					{ expected: 1, bootstrap: false },
-				]
-				: [
-					{ expected: 0, bootstrap: true },
-					{ expected: 1, bootstrap: false },
-					{ expected: 1, bootstrap: false },
-				]);
+			expect(acquireRequests).toEqual(
+				outcome === "predecessor-live"
+					? [
+							{ expected: 0, bootstrap: true },
+							{ expected: 1, bootstrap: false },
+						]
+					: [
+							{ expected: 0, bootstrap: true },
+							{ expected: 1, bootstrap: false },
+							{ expected: 1, bootstrap: false },
+						],
+			);
 			expect(renewRequests).toEqual(outcome === "delayed-prior-wins" ? [1, 2, 1, 2] : [1, 2, 1]);
 			expect(process.spawnCount()).toBe(1);
 			expect(process.events).not.toContain("hard-control");
@@ -2568,48 +2997,53 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		},
 	);
 
-
 	test("generation conflict after a lost owner request fails closed without bootstrap replay", async () => {
 		const process = processHarness();
 		const store = await temporaryStore({ isLockOwnerAlive: async owner => owner.pid === process.current().pid });
 		let firstRequestLost = true;
 		let bootstrapRequests = 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				renewOwner: async () => {
-					throw new LifecycleE4ClientError({
-						kind: "owner-expired",
-						status: 410,
-						code: "owner_expired",
-						correlation: {},
-						body: "[redacted]",
-					});
-				},
-				acquireOwner: async input => {
-					if (input.expectedOwnerGeneration === 0) {
-						bootstrapRequests++;
-						if (firstRequestLost) {
-							firstRequestLost = false;
-							throw new LifecycleE4ClientError({ kind: "timeout" });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					renewOwner: async () => {
+						throw new LifecycleE4ClientError({
+							kind: "owner-expired",
+							status: 410,
+							code: "owner_expired",
+							correlation: {},
+							body: "[redacted]",
+						});
+					},
+					acquireOwner: async input => {
+						if (input.expectedOwnerGeneration === 0) {
+							bootstrapRequests++;
+							if (firstRequestLost) {
+								firstRequestLost = false;
+								throw new LifecycleE4ClientError({ kind: "timeout" });
+							}
+							return { result: "acquired", ownerGeneration: 1 } as never;
 						}
-						return { result: "acquired", ownerGeneration: 1 } as never;
-					}
-					throw new LifecycleE4ClientError({
-						kind: "owner-conflict",
-						status: 409,
-						code: "owner_generation_conflict",
-						correlation: {},
-						body: "[redacted]",
-					});
-				},
-			};
-		} });
+						throw new LifecycleE4ClientError({
+							kind: "owner-conflict",
+							status: 409,
+							code: "owner_generation_conflict",
+							correlation: {},
+							body: "[redacted]",
+						});
+					},
+				};
+			},
+		});
 		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 		expect((await first.connect()).state.reason).toBe("endpoint_unreachable");
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+		});
 		const result = await recovered.connect();
 		expect(result).toMatchObject({ kind: "failure", state: { reason: "ownership_conflict" } });
 		expect({ bootstrapRequests, spawns: process.spawnCount() }).toEqual({ bootstrapRequests: 1, spawns: 1 });
@@ -2630,29 +3064,40 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		let acquired = false;
 		let acquireCalls = 0;
 		let renewCalls = 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				acquireOwner: async input => {
-					acquireCalls++;
-					if (!("bootstrapCredential" in input)) throw new Error("unexpected credential-only initial acquire");
-					acquired = true;
-					return { result: "acquired", ownerGeneration: 1 } as never;
-				},
-				renewOwner: async input => {
-					renewCalls++;
-					if (!acquired || input.ownerGeneration !== 1) throw new Error("generation-one owner was not acquired");
-					return { result: "renewed", ownerGeneration: 1 } as never;
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					acquireOwner: async input => {
+						acquireCalls++;
+						if (!("bootstrapCredential" in input)) throw new Error("unexpected credential-only initial acquire");
+						acquired = true;
+						return { result: "acquired", ownerGeneration: 1 } as never;
+					},
+					renewOwner: async input => {
+						renewCalls++;
+						if (!acquired || input.ownerGeneration !== 1)
+							throw new Error("generation-one owner was not acquired");
+						return { result: "renewed", ownerGeneration: 1 } as never;
+					},
+				};
+			},
+		});
 		const first = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
 		expect((await first.connect()).kind).toBe("failure");
-		const recovered = new LifecycleSupervisor(resolved("local-owned"), { store, process: process.adapter, createClient });
+		const recovered = new LifecycleSupervisor(resolved("local-owned"), {
+			store,
+			process: process.adapter,
+			createClient,
+		});
 		expect((await recovered.connect()).kind).toBe("ready");
-		expect({ acquireCalls, renewCalls, spawns: process.spawnCount() }).toEqual({ acquireCalls: 1, renewCalls: 1, spawns: 1 });
+		expect({ acquireCalls, renewCalls, spawns: process.spawnCount() }).toEqual({
+			acquireCalls: 1,
+			renewCalls: 1,
+			spawns: 1,
+		});
 	});
 
 	test("detached close failure cancels lease renewal before detach and never renews afterward", async () => {
@@ -2665,21 +3110,30 @@ describe("LifecycleSupervisor local-owned authority", () => {
 				active = true;
 				return { unref: () => undefined, handler } as unknown as NodeJS.Timeout;
 			}) as typeof setInterval;
-			globalThis.clearInterval = (() => { active = false; }) as typeof clearInterval;
+			globalThis.clearInterval = (() => {
+				active = false;
+			}) as typeof clearInterval;
 			const store = await temporaryStore();
 			const process = processHarness();
 			const supervisor = new LifecycleSupervisor(resolved("local-owned", "detached"), {
 				store,
 				process: process.adapter,
-				createClient: () => ({ handshake: async () => {
-					const current = process.current();
-					const base = boundClient(bindingFor(current.pid, current.launchId), []);
-					return {
-						...base,
-						renewClient: async () => { renewals++; return { result: "renewed" } as never; },
-						detachClient: async () => { throw new LifecycleE4ClientError({ kind: "timeout" }); },
-					};
-				} }),
+				createClient: () => ({
+					handshake: async () => {
+						const current = process.current();
+						const base = boundClient(bindingFor(current.pid, current.launchId), []);
+						return {
+							...base,
+							renewClient: async () => {
+								renewals++;
+								return { result: "renewed" } as never;
+							},
+							detachClient: async () => {
+								throw new LifecycleE4ClientError({ kind: "timeout" });
+							},
+						};
+					},
+				}),
 			});
 			expect((await supervisor.connect()).kind).toBe("ready");
 			expect(active).toBe(true);
@@ -2696,23 +3150,25 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		const process = processHarness();
 		const detachInputs: Parameters<BoundLifecycleE4Client["detachClient"]>[0][] = [];
 		const releaseInputs: Parameters<BoundLifecycleE4Client["releaseOwner"]>[0][] = [];
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				detachClient: async input => {
-					detachInputs.push(input);
-					if (detachInputs.length === 1) throw new LifecycleE4ClientError({ kind: "timeout" });
-					return { result: "already_detached" } as never;
-				},
-				releaseOwner: async input => {
-					releaseInputs.push(input);
-					if (releaseInputs.length === 1) throw new LifecycleE4ClientError({ kind: "timeout" });
-					return { result: "already_released" } as never;
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					detachClient: async input => {
+						detachInputs.push(input);
+						if (detachInputs.length === 1) throw new LifecycleE4ClientError({ kind: "timeout" });
+						return { result: "already_detached" } as never;
+					},
+					releaseOwner: async input => {
+						releaseInputs.push(input);
+						if (releaseInputs.length === 1) throw new LifecycleE4ClientError({ kind: "timeout" });
+						return { result: "already_released" } as never;
+					},
+				};
+			},
+		});
 		const supervisor = new LifecycleSupervisor(resolved("local-owned", "detached"), {
 			store,
 			process: process.adapter,
@@ -2721,9 +3177,13 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		expect((await supervisor.connect()).kind).toBe("ready");
 		expect((await supervisor.close({ consumerClosed: true })).kind).toBe("detached");
 		expect(detachInputs).toHaveLength(2);
-		expect(detachInputs.map(({ signal: _, ...input }) => input)[1]).toEqual(detachInputs.map(({ signal: _, ...input }) => input)[0]);
+		expect(detachInputs.map(({ signal: _, ...input }) => input)[1]).toEqual(
+			detachInputs.map(({ signal: _, ...input }) => input)[0],
+		);
 		expect(releaseInputs).toHaveLength(2);
-		expect(releaseInputs.map(({ signal: _, ...input }) => input)[1]).toEqual(releaseInputs.map(({ signal: _, ...input }) => input)[0]);
+		expect(releaseInputs.map(({ signal: _, ...input }) => input)[1]).toEqual(
+			releaseInputs.map(({ signal: _, ...input }) => input)[0],
+		);
 	});
 
 	test("replays detach-pending on a later detached close after ambiguous retries exhaust", async () => {
@@ -2732,26 +3192,28 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		let detachCalls = 0;
 		let releaseCalls = 0;
 		let renewCalls = 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				renewOwner: async () => {
-					renewCalls++;
-					return { result: "renewed", ownerGeneration: 1 } as never;
-				},
-				detachClient: async () => {
-					detachCalls++;
-					if (detachCalls <= 3) throw new LifecycleE4ClientError({ kind: "timeout" });
-					return { result: "already_detached" } as never;
-				},
-				releaseOwner: async () => {
-					releaseCalls++;
-					return { result: "released" } as never;
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					renewOwner: async () => {
+						renewCalls++;
+						return { result: "renewed", ownerGeneration: 1 } as never;
+					},
+					detachClient: async () => {
+						detachCalls++;
+						if (detachCalls <= 3) throw new LifecycleE4ClientError({ kind: "timeout" });
+						return { result: "already_detached" } as never;
+					},
+					releaseOwner: async () => {
+						releaseCalls++;
+						return { result: "released" } as never;
+					},
+				};
+			},
+		});
 		const supervisor = new LifecycleSupervisor(resolved("local-owned", "detached"), {
 			store,
 			process: process.adapter,
@@ -2770,28 +3232,30 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		let detachCalls = 0;
 		let releaseCalls = 0;
 		let renewCalls = 0;
-		const createClient = (): LifecycleE4Client => ({ handshake: async () => {
-			const current = process.current();
-			const base = boundClient(bindingFor(current.pid, current.launchId), []);
-			return {
-				...base,
-				renewOwner: async () => {
-					renewCalls++;
-					if (renewCalls > 1) throw new Error("release replay must not renew a possibly released owner");
-					return { result: "renewed", ownerGeneration: 1 } as never;
-				},
-				detachClient: async () => {
-					detachCalls++;
-					if (detachCalls > 1) throw new Error("release-pending replay must not detach again");
-					return { result: "detached" } as never;
-				},
-				releaseOwner: async () => {
-					releaseCalls++;
-					if (releaseCalls <= 3) throw new LifecycleE4ClientError({ kind: "timeout" });
-					return { result: "already_released" } as never;
-				},
-			};
-		} });
+		const createClient = (): LifecycleE4Client => ({
+			handshake: async () => {
+				const current = process.current();
+				const base = boundClient(bindingFor(current.pid, current.launchId), []);
+				return {
+					...base,
+					renewOwner: async () => {
+						renewCalls++;
+						if (renewCalls > 1) throw new Error("release replay must not renew a possibly released owner");
+						return { result: "renewed", ownerGeneration: 1 } as never;
+					},
+					detachClient: async () => {
+						detachCalls++;
+						if (detachCalls > 1) throw new Error("release-pending replay must not detach again");
+						return { result: "detached" } as never;
+					},
+					releaseOwner: async () => {
+						releaseCalls++;
+						if (releaseCalls <= 3) throw new LifecycleE4ClientError({ kind: "timeout" });
+						return { result: "already_released" } as never;
+					},
+				};
+			},
+		});
 		const supervisor = new LifecycleSupervisor(resolved("local-owned", "detached"), {
 			store,
 			process: process.adapter,
@@ -2873,7 +3337,13 @@ describe("lifecycle dispatch coordination", () => {
 				},
 			}),
 			"status",
-			{ closeReady: true, restoreTerminal: () => { restores++; }, signalTarget: signals },
+			{
+				closeReady: true,
+				restoreTerminal: () => {
+					restores++;
+				},
+				signalTarget: signals,
+			},
 		);
 
 		expect(execution).toEqual({ result: coordinatorObserved });
@@ -2892,14 +3362,22 @@ describe("lifecycle dispatch coordination", () => {
 					events.push("connect");
 					return connecting.promise;
 				},
-				abort: () => { events.push("abort"); },
+				abort: () => {
+					events.push("abort");
+				},
 				close: async () => {
 					events.push("close");
 					return coordinatorDetached;
 				},
 			}),
 			"connect",
-			{ closeReady: true, restoreTerminal: () => { events.push("restore"); }, signalTarget: signals },
+			{
+				closeReady: true,
+				restoreTerminal: () => {
+					events.push("restore");
+				},
+				signalTarget: signals,
+			},
 		);
 
 		signals.emit("SIGINT");
@@ -2919,11 +3397,15 @@ describe("lifecycle dispatch coordination", () => {
 		const executionPromise = dispatchLifecycleAction(
 			lifecycleController({
 				connect: () => never.promise,
-				abort: () => { events.push("abort"); },
+				abort: () => {
+					events.push("abort");
+				},
 			}),
 			"connect",
 			{
-				restoreTerminal: () => { events.push("restore"); },
+				restoreTerminal: () => {
+					events.push("restore");
+				},
 				signalTarget: signals,
 				signalSettleTimeoutMs: 1,
 			},
@@ -2944,7 +3426,9 @@ describe("lifecycle dispatch coordination", () => {
 		const executionPromise = dispatchLifecycleAction(
 			lifecycleController({
 				connect: async () => coordinatorReady,
-				abort: () => { events.push("abort"); },
+				abort: () => {
+					events.push("abort");
+				},
 				close: () => {
 					events.push("close");
 					closeEntered.resolve();
@@ -2952,7 +3436,13 @@ describe("lifecycle dispatch coordination", () => {
 				},
 			}),
 			"connect",
-			{ closeReady: true, restoreTerminal: () => { events.push("restore"); }, signalTarget: signals },
+			{
+				closeReady: true,
+				restoreTerminal: () => {
+					events.push("restore");
+				},
+				signalTarget: signals,
+			},
 		);
 
 		await closeEntered.promise;
@@ -2987,11 +3477,22 @@ describe("lifecycle dispatch coordination", () => {
 	test("restores and removes listeners when an action throws", async () => {
 		const signals = new TestLifecycleSignalTarget();
 		let restores = 0;
-		await expect(dispatchLifecycleAction(
-			lifecycleController({ connect: async () => { throw new Error("synthetic secret"); } }),
-			"connect",
-			{ restoreTerminal: () => { restores++; }, signalTarget: signals },
-		)).rejects.toThrow("synthetic secret");
+		await expect(
+			dispatchLifecycleAction(
+				lifecycleController({
+					connect: async () => {
+						throw new Error("synthetic secret");
+					},
+				}),
+				"connect",
+				{
+					restoreTerminal: () => {
+						restores++;
+					},
+					signalTarget: signals,
+				},
+			),
+		).rejects.toThrow("synthetic secret");
 		expect(restores).toBe(1);
 		expect(signals.listenerCount()).toBe(0);
 	});
@@ -3006,7 +3507,16 @@ interface LifecycleCliResult {
 async function runLifecycleCli(args: readonly string[], home: string): Promise<LifecycleCliResult> {
 	const child = Bun.spawn([process.execPath, "src/cli.ts", ...args], {
 		cwd: join(import.meta.dir, "../../.."),
-		env: { ...Bun.env, HOME: home, BREADBOARD_ENGINE_MODE: undefined },
+		env: {
+			...Bun.env,
+			HOME: home,
+			BREADBOARD_ENGINE_MODE: undefined,
+			ANTHROPIC_API_KEY: "test-key",
+			PI_CODING_AGENT_DIR: undefined,
+			OMP_PROFILE: undefined,
+			PI_PROFILE: undefined,
+			PI_CONFIG_DIR: undefined,
+		},
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -3033,14 +3543,7 @@ describe("CLI lifecycle composition boundary", () => {
 			["launch", "--engine-mode", "local-owned", "--help"],
 			["config", "--help"],
 			["update", "--help"],
-			[
-				"launch",
-				"--engine-mode",
-				"local-owned",
-				"--export",
-				"test/fixtures/before-compaction.jsonl",
-				exportPath,
-			],
+			["launch", "--engine-mode", "local-owned", "--export", "test/fixtures/before-compaction.jsonl", exportPath],
 		] as const;
 
 		const results = [];
@@ -3055,8 +3558,15 @@ describe("CLI lifecycle composition boundary", () => {
 	test("engine-off RPC remains native and keeps stdout byte-clean JSONL", async () => {
 		const home = await temporaryLifecycleHome();
 		const result = await runLifecycleCli(["launch", "--engine-mode", "off", "--mode", "rpc"], home);
-		expect(result.exitCode).toBe(0);
-		const frames = result.stdout.trim().split("\n").map(line => JSON.parse(line) as { type?: string });
+		if (result.exitCode !== 0) {
+			throw new Error(
+				`engine-off RPC exited ${result.exitCode}; stdout=${JSON.stringify(result.stdout)} stderr=${JSON.stringify(result.stderr)}`,
+			);
+		}
+		const frames = result.stdout
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { type?: string });
 		expect(frames[0]).toEqual({ type: "ready" });
 		expect(frames.every(frame => typeof frame.type === "string")).toBe(true);
 		expect(`${result.stdout}${result.stderr}`).not.toContain("BreadBoard engine:");

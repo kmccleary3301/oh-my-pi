@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { type Component, TUI } from "@oh-my-pi/pi-tui";
@@ -33,6 +33,24 @@ function plainBuffer(term: VirtualTerminal): string[] {
 
 describe("ToolExecutionComponent write repaint seam", () => {
 	const components: ToolExecutionComponent[] = [];
+	const multiplexerEnvKeys = [
+		"TMUX",
+		"STY",
+		"ZELLIJ",
+		"CMUX_WORKSPACE_ID",
+		"CMUX_SURFACE_ID",
+		"CMUX_REMOTE_TRANSPORT",
+		"TERM",
+	] as const;
+	let originalMultiplexerEnv: Partial<Record<(typeof multiplexerEnvKeys)[number], string | undefined>>;
+
+	beforeEach(() => {
+		originalMultiplexerEnv = {};
+		for (const key of multiplexerEnvKeys) {
+			originalMultiplexerEnv[key] = Bun.env[key];
+			delete Bun.env[key];
+		}
+	});
 
 	beforeAll(async () => {
 		await initTheme();
@@ -41,6 +59,11 @@ describe("ToolExecutionComponent write repaint seam", () => {
 	afterEach(() => {
 		for (const component of components) component.stopAnimation();
 		components.length = 0;
+		for (const key of multiplexerEnvKeys) {
+			const original = originalMultiplexerEnv[key];
+			if (original === undefined) delete Bun.env[key];
+			else Bun.env[key] = original;
+		}
 		vi.restoreAllMocks();
 	});
 

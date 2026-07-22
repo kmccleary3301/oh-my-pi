@@ -8,8 +8,9 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { CanonicalE4ClientError, createCanonicalE4Client, projectFailureEvidence } from "@breadboard/sdk";
-import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
+import { createCanonicalE4Client } from "@breadboard/sdk";
+import { type AgentEvent, EventLoopKeepalive, type StreamFn } from "@oh-my-pi/pi-agent-core";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryExists,
@@ -25,7 +26,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CanonicalE4SessionPort } from "./breadboard/canonical-e4-session-port";
-import { validateBreadboardInteractiveLaunch } from "./breadboard/interactive-launch-policy";
+import { E4AgentStreamBridge } from "./breadboard/e4-agent-stream";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
 import { LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
@@ -68,8 +69,8 @@ import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
-import { BreadboardInteractiveSessionMode } from "./modes/breadboard-interactive-session-mode";
-import type { InteractiveMode } from "./modes/interactive-mode";
+import type { MCPManager } from "./mcp";
+import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
@@ -89,10 +90,13 @@ import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
+import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
+import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
+import type { LspStartupServerInfo } from "./tools";
 import {
 	getChangelogPath,
 	parseChangelog,
@@ -102,6 +106,7 @@ import {
 	writeLastChangelogVersion,
 } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
+import { withTimeoutSignal } from "./utils/fetch-timeout";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
@@ -114,6 +119,21 @@ type RunRpcMode = (
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
+}
+
+async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
+	if (!settings.get("startup.checkUpdate")) return;
+	try {
+		const response = await fetch("https://registry.npmjs.org/@oh-my-pi/pi-coding-agent/latest", {
+			signal: withTimeoutSignal(5_000),
+		});
+		if (!response.ok) return undefined;
+		const data = (await response.json()) as { version?: string };
+		const latestVersion = data.version;
+		return latestVersion && Bun.semver.order(latestVersion, currentVersion) > 0 ? latestVersion : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 // Todo settings are caller-controlled in protocol modes. Do not host-default them:
@@ -386,6 +406,92 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		applyExtensionFlags(nextSession.extensionRunner, args.rawArgs);
 		return nextSession;
 	};
+}
+
+async function runInteractiveMode(
+	session: AgentSession,
+	version: string,
+	changelogMarkdown: string | undefined,
+	notifs: (InteractiveModeNotify | null)[],
+	versionCheckPromise: Promise<string | undefined>,
+	initialMessages: string[],
+	setExtensionUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
+	lspServers: LspStartupServerInfo[] | undefined,
+	mcpManager: MCPManager | undefined,
+	resuming: boolean,
+	forceSetupWizard: boolean,
+	showStartupSplash: boolean,
+	eventBus?: EventBus,
+	initialMessage?: string,
+	initialImages?: ImageContent[],
+	joinLink?: string,
+): Promise<void> {
+	const mode = new InteractiveMode(
+		session,
+		version,
+		changelogMarkdown,
+		setExtensionUIContext,
+		lspServers,
+		mcpManager,
+		eventBus,
+	);
+	const storedSetupVersion = settings.get("setupVersion");
+	const setupWizard =
+		forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
+			? await import("./modes/setup-wizard")
+			: undefined;
+	const setupScenes = setupWizard
+		? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
+				resuming,
+				isTTY: process.stdin.isTTY && process.stdout.isTTY,
+				setupWizardEnabled: settings.get("startup.setupWizard"),
+				force: forceSetupWizard,
+			})
+		: [];
+	const playStartupSplash = showStartupSplash && setupScenes.length === 0;
+
+	await mode.init({
+		suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
+		clearInitialTerminalHistory: true,
+	});
+	if (setupWizard && playStartupSplash) await setupWizard.runStartupSplash(mode);
+	if (setupWizard && setupScenes.length > 0) await setupWizard.runSetupWizard(mode, setupScenes);
+
+	versionCheckPromise
+		.then(newVersion => {
+			if (settings.get("startup.checkUpdate") && newVersion) mode.showNewVersionNotification(newVersion);
+		})
+		.catch(() => {});
+
+	mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: true });
+	for (const notify of notifs) {
+		if (!notify) continue;
+		if (notify.kind === "warn") mode.showWarning(notify.message);
+		else if (notify.kind === "error") mode.showError(notify.message);
+		else mode.showStatus(notify.message);
+	}
+
+	if (joinLink !== undefined) await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
+	if (initialMessage !== undefined) {
+		try {
+			using _keepalive = new EventLoopKeepalive();
+			await session.prompt(initialMessage, { images: initialImages });
+		} catch (error: unknown) {
+			mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		}
+	}
+	for (const message of initialMessages) {
+		try {
+			using _keepalive = new EventLoopKeepalive();
+			await session.prompt(message);
+		} catch (error: unknown) {
+			mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		}
+	}
+	while (true) {
+		const input = await mode.getUserInput();
+		await submitInteractiveInput(mode, session, input);
+	}
 }
 
 type SessionPromptResult = "accepted" | "declined" | "unavailable";
@@ -925,95 +1031,82 @@ interface RunRootCommandDependencies {
 	discoverAuthStorage?: typeof discoverAuthStorage;
 	selectSession?: typeof selectSession;
 	runAcpMode?: RunAcpMode;
+	runInteractiveMode?: typeof runInteractiveMode;
+	prepareBreadboardRuntime?: typeof prepareBreadboardRuntime;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
-async function runBreadboardInteractiveProduct(parsed: Args, pipedInput: string | undefined): Promise<void> {
-	const validation = validateBreadboardInteractiveLaunch(parsed, pipedInput);
-	if (validation !== null) {
-		process.stderr.write(`BreadBoard launch error: ${validation}\n`);
-		process.exitCode = 1;
-		return;
-	}
-
-	try {
-		const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
-		const config = resolveBreadboardRunConfig({
-			cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
-			selectedConfig,
-			workspacePath: getProjectDir(),
-		});
-		const target =
-			typeof parsed.resume === "string"
-				? { kind: "attach" as const, sessionId: parsed.resume }
-				: config.sessionConfigPath === undefined
-					? null
-					: { kind: "create" as const, request: { configPath: config.sessionConfigPath } };
-		if (target === null) {
-			process.stderr.write(
-				"BreadBoard configuration error [invalid_session_config/sessionConfigPath]: a selected sessionConfigPath is required to create a session.\n",
-			);
-			process.exitCode = 1;
-			return;
-		}
-
-		// The governed interactive path owns lifecycle composition directly.
-		const store =
-			config.mode === "local-owned"
-				? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
-				: undefined;
-		const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
-		const connected = await supervisor.connect();
-		if (connected.kind !== "ready") {
-			process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
-			const closed = await supervisor.close({ consumerClosed: true });
-			if (closed.kind === "failure") {
-				process.exitCode = writeLifecyclePresentation(closed).exitCode || 1;
-			}
-			return;
-		}
-		const sessionMode = new BreadboardInteractiveSessionMode(
-			new CanonicalE4SessionPort(
-				createCanonicalE4Client({
-					baseUrl: connected.handle.binding.endpoint,
-					requestTimeoutMs: config.requestTimeoutMs,
-					fetch: connected.handle.requestFetch,
-				}),
-			),
-			target,
-		);
-		try {
-			await sessionMode.run();
-		} catch (error) {
-			if (error instanceof CanonicalE4ClientError) {
-				const evidence = projectFailureEvidence(error.failure);
-				const code =
-					"code" in evidence.details && evidence.details.code !== null ? `/${evidence.details.code}` : "";
-				const sessionId = sessionMode.controller?.runtime.sessionId;
-				const recovery = sessionId === undefined ? "" : ` Session: ${sessionId}.`;
-				process.stderr.write(`BreadBoard session failed [${evidence.details.kind}${code}].${recovery}\n`);
-			} else {
-				process.stderr.write("BreadBoard session failed unexpectedly.\n");
-			}
-			process.exitCode = 1;
-		} finally {
-			const closed = await supervisor.close({ consumerClosed: true });
-			if (closed.kind === "failure") {
-				process.exitCode = writeLifecyclePresentation(closed).exitCode || 1;
-			}
-		}
-	} catch (error) {
-		const message =
-			error instanceof BreadboardRunConfigError
-				? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
-				: "BreadBoard lifecycle failed unexpectedly.";
-		process.stderr.write(`${message}\n`);
-		process.exitCode = 1;
-	}
+interface PreparedBreadboardRuntime {
+	readonly stream: StreamFn;
+	readonly sessionId: string;
+	close(): Promise<void>;
 }
 
+async function prepareBreadboardRuntime(
+	parsed: Args,
+	emitAgentEvent: (event: AgentEvent) => void,
+): Promise<PreparedBreadboardRuntime | null> {
+	const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "config.yml"));
+	const config = resolveBreadboardRunConfig({
+		cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
+		selectedConfig,
+		workspacePath: getProjectDir(),
+	});
+	const target =
+		typeof parsed.resume === "string"
+			? { kind: "attach" as const, sessionId: parsed.resume }
+			: config.sessionConfigPath === undefined
+				? null
+				: { kind: "create" as const, request: { configPath: config.sessionConfigPath } };
+	if (target === null) {
+		throw new BreadboardRunConfigError(
+			"invalid_session_config",
+			"sessionConfigPath",
+			"a selected sessionConfigPath is required to create a session",
+		);
+	}
+
+	const store =
+		config.mode === "local-owned"
+			? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
+			: undefined;
+	const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
+	const connected = await supervisor.connect();
+	if (connected.kind !== "ready") {
+		process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
+		const closed = await supervisor.close({ consumerClosed: true });
+		if (closed.kind === "failure") process.exitCode = writeLifecyclePresentation(closed).exitCode || 1;
+		return null;
+	}
+
+	const opened = await new CanonicalE4SessionPort(
+		createCanonicalE4Client({
+			baseUrl: connected.handle.binding.endpoint,
+			requestTimeoutMs: config.requestTimeoutMs,
+			fetch: connected.handle.requestFetch,
+		}),
+	).open(target);
+	const snapshot = await opened.snapshot();
+	const bridge = new E4AgentStreamBridge({
+		session: opened,
+		replayHeadSequence: snapshot.headSequence,
+		emitAgentEvent,
+	});
+	let closed = false;
+	let cancelCleanup: (() => void) | undefined;
+	const close = async (): Promise<void> => {
+		if (closed) return;
+		closed = true;
+		cancelCleanup?.();
+		await bridge.close();
+		const outcome = await supervisor.close({ consumerClosed: true });
+		if (outcome.kind === "failure") process.exitCode = writeLifecyclePresentation(outcome).exitCode || 1;
+	};
+	cancelCleanup = postmortem.register("breadboard-runtime", close);
+	return { stream: bridge.stream, sessionId: String(opened.sessionId), close };
+}
 
 export async function runRootCommand(
 	parsed: Args,
@@ -1063,8 +1156,7 @@ export async function runRootCommand(
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
-	const nativeSurface =
-		mode === "rpc" || mode === "rpc-ui" || mode === "acp" ? mode : "print";
+	const nativeSurface = mode === "rpc" || mode === "rpc-ui" || mode === "acp" ? mode : "print";
 	if (!isInteractive) {
 		const nativePolicy = resolveNativeLaunchPolicy(parsedArgs, nativeSurface);
 		if (nativePolicy.kind === "unavailable") {
@@ -1074,12 +1166,6 @@ export async function runRootCommand(
 			stopThemeWatcher();
 			return;
 		}
-	}
-	if (isInteractive) {
-		stopStartupWatchdog();
-		stopThemeWatcher();
-		await runBreadboardInteractiveProduct(parsedArgs, pipedInput);
-		return;
 	}
 
 	let cwd = getProjectDir();
@@ -1315,6 +1401,31 @@ export async function runRootCommand(
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
 
+	let breadboardAgentSession: AgentSession | undefined;
+	if (isInteractive) {
+		try {
+			const prepared = await (deps.prepareBreadboardRuntime ?? prepareBreadboardRuntime)(parsedArgs, event => {
+				breadboardAgentSession?.agent.emitExternalEvent(event);
+			});
+			if (prepared === null) {
+				stopStartupWatchdog();
+				stopThemeWatcher();
+				return;
+			}
+			sessionOptions.mainStreamFn = prepared.stream;
+		} catch (error) {
+			const message =
+				error instanceof BreadboardRunConfigError
+					? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
+					: "BreadBoard lifecycle failed unexpectedly.";
+			process.stderr.write(`${message}\n`);
+			process.exitCode = 1;
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			return;
+		}
+	}
+
 	// OTEL: register global OTLP exporters when an endpoint is configured via
 	// env, then switch on the agent loop's telemetry hooks so traces, run-level
 	// metrics, and structured logs have source events to export. Content capture
@@ -1415,11 +1526,22 @@ export async function runRootCommand(
 			stdinContent: pipedInput,
 		});
 
-		const { session, setToolUIContext, modelFallbackMessage } = await createSession({
+		const showStartupSplash = shouldShowStartupSplash({
+			configured: settingsInstance.get("startup.showSplash"),
+			isInteractive,
+			resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
+			quiet: settingsInstance.get("startup.quiet"),
+			timing: Boolean($env.PI_TIMING),
+			stdinIsTTY: process.stdin.isTTY,
+			stdoutIsTTY: process.stdout.isTTY,
+		});
+
+		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
 			...sessionOptions,
 			eventBus,
 			preloadedExtensions: extensionsResult,
 		});
+		breadboardAgentSession = session;
 
 		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 		// scan, collab mirror, resumed process) has a sessionFile but no in-memory
@@ -1442,7 +1564,10 @@ export async function runRootCommand(
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
 
+		if (modelFallbackMessage) notifs.push({ kind: "warn", message: modelFallbackMessage });
+
 		const modelRegistryError = modelRegistry.getError();
+		if (modelRegistryError) notifs.push({ kind: "error", message: modelRegistryError.message });
 
 		if (!isInteractive && !session.model) {
 			if (modelRegistryError) {
@@ -1464,6 +1589,38 @@ export async function runRootCommand(
 			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 			stopStartupWatchdog();
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
+		} else if (isInteractive) {
+			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
+			const modelScopeNotification = buildModelScopeNotification(
+				scopedModels,
+				settingsInstance.get("startup.quiet"),
+			);
+			if (modelScopeNotification) notifs.push(modelScopeNotification);
+			if ($env.PI_TIMING) {
+				logger.printTimings();
+				if (logger.shouldExitAfterTimings()) process.exit(0);
+			}
+			stopStartupWatchdog();
+			logger.endTiming();
+			await (deps.runInteractiveMode ?? runInteractiveMode)(
+				session,
+				VERSION,
+				changelogMarkdown,
+				notifs,
+				versionCheckPromise,
+				initialArgs.messages,
+				setToolUIContext,
+				lspServers,
+				mcpManager,
+				Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
+				deps.forceSetupWizard === true,
+				showStartupSplash,
+				eventBus,
+				initialMessage,
+				initialImages,
+				parsedArgs.join,
+			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 			stopStartupWatchdog();

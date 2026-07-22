@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
-import { JSONC } from "bun";
+import { extname, isAbsolute, resolve } from "node:path";
+import { JSONC, YAML } from "bun";
 
 export const BREADBOARD_ENGINE_MODES = ["local-owned", "local-external", "remote", "off"] as const;
 export type BreadboardEngineMode = (typeof BREADBOARD_ENGINE_MODES)[number];
@@ -124,13 +124,12 @@ const SELECTED_CONFIG_FIELDS = new Set([
 	"sessionConfigPath",
 ]);
 
-
 function fail(code: RunConfigErrorCode, field: RunConfigField, message: string): never {
 	throw new BreadboardRunConfigError(code, field, message);
 }
 
 function hasOwn(value: object, key: PropertyKey): boolean {
-	return Object.prototype.hasOwnProperty.call(value, key);
+	return Object.hasOwn(value, key);
 }
 
 function pick<T>(
@@ -162,8 +161,18 @@ function normalizeEndpoint(value: unknown): string {
 	} catch {
 		fail("invalid_url", "endpoint", "engine endpoint is not a valid URL");
 	}
-	if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || url.search || url.hash) {
-		fail("invalid_url", "endpoint", "engine endpoint must use HTTP(S) and contain no credentials, query, or fragment");
+	if (
+		(url.protocol !== "http:" && url.protocol !== "https:") ||
+		url.username ||
+		url.password ||
+		url.search ||
+		url.hash
+	) {
+		fail(
+			"invalid_url",
+			"endpoint",
+			"engine endpoint must use HTTP(S) and contain no credentials, query, or fragment",
+		);
 	}
 	if (!url.hostname || (url.pathname.includes("//") && url.pathname !== "/")) {
 		fail("invalid_url", "endpoint", "engine endpoint has an invalid host or path");
@@ -211,7 +220,11 @@ function environmentAuth(environment: Readonly<Record<string, string | undefined
 	const candidate = candidates[0];
 	if (!candidate) return undefined;
 	if (candidate.kind === "process-secret") {
-		if (candidate.value.length < 16 || candidate.value.length > 8_192 || /[\s\u0000-\u001f\u007f]/u.test(candidate.value)) {
+		if (
+			candidate.value.length < 16 ||
+			candidate.value.length > 8_192 ||
+			/[\s\u0000-\u001f\u007f]/u.test(candidate.value)
+		) {
 			fail("invalid_auth", "auth", "process authentication secret is malformed");
 		}
 		return candidate;
@@ -222,13 +235,17 @@ function environmentAuth(environment: Readonly<Record<string, string | undefined
 
 function parseTls(value: unknown): { readonly kind: "system-trust"; readonly spkiPin?: string } | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value !== "object" || value === null || Array.isArray(value)) fail("invalid_tls", "tls", "TLS must be an object");
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		fail("invalid_tls", "tls", "TLS must be an object");
 	const record = value as Record<string, unknown>;
-	if (record.kind !== undefined && record.kind !== "system-trust") fail("invalid_tls", "tls", "remote TLS must use system trust");
+	if (record.kind !== undefined && record.kind !== "system-trust")
+		fail("invalid_tls", "tls", "remote TLS must use system trust");
 	if (record.spkiPin !== undefined && (typeof record.spkiPin !== "string" || !SPKI_PIN.test(record.spkiPin))) {
 		fail("invalid_tls", "tls", "TLS SPKI pin is invalid");
 	}
-	return record.spkiPin === undefined ? { kind: "system-trust" } : { kind: "system-trust", spkiPin: record.spkiPin as string };
+	return record.spkiPin === undefined
+		? { kind: "system-trust" }
+		: { kind: "system-trust", spkiPin: record.spkiPin as string };
 }
 
 function parseTimeout(value: unknown, field: "startupTimeoutMs" | "requestTimeoutMs", fallback: number): number {
@@ -242,7 +259,8 @@ function parseTimeout(value: unknown, field: "startupTimeoutMs" | "requestTimeou
 }
 
 function parseExitPolicy(value: unknown): OwnerExitPolicy {
-	if (value !== "attached" && value !== "detached") fail("invalid_exit_policy", "ownerExitPolicy", "owner exit policy must be attached or detached");
+	if (value !== "attached" && value !== "detached")
+		fail("invalid_exit_policy", "ownerExitPolicy", "owner exit policy must be attached or detached");
 	return value;
 }
 
@@ -252,17 +270,25 @@ export function executablePathSha256(canonicalPath: string): `sha256:${string}` 
 
 function parseArtifact(value: unknown): EngineArtifact | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value !== "object" || value === null || Array.isArray(value)) fail("invalid_artifact", "engineArtifact", "engine artifact must be an object");
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		fail("invalid_artifact", "engineArtifact", "engine artifact must be an object");
 	const record = value as Record<string, unknown>;
-	if (typeof record.executablePath !== "string" || !isAbsolute(record.executablePath) || record.executablePath.includes("\0")) {
+	if (
+		typeof record.executablePath !== "string" ||
+		!isAbsolute(record.executablePath) ||
+		record.executablePath.includes("\0")
+	) {
 		fail("invalid_artifact", "engineArtifact", "engine artifact executable path must be absolute");
 	}
 	if (!Array.isArray(record.argv) || record.argv.some(arg => typeof arg !== "string" || arg.includes("\0"))) {
 		fail("invalid_artifact", "engineArtifact", "engine artifact argv must be an array of strings");
 	}
-	if (typeof record.executableSha256 !== "string" || !SHA256.test(record.executableSha256)) fail("invalid_artifact", "engineArtifact", "engine executable digest is invalid");
-	if (typeof record.engineSourceSha256 !== "string" || !SHA256.test(record.engineSourceSha256)) fail("invalid_artifact", "engineArtifact", "engine source digest is invalid");
-	if (typeof record.servedBackendCommit !== "string" || !COMMIT_ID.test(record.servedBackendCommit)) fail("invalid_artifact", "engineArtifact", "served backend commit is invalid");
+	if (typeof record.executableSha256 !== "string" || !SHA256.test(record.executableSha256))
+		fail("invalid_artifact", "engineArtifact", "engine executable digest is invalid");
+	if (typeof record.engineSourceSha256 !== "string" || !SHA256.test(record.engineSourceSha256))
+		fail("invalid_artifact", "engineArtifact", "engine source digest is invalid");
+	if (typeof record.servedBackendCommit !== "string" || !COMMIT_ID.test(record.servedBackendCommit))
+		fail("invalid_artifact", "engineArtifact", "served backend commit is invalid");
 	let executablePath: string;
 	try {
 		executablePath = realpathSync(record.executablePath);
@@ -270,7 +296,8 @@ function parseArtifact(value: unknown): EngineArtifact | undefined {
 		fail("invalid_artifact", "engineArtifact", "engine artifact executable path cannot be canonicalized");
 	}
 	const argv = Object.freeze([...(record.argv as string[])]);
-	const argvSha256 = `sha256:${createHash("sha256").update("breadboard-engine-argv-v1\0").update(JSON.stringify(argv)).digest("hex")}` as const;
+	const argvSha256 =
+		`sha256:${createHash("sha256").update("breadboard-engine-argv-v1\0").update(JSON.stringify(argv)).digest("hex")}` as const;
 	return Object.freeze({
 		executablePath,
 		argv,
@@ -290,7 +317,8 @@ function environmentArtifact(environment: Readonly<Record<string, string | undef
 		environment.BREADBOARD_ENGINE_BACKEND_COMMIT,
 	];
 	if (fields.every(value => value === undefined)) return undefined;
-	if (fields.some(value => value === undefined)) fail("invalid_artifact", "engineArtifact", "environment engine artifact identity is incomplete");
+	if (fields.some(value => value === undefined))
+		fail("invalid_artifact", "engineArtifact", "environment engine artifact identity is incomplete");
 	let argv: unknown;
 	try {
 		argv = JSON.parse(fields[1] as string);
@@ -320,7 +348,11 @@ function canonicalWorkspace(path: string, canonicalize?: (path: string) => strin
 function parseSessionConfigPath(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || value.length === 0 || value !== value.trim() || value.includes("\0")) {
-		fail("invalid_session_config", "sessionConfigPath", "session config path must be a non-empty path without surrounding whitespace");
+		fail(
+			"invalid_session_config",
+			"sessionConfigPath",
+			"session config path must be a non-empty path without surrounding whitespace",
+		);
 	}
 	return value;
 }
@@ -335,9 +367,11 @@ function freezeConfig(config: BreadboardRunConfig): BreadboardRunConfig {
 export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInput): BreadboardRunConfig {
 	const environment = input.environment ?? process.env;
 	const selected = input.selectedConfig ?? {};
-	if (typeof selected !== "object" || selected === null || Array.isArray(selected)) fail("invalid_selected_config", "mode", "selected config must be an object");
+	if (typeof selected !== "object" || selected === null || Array.isArray(selected))
+		fail("invalid_selected_config", "mode", "selected config must be an object");
 	for (const key of Object.keys(selected)) {
-		if (!SELECTED_CONFIG_FIELDS.has(key)) fail("invalid_selected_config", "mode", "selected BreadBoard configuration contains an unsupported field");
+		if (!SELECTED_CONFIG_FIELDS.has(key))
+			fail("invalid_selected_config", "mode", "selected BreadBoard configuration contains an unsupported field");
 	}
 
 	const sessionConfigPath = parseSessionConfigPath(
@@ -347,56 +381,79 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	const cliMode = input.cli?.engineMode;
 	const envMode = environment.BREADBOARD_ENGINE_MODE;
 	const selectedMode = hasOwn(selected, "engineMode") ? selected.engineMode : undefined;
-	const endpointChoice = pick(input.cli?.engineUrl, environment.BREADBOARD_API_URL, hasOwn(selected, "baseUrl") ? selected.baseUrl : undefined, undefined);
+	const endpointChoice = pick(
+		input.cli?.engineUrl,
+		environment.BREADBOARD_API_URL,
+		hasOwn(selected, "baseUrl") ? selected.baseUrl : undefined,
+		undefined,
+	);
 	const normalizedEndpoint = endpointChoice.value === undefined ? undefined : normalizeEndpoint(endpointChoice.value);
 
 	let modeChoice: { value: BreadboardEngineMode; source: ConfigSource; explicit: boolean };
 	if (cliMode !== undefined) modeChoice = { value: parseMode(cliMode), source: "cli", explicit: true };
 	else if (envMode !== undefined) modeChoice = { value: parseMode(envMode), source: "environment", explicit: true };
-	else if (selectedMode !== undefined) modeChoice = { value: parseMode(selectedMode), source: "selected-config", explicit: true };
-	else if (normalizedEndpoint === undefined) modeChoice = { value: "local-owned", source: "derived-default", explicit: false };
-	else modeChoice = { value: isLoopbackEndpoint(normalizedEndpoint) ? "local-external" : "remote", source: "derived-default", explicit: false };
+	else if (selectedMode !== undefined)
+		modeChoice = { value: parseMode(selectedMode), source: "selected-config", explicit: true };
+	else if (normalizedEndpoint === undefined)
+		modeChoice = { value: "local-owned", source: "derived-default", explicit: false };
+	else
+		modeChoice = {
+			value: isLoopbackEndpoint(normalizedEndpoint) ? "local-external" : "remote",
+			source: "derived-default",
+			explicit: false,
+		};
 
 	const selectedAuth = hasOwn(selected, "auth") ? selected.auth : undefined;
 	const envAuth = environmentAuth(environment);
-	const authChoice = envAuth !== undefined
-		? { value: envAuth, source: "environment" as const, explicit: true }
-		: selectedAuth !== undefined
-			? { value: parseAuth(selectedAuth), source: "selected-config" as const, explicit: true }
-			: { value: undefined, source: "derived-default" as const, explicit: false };
+	const authChoice =
+		envAuth !== undefined
+			? { value: envAuth, source: "environment" as const, explicit: true }
+			: selectedAuth !== undefined
+				? { value: parseAuth(selectedAuth), source: "selected-config" as const, explicit: true }
+				: { value: undefined, source: "derived-default" as const, explicit: false };
 
 	const selectedTls = hasOwn(selected, "tls") ? selected.tls : undefined;
-	const environmentTls = environment.BREADBOARD_TLS_SPKI_PIN === undefined ? undefined : { spkiPin: environment.BREADBOARD_TLS_SPKI_PIN };
-	const tlsChoice = environmentTls !== undefined
-		? { value: parseTls(environmentTls), source: "environment" as const }
-		: selectedTls !== undefined
-			? { value: parseTls(selectedTls), source: "selected-config" as const }
-			: { value: undefined, source: "derived-default" as const };
+	const environmentTls =
+		environment.BREADBOARD_TLS_SPKI_PIN === undefined ? undefined : { spkiPin: environment.BREADBOARD_TLS_SPKI_PIN };
+	const tlsChoice =
+		environmentTls !== undefined
+			? { value: parseTls(environmentTls), source: "environment" as const }
+			: selectedTls !== undefined
+				? { value: parseTls(selectedTls), source: "selected-config" as const }
+				: { value: undefined, source: "derived-default" as const };
 
 	const envArtifact = environmentArtifact(environment);
-	const artifactChoice = envArtifact !== undefined
-		? { value: parseArtifact(envArtifact), source: "environment" as const }
-		: hasOwn(selected, "engineArtifact")
-			? { value: parseArtifact(selected.engineArtifact), source: "selected-config" as const }
-			: { value: undefined, source: "derived-default" as const };
+	const artifactChoice =
+		envArtifact !== undefined
+			? { value: parseArtifact(envArtifact), source: "environment" as const }
+			: hasOwn(selected, "engineArtifact")
+				? { value: parseArtifact(selected.engineArtifact), source: "selected-config" as const }
+				: { value: undefined, source: "derived-default" as const };
 
-	const workspaceChoice = environment.BREADBOARD_WORKSPACE_ID !== undefined
-		? { value: environment.BREADBOARD_WORKSPACE_ID, source: "environment" as const }
-		: hasOwn(selected, "workspaceId")
-			? { value: selected.workspaceId, source: "selected-config" as const }
-			: { value: canonicalWorkspace(input.workspacePath, input.canonicalizeWorkspace), source: "derived-default" as const };
-	if (typeof workspaceChoice.value !== "string" || !WORKSPACE_ID.test(workspaceChoice.value)) fail("invalid_workspace", "workspaceId", "workspace identity must be a versioned SHA-256 value");
+	const workspaceChoice =
+		environment.BREADBOARD_WORKSPACE_ID !== undefined
+			? { value: environment.BREADBOARD_WORKSPACE_ID, source: "environment" as const }
+			: hasOwn(selected, "workspaceId")
+				? { value: selected.workspaceId, source: "selected-config" as const }
+				: {
+						value: canonicalWorkspace(input.workspacePath, input.canonicalizeWorkspace),
+						source: "derived-default" as const,
+					};
+	if (typeof workspaceChoice.value !== "string" || !WORKSPACE_ID.test(workspaceChoice.value))
+		fail("invalid_workspace", "workspaceId", "workspace identity must be a versioned SHA-256 value");
 
-	const startupChoice = environment.BREADBOARD_STARTUP_TIMEOUT_MS !== undefined
-		? { value: environment.BREADBOARD_STARTUP_TIMEOUT_MS, source: "environment" as const, explicit: true }
-		: hasOwn(selected, "startupTimeoutMs")
-			? { value: selected.startupTimeoutMs, source: "selected-config" as const, explicit: true }
-			: { value: DEFAULT_STARTUP_TIMEOUT_MS, source: "derived-default" as const, explicit: false };
-	const requestChoice = environment.BREADBOARD_REQUEST_TIMEOUT_MS !== undefined
-		? { value: environment.BREADBOARD_REQUEST_TIMEOUT_MS, source: "environment" as const, explicit: true }
-		: hasOwn(selected, "requestTimeoutMs")
-			? { value: selected.requestTimeoutMs, source: "selected-config" as const, explicit: true }
-			: { value: DEFAULT_REQUEST_TIMEOUT_MS, source: "derived-default" as const, explicit: false };
+	const startupChoice =
+		environment.BREADBOARD_STARTUP_TIMEOUT_MS !== undefined
+			? { value: environment.BREADBOARD_STARTUP_TIMEOUT_MS, source: "environment" as const, explicit: true }
+			: hasOwn(selected, "startupTimeoutMs")
+				? { value: selected.startupTimeoutMs, source: "selected-config" as const, explicit: true }
+				: { value: DEFAULT_STARTUP_TIMEOUT_MS, source: "derived-default" as const, explicit: false };
+	const requestChoice =
+		environment.BREADBOARD_REQUEST_TIMEOUT_MS !== undefined
+			? { value: environment.BREADBOARD_REQUEST_TIMEOUT_MS, source: "environment" as const, explicit: true }
+			: hasOwn(selected, "requestTimeoutMs")
+				? { value: selected.requestTimeoutMs, source: "selected-config" as const, explicit: true }
+				: { value: DEFAULT_REQUEST_TIMEOUT_MS, source: "derived-default" as const, explicit: false };
 	const exitChoice = pick(
 		input.cli?.ownerExitPolicy,
 		environment.BREADBOARD_OWNER_EXIT_POLICY,
@@ -413,26 +470,37 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	if (mode === "off") {
 		if (endpointChoice.explicit) fail("mode_endpoint_conflict", "endpoint", "off mode forbids an engine endpoint");
 		if (authChoice.explicit) fail("mode_auth_conflict", "auth", "off mode forbids authentication");
-		if (artifactChoice.value !== undefined) fail("invalid_artifact", "engineArtifact", "off mode forbids an engine artifact");
+		if (artifactChoice.value !== undefined)
+			fail("invalid_artifact", "engineArtifact", "off mode forbids an engine artifact");
 		if (exitChoice.explicit) fail("invalid_exit_policy", "ownerExitPolicy", "off mode forbids an owner exit policy");
 		endpoint = undefined;
 	} else if (mode === "local-owned") {
 		endpoint ??= DEFAULT_ENDPOINT;
-		if (!isLoopbackEndpoint(endpoint)) fail("mode_endpoint_conflict", "endpoint", "local-owned requires a loopback endpoint");
-		if (authChoice.value !== undefined) fail("mode_auth_conflict", "auth", "local-owned does not accept endpoint authentication");
-		if (!artifactChoice.value) fail("missing_engine_artifact", "engineArtifact", "local-owned requires an explicit engine artifact identity");
+		if (!isLoopbackEndpoint(endpoint))
+			fail("mode_endpoint_conflict", "endpoint", "local-owned requires a loopback endpoint");
+		if (authChoice.value !== undefined)
+			fail("mode_auth_conflict", "auth", "local-owned does not accept endpoint authentication");
+		if (!artifactChoice.value)
+			fail("missing_engine_artifact", "engineArtifact", "local-owned requires an explicit engine artifact identity");
 		tls = { kind: "local-loopback" };
 	} else if (mode === "local-external") {
-		if (!endpointChoice.explicit || endpoint === undefined) fail("missing_endpoint", "endpoint", "local-external requires an explicit loopback endpoint");
-		if (!isLoopbackEndpoint(endpoint)) fail("mode_endpoint_conflict", "endpoint", "local-external requires a loopback endpoint");
-		if (artifactChoice.value !== undefined) fail("invalid_artifact", "engineArtifact", "local-external forbids an engine artifact");
-		if (exitChoice.explicit) fail("invalid_exit_policy", "ownerExitPolicy", "local-external forbids an owner exit policy");
+		if (!endpointChoice.explicit || endpoint === undefined)
+			fail("missing_endpoint", "endpoint", "local-external requires an explicit loopback endpoint");
+		if (!isLoopbackEndpoint(endpoint))
+			fail("mode_endpoint_conflict", "endpoint", "local-external requires a loopback endpoint");
+		if (artifactChoice.value !== undefined)
+			fail("invalid_artifact", "engineArtifact", "local-external forbids an engine artifact");
+		if (exitChoice.explicit)
+			fail("invalid_exit_policy", "ownerExitPolicy", "local-external forbids an owner exit policy");
 		tls = { kind: "local-loopback" };
 	} else {
-		if (!endpointChoice.explicit || endpoint === undefined) fail("missing_endpoint", "endpoint", "remote mode requires an explicit endpoint");
-		if (isLoopbackEndpoint(endpoint) || !endpoint.startsWith("https://")) fail("mode_endpoint_conflict", "endpoint", "remote requires non-loopback HTTPS");
+		if (!endpointChoice.explicit || endpoint === undefined)
+			fail("missing_endpoint", "endpoint", "remote mode requires an explicit endpoint");
+		if (isLoopbackEndpoint(endpoint) || !endpoint.startsWith("https://"))
+			fail("mode_endpoint_conflict", "endpoint", "remote requires non-loopback HTTPS");
 		if (!authChoice.value) fail("missing_auth", "auth", "remote mode requires authentication");
-		if (artifactChoice.value !== undefined) fail("invalid_artifact", "engineArtifact", "remote forbids an engine artifact");
+		if (artifactChoice.value !== undefined)
+			fail("invalid_artifact", "engineArtifact", "remote forbids an engine artifact");
 		if (exitChoice.explicit) fail("invalid_exit_policy", "ownerExitPolicy", "remote forbids an owner exit policy");
 		tls = tlsChoice.value ?? { kind: "system-trust" };
 	}
@@ -452,25 +520,32 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	const safeDigestInput = JSON.stringify({
 		mode,
 		endpoint,
-		auth: authChoice.value === undefined ? undefined : {
-			kind: authChoice.value.kind,
-			source: authChoice.source,
-		},
+		auth:
+			authChoice.value === undefined
+				? undefined
+				: {
+						kind: authChoice.value.kind,
+						source: authChoice.source,
+					},
 		tls,
-		engineArtifact: artifactChoice.value === undefined ? undefined : {
-			executablePathSha256: executablePathSha256(artifactChoice.value.executablePath),
-			argvSha256: artifactChoice.value.argvSha256,
-			executableSha256: artifactChoice.value.executableSha256,
-			engineSourceSha256: artifactChoice.value.engineSourceSha256,
-			servedBackendCommit: artifactChoice.value.servedBackendCommit,
-		},
+		engineArtifact:
+			artifactChoice.value === undefined
+				? undefined
+				: {
+						executablePathSha256: executablePathSha256(artifactChoice.value.executablePath),
+						argvSha256: artifactChoice.value.argvSha256,
+						executableSha256: artifactChoice.value.executableSha256,
+						engineSourceSha256: artifactChoice.value.engineSourceSha256,
+						servedBackendCommit: artifactChoice.value.servedBackendCommit,
+					},
 		workspaceId: workspaceChoice.value,
 		startupTimeoutMs,
 		requestTimeoutMs,
 		ownerExitPolicy: mode === "local-owned" ? ownerExitPolicy : undefined,
-		sessionConfigPathSha256: sessionConfigPath === undefined
-			? undefined
-			: `sha256:${createHash("sha256").update("breadboard-session-config-path-v1\0").update(sessionConfigPath).digest("hex")}`,
+		sessionConfigPathSha256:
+			sessionConfigPath === undefined
+				? undefined
+				: `sha256:${createHash("sha256").update("breadboard-session-config-path-v1\0").update(sessionConfigPath).digest("hex")}`,
 		sources,
 	});
 	const configHash = createHash("sha256").update("breadboard-run-config-v2\0").update(safeDigestInput);
@@ -490,22 +565,34 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	});
 }
 
-export async function loadSelectedBreadboardConfig(settingsFile: string): Promise<SelectedBreadboardConfig> {
-	const file = Bun.file(settingsFile);
+export async function loadSelectedBreadboardConfig(configFile: string): Promise<SelectedBreadboardConfig> {
+	const file = Bun.file(configFile);
 	if (!(await file.exists())) return {};
 	let parsed: unknown;
 	try {
-		parsed = JSONC.parse(await file.text());
+		const text = await file.text();
+		parsed = [".yaml", ".yml"].includes(extname(configFile).toLowerCase()) ? YAML.parse(text) : JSONC.parse(text);
 	} catch {
-		fail("invalid_selected_config", "mode", "selected OMP settings are unreadable or malformed");
+		fail("invalid_selected_config", "mode", "selected OMP config is unreadable or malformed");
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		fail("invalid_selected_config", "mode", "selected OMP settings must be an object");
+		fail("invalid_selected_config", "mode", "selected OMP config must be an object");
 	}
 	if (!("breadboard" in parsed) || parsed.breadboard === undefined) return {};
 	const breadboard = parsed.breadboard;
 	if (typeof breadboard !== "object" || breadboard === null || Array.isArray(breadboard)) {
-		fail("invalid_selected_config", "mode", "selected OMP breadboard settings must be an object");
+		fail("invalid_selected_config", "mode", "selected OMP breadboard config must be an object");
 	}
-	return breadboard as SelectedBreadboardConfig;
+	return {
+		...("engineMode" in breadboard ? { engineMode: breadboard.engineMode } : {}),
+		...("baseUrl" in breadboard ? { baseUrl: breadboard.baseUrl } : {}),
+		...("auth" in breadboard ? { auth: breadboard.auth } : {}),
+		...("tls" in breadboard ? { tls: breadboard.tls } : {}),
+		...("engineArtifact" in breadboard ? { engineArtifact: breadboard.engineArtifact } : {}),
+		...("workspaceId" in breadboard ? { workspaceId: breadboard.workspaceId } : {}),
+		...("startupTimeoutMs" in breadboard ? { startupTimeoutMs: breadboard.startupTimeoutMs } : {}),
+		...("requestTimeoutMs" in breadboard ? { requestTimeoutMs: breadboard.requestTimeoutMs } : {}),
+		...("ownerExitPolicy" in breadboard ? { ownerExitPolicy: breadboard.ownerExitPolicy } : {}),
+		...("sessionConfigPath" in breadboard ? { sessionConfigPath: breadboard.sessionConfigPath } : {}),
+	};
 }

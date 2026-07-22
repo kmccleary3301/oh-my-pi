@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { AUTHORITY_RECORD_SCHEMA_VERSION, LocalAuthorityStore, LocalAuthorityStoreError } from "./local-authority-store";
+import { join } from "node:path";
+import {
+	AUTHORITY_RECORD_SCHEMA_VERSION,
+	LocalAuthorityStore,
+	LocalAuthorityStoreError,
+} from "./local-authority-store";
 import { executablePathSha256 } from "./run-config";
 
 const roots: string[] = [];
@@ -43,7 +47,9 @@ describe("LocalAuthorityStore", () => {
 	test("creates a user-only root and separate durable public/secret records", async () => {
 		const root = await temporaryRoot();
 		const store = new LocalAuthorityStore(root);
-		const committed = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		const committed = await store.withExclusiveLock(endpoint, () =>
+			store.commit(endpoint, null, record(), { ownerCredential }),
+		);
 		const key = LocalAuthorityStore.endpointKey(endpoint);
 		const rootMetadata = await lstat(root);
 		const publicMetadata = await lstat(join(root, `${key}.authority.json`));
@@ -67,7 +73,9 @@ describe("LocalAuthorityStore", () => {
 	test("persists one strict control attempt and its drain binding across authority rotation", async () => {
 		const root = await temporaryRoot();
 		const store = new LocalAuthorityStore(root, { now: () => 1_784_373_178_000 });
-		const committed = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		const committed = await store.withExclusiveLock(endpoint, () =>
+			store.commit(endpoint, null, record(), { ownerCredential }),
+		);
 		const key = LocalAuthorityStore.endpointKey(endpoint);
 		const orphanControlSecret = `${key}.control.secret.orphan_control_credential_abcdefghijkl.bin`;
 		await writeFile(join(root, orphanControlSecret), "simulated interrupted secret write", { mode: 0o600 });
@@ -78,23 +86,29 @@ describe("LocalAuthorityStore", () => {
 			registrationCredential: "requester_credential_abcdefghijklmnopqrstuvwxyz",
 			admissionEpoch: 7,
 		};
-		const first = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
-			endpoint,
-			committed,
-			"stop",
-			"control_request_abcdefghijklmnopqrstuvwxyz012345",
-			requester,
-		));
+		const first = await store.withExclusiveLock(endpoint, () =>
+			store.prepareControlAttempt(
+				endpoint,
+				committed,
+				"stop",
+				"control_request_abcdefghijklmnopqrstuvwxyz012345",
+				requester,
+			),
+		);
 		await expect(lstat(join(root, orphanControlSecret))).rejects.toMatchObject({ code: "ENOENT" });
-		const replay = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
-			endpoint,
-			committed,
-			"stop",
-			"replacement_request_abcdefghijklmnopqrstuvwxyz0",
-			requester,
-		));
+		const replay = await store.withExclusiveLock(endpoint, () =>
+			store.prepareControlAttempt(
+				endpoint,
+				committed,
+				"stop",
+				"replacement_request_abcdefghijklmnopqrstuvwxyz0",
+				requester,
+			),
+		);
 		expect(replay).toEqual(first);
-		const draining = await store.withExclusiveLock(endpoint, () => store.markControlAttemptDraining(endpoint, first, 2));
+		const draining = await store.withExclusiveLock(endpoint, () =>
+			store.markControlAttemptDraining(endpoint, first, 2),
+		);
 		expect(draining).toMatchObject({
 			phase: "draining",
 			drainGeneration: 2,
@@ -106,20 +120,32 @@ describe("LocalAuthorityStore", () => {
 		const requesterSecret = await store.readControlAttemptSecret(first);
 		expect(requesterSecret.requesterRegistrationCredential.toString("utf8")).toBe(requester.registrationCredential);
 		requesterSecret.requesterRegistrationCredential.fill(0);
-		let committing = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, draining, "graceful-accepted"));
-		committing = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, committing, "hard-signal-pending"));
-		committing = await store.withExclusiveLock(endpoint, () => store.advanceControlAttempt(endpoint, committing, "hard-signal-commit-pending"));
+		let committing = await store.withExclusiveLock(endpoint, () =>
+			store.advanceControlAttempt(endpoint, draining, "graceful-accepted"),
+		);
+		committing = await store.withExclusiveLock(endpoint, () =>
+			store.advanceControlAttempt(endpoint, committing, "hard-signal-pending"),
+		);
+		committing = await store.withExclusiveLock(endpoint, () =>
+			store.advanceControlAttempt(endpoint, committing, "hard-signal-commit-pending"),
+		);
 		expect(committing.phase).toBe("hard-signal-commit-pending");
 		const rotatedCredential = Buffer.from("rotated_owner_credential_abcdefghijklmnopq", "ascii");
-		const rotated = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, committed, record(2), { ownerCredential: rotatedCredential }));
+		const rotated = await store.withExclusiveLock(endpoint, () =>
+			store.commit(endpoint, committed, record(2), { ownerCredential: rotatedCredential }),
+		);
 		expect(await store.readControlAttempt(endpoint, rotated)).toEqual(committing);
-		expect(await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
-			endpoint,
-			rotated,
-			"stop",
-			"another_request_abcdefghijklmnopqrstuvwxyz012",
-			requester,
-		))).toEqual(committing);
+		expect(
+			await store.withExclusiveLock(endpoint, () =>
+				store.prepareControlAttempt(
+					endpoint,
+					rotated,
+					"stop",
+					"another_request_abcdefghijklmnopqrstuvwxyz012",
+					requester,
+				),
+			),
+		).toEqual(committing);
 		const controlPath = join(root, `${key}.control.json`);
 		const controlText = await Bun.file(controlPath).text();
 		expect(controlText).not.toContain(ownerCredential.toString("ascii"));
@@ -129,8 +155,12 @@ describe("LocalAuthorityStore", () => {
 		expect(controlText).not.toContain("authorization_");
 		expect(controlText).not.toContain("owner_credential");
 		expect(controlText).not.toContain("darwin:123:456");
-		await writeFile(controlPath, controlText.replace(',"createdAtUnix"', ',"unexpected":true,"createdAtUnix"'), { mode: 0o600 });
-		await expect(store.readControlAttempt(endpoint, rotated)).rejects.toMatchObject({ code: "control_attempt_integrity" });
+		await writeFile(controlPath, controlText.replace(',"createdAtUnix"', ',"unexpected":true,"createdAtUnix"'), {
+			mode: 0o600,
+		});
+		await expect(store.readControlAttempt(endpoint, rotated)).rejects.toMatchObject({
+			code: "control_attempt_integrity",
+		});
 		await writeFile(controlPath, controlText, { mode: 0o600 });
 		await store.withExclusiveLock(endpoint, () => store.clearControlAttempt(endpoint, committing));
 		await expect(lstat(join(root, first.requesterCredentialRef))).rejects.toMatchObject({ code: "ENOENT" });
@@ -139,7 +169,9 @@ describe("LocalAuthorityStore", () => {
 	test("atomically converges concurrent replacements of one expired begin requester", async () => {
 		const root = await temporaryRoot();
 		const store = new LocalAuthorityStore(root);
-		const committed = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		const committed = await store.withExclusiveLock(endpoint, () =>
+			store.commit(endpoint, null, record(), { ownerCredential }),
+		);
 		const expiredRequester = {
 			registrationId: "registration_expired_abcdefghijklmnopqrstuvwxyz",
 			registrationGeneration: 1,
@@ -147,13 +179,15 @@ describe("LocalAuthorityStore", () => {
 			registrationCredential: "requester_expired_credential_abcdefghijklmnopqrstuvwxyz",
 			admissionEpoch: 7,
 		};
-		const expired = await store.withExclusiveLock(endpoint, () => store.prepareControlAttempt(
-			endpoint,
-			committed,
-			"stop",
-			"control_request_expired_abcdefghijklmnopqrstuvwxyz",
-			expiredRequester,
-		));
+		const expired = await store.withExclusiveLock(endpoint, () =>
+			store.prepareControlAttempt(
+				endpoint,
+				committed,
+				"stop",
+				"control_request_expired_abcdefghijklmnopqrstuvwxyz",
+				expiredRequester,
+			),
+		);
 		const requesterA = {
 			registrationId: "registration_current_a_abcdefghijklmnopqrstuvwxyz",
 			registrationGeneration: 2,
@@ -169,22 +203,26 @@ describe("LocalAuthorityStore", () => {
 			admissionEpoch: 8,
 		};
 		const [winnerA, winnerB] = await Promise.all([
-			store.withExclusiveLock(endpoint, () => store.replaceExpiredBeginControlAttempt(
-				endpoint,
-				committed,
-				expired,
-				"stop",
-				"control_request_current_a_abcdefghijklmnopqrstuvwxyz",
-				requesterA,
-			)),
-			store.withExclusiveLock(endpoint, () => store.replaceExpiredBeginControlAttempt(
-				endpoint,
-				committed,
-				expired,
-				"stop",
-				"control_request_current_b_abcdefghijklmnopqrstuvwxyz",
-				requesterB,
-			)),
+			store.withExclusiveLock(endpoint, () =>
+				store.replaceExpiredBeginControlAttempt(
+					endpoint,
+					committed,
+					expired,
+					"stop",
+					"control_request_current_a_abcdefghijklmnopqrstuvwxyz",
+					requesterA,
+				),
+			),
+			store.withExclusiveLock(endpoint, () =>
+				store.replaceExpiredBeginControlAttempt(
+					endpoint,
+					committed,
+					expired,
+					"stop",
+					"control_request_current_b_abcdefghijklmnopqrstuvwxyz",
+					requesterB,
+				),
+			),
 		]);
 		expect(winnerA).toEqual(winnerB);
 		expect(winnerA.controlRequestId).not.toBe(expired.controlRequestId);
@@ -198,23 +236,25 @@ describe("LocalAuthorityStore", () => {
 		expect(publicText).not.toContain(requesterA.registrationCredential);
 		expect(publicText).not.toContain(requesterB.registrationCredential);
 		const winnerSecret = await store.readControlAttemptSecret(winnerA);
-		expect([
-			requesterA.registrationCredential,
-			requesterB.registrationCredential,
-		]).toContain(winnerSecret.requesterRegistrationCredential.toString("utf8"));
+		expect([requesterA.registrationCredential, requesterB.registrationCredential]).toContain(
+			winnerSecret.requesterRegistrationCredential.toString("utf8"),
+		);
 		winnerSecret.requesterRegistrationCredential.fill(0);
 	});
-
 
 	test("enforces generation CAS and retires only the current generation", async () => {
 		const root = await temporaryRoot();
 		const store = new LocalAuthorityStore(root);
 		await store.withExclusiveLock(endpoint, async () => {
 			const first = await store.commit(endpoint, null, record(), { ownerCredential });
-			await expect(store.commit(endpoint, null, record(2), { ownerCredential })).rejects.toMatchObject({ code: "generation_conflict" });
+			await expect(store.commit(endpoint, null, record(2), { ownerCredential })).rejects.toMatchObject({
+				code: "generation_conflict",
+			});
 			const second = await store.commit(endpoint, first, record(2), { ownerCredential });
 			expect(second.ownerGeneration).toBe(2);
-			await expect(store.retireDeadGeneration(endpoint, first)).rejects.toMatchObject({ code: "generation_conflict" });
+			await expect(store.retireDeadGeneration(endpoint, first)).rejects.toMatchObject({
+				code: "generation_conflict",
+			});
 			await store.retireDeadGeneration(endpoint, second);
 			expect(await store.readCurrent(endpoint)).toBeNull();
 		});
@@ -234,7 +274,9 @@ describe("LocalAuthorityStore", () => {
 		await store.withExclusiveLock(endpoint, async () => {
 			const current = await store.commit(endpoint, null, record(), { ownerCredential });
 			interrupt = true;
-			await expect(store.retireDeadGeneration(endpoint, current)).rejects.toThrow("synthetic retirement interruption");
+			await expect(store.retireDeadGeneration(endpoint, current)).rejects.toThrow(
+				"synthetic retirement interruption",
+			);
 			expect(await store.readCurrent(endpoint)).toEqual(current);
 			const preservedSecret = await store.readSecret(current);
 			expect(preservedSecret.ownerCredential).toEqual(ownerCredential);
@@ -250,9 +292,13 @@ describe("LocalAuthorityStore", () => {
 				if (interruptCleanup && path.includes(".secret.")) throw new Error("synthetic secret cleanup interruption");
 			},
 		});
-		const current = await store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential }));
+		const current = await store.withExclusiveLock(endpoint, () =>
+			store.commit(endpoint, null, record(), { ownerCredential }),
+		);
 		interruptCleanup = true;
-		await expect(store.withExclusiveLock(endpoint, () => store.retireDeadGeneration(endpoint, current))).rejects.toThrow("synthetic secret cleanup interruption");
+		await expect(
+			store.withExclusiveLock(endpoint, () => store.retireDeadGeneration(endpoint, current)),
+		).rejects.toThrow("synthetic secret cleanup interruption");
 		expect(await store.readCurrent(endpoint)).toBeNull();
 		expect((await readdir(root)).some(name => name === current.ownerCredentialRef)).toBe(true);
 
@@ -274,7 +320,9 @@ describe("LocalAuthorityStore", () => {
 		const key = LocalAuthorityStore.endpointKey(endpoint);
 		const path = join(root, `${key}.authority.json`);
 		await writeFile(path, '{"pid":999999,"ownerCredential":"synthetic-secret"}\n', { mode: 0o600 });
-		await expect(store.withExclusiveLock(endpoint, () => store.readCurrentForRecovery(endpoint))).rejects.toBeInstanceOf(LocalAuthorityStoreError);
+		await expect(
+			store.withExclusiveLock(endpoint, () => store.readCurrentForRecovery(endpoint)),
+		).rejects.toBeInstanceOf(LocalAuthorityStoreError);
 		expect(initialized).toBe(true);
 		const names = await readdir(root);
 		expect(names.some(name => name.startsWith(`${key}.authority.invalid.`))).toBe(true);
@@ -328,7 +376,9 @@ describe("LocalAuthorityStore", () => {
 				await writeFile(lockPath, "{}\n", { mode: 0o600 });
 			},
 		});
-		await expect(store.withExclusiveLock(endpoint, async () => "never")).rejects.toMatchObject({ code: "lock_integrity" });
+		await expect(store.withExclusiveLock(endpoint, async () => "never")).rejects.toMatchObject({
+			code: "lock_integrity",
+		});
 	});
 
 	test("removes an unreferenced secret when public record commit fails", async () => {
@@ -338,8 +388,9 @@ describe("LocalAuthorityStore", () => {
 				if (to.endsWith(".authority.json")) throw new Error("synthetic public commit failure");
 			},
 		});
-		await expect(store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential })))
-			.rejects.toThrow("synthetic public commit failure");
+		await expect(
+			store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential })),
+		).rejects.toThrow("synthetic public commit failure");
 		expect((await readdir(root)).some(name => name.includes(".secret."))).toBe(false);
 	});
 
@@ -356,8 +407,9 @@ describe("LocalAuthorityStore", () => {
 				await mkdir(root, { mode: 0o700 });
 			},
 		});
-		await expect(store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential })))
-			.rejects.toMatchObject({ code: "root_integrity" });
+		await expect(
+			store.withExclusiveLock(endpoint, () => store.commit(endpoint, null, record(), { ownerCredential })),
+		).rejects.toMatchObject({ code: "root_integrity" });
 		expect(await readdir(root)).toEqual([]);
 	});
 
@@ -375,21 +427,28 @@ describe("LocalAuthorityStore", () => {
 			expect(claimed.kind).toBe("claimed");
 			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
 			const bootstrapCredential = Buffer.alloc(32, 7);
-			const prepared = await store.prepareStartClaim(endpoint, claimed.claim.token, {
-				launchId: "launch_abcdefghijklmnopqrstuvwxyz0123456789012",
-				executableSha256: `sha256:${"a".repeat(64)}`,
-				engineArtifactSha256: `sha256:${"b".repeat(64)}`,
-				servedBackendCommit: "c".repeat(40),
-				executablePathSha256: executablePathSha256("/usr/bin/false"),
-				argvSha256: `sha256:${"d".repeat(64)}`,
-			}, { bootstrapCredential, ownerCredential });
+			const prepared = await store.prepareStartClaim(
+				endpoint,
+				claimed.claim.token,
+				{
+					launchId: "launch_abcdefghijklmnopqrstuvwxyz0123456789012",
+					executableSha256: `sha256:${"a".repeat(64)}`,
+					engineArtifactSha256: `sha256:${"b".repeat(64)}`,
+					servedBackendCommit: "c".repeat(40),
+					executablePathSha256: executablePathSha256("/usr/bin/false"),
+					argvSha256: `sha256:${"d".repeat(64)}`,
+				},
+				{ bootstrapCredential, ownerCredential },
+			);
 			bootstrapCredential.fill(0);
 			const bound = await store.bindStartClaimProcess(endpoint, prepared.token, enginePid, "darwin:4321:123456");
 			const firstAttempt = await store.markOwnerAttempt(endpoint, bound);
 			const secondAttempt = await store.markOwnerAttempt(endpoint, firstAttempt);
 			const rolledBack = await store.rollbackOwnerAttempt(endpoint, secondAttempt);
 			expect(rolledBack.ownerAttemptGeneration).toBe(1);
-			await expect(store.rollbackOwnerAttempt(endpoint, secondAttempt)).rejects.toMatchObject({ code: "generation_conflict" });
+			await expect(store.rollbackOwnerAttempt(endpoint, secondAttempt)).rejects.toMatchObject({
+				code: "generation_conflict",
+			});
 			const recovered = await store.claimStart(endpoint);
 			expect(recovered.kind).toBe("recoverable");
 			if (recovered.kind !== "recoverable") throw new Error("expected recoverable start");
@@ -415,14 +474,19 @@ describe("LocalAuthorityStore", () => {
 		const prepared = await store.withExclusiveLock(endpoint, async () => {
 			const claimed = await store.claimStart(endpoint);
 			if (claimed.kind !== "claimed") throw new Error("expected claimed start");
-			return await store.prepareStartClaim(endpoint, claimed.claim.token, {
-				launchId: "launch_pending_mismatch_abcdefghijklmnopqrstuvwxyz",
-				executableSha256: `sha256:${"a".repeat(64)}`,
-				executablePathSha256: executablePathSha256("/usr/bin/false"),
-				argvSha256: `sha256:${"d".repeat(64)}`,
-				engineArtifactSha256: `sha256:${"b".repeat(64)}`,
-				servedBackendCommit: "c".repeat(40),
-			}, { bootstrapCredential, ownerCredential: pendingOwnerCredential });
+			return await store.prepareStartClaim(
+				endpoint,
+				claimed.claim.token,
+				{
+					launchId: "launch_pending_mismatch_abcdefghijklmnopqrstuvwxyz",
+					executableSha256: `sha256:${"a".repeat(64)}`,
+					executablePathSha256: executablePathSha256("/usr/bin/false"),
+					argvSha256: `sha256:${"d".repeat(64)}`,
+					engineArtifactSha256: `sha256:${"b".repeat(64)}`,
+					servedBackendCommit: "c".repeat(40),
+				},
+				{ bootstrapCredential, ownerCredential: pendingOwnerCredential },
+			);
 		});
 		const originalFrom = Buffer.from;
 		const decoded: Buffer[] = [];
@@ -432,10 +496,12 @@ describe("LocalAuthorityStore", () => {
 			return value;
 		};
 		try {
-			await expect(store.readPendingSecret({
-				...prepared,
-				pendingSecretVerifier: `sha256:${"f".repeat(64)}`,
-			})).rejects.toMatchObject({ code: "secret_verifier_mismatch" });
+			await expect(
+				store.readPendingSecret({
+					...prepared,
+					pendingSecretVerifier: `sha256:${"f".repeat(64)}`,
+				}),
+			).rejects.toMatchObject({ code: "secret_verifier_mismatch" });
 		} finally {
 			(Buffer as unknown as { from: typeof Buffer.from }).from = originalFrom;
 		}
@@ -465,7 +531,9 @@ describe("LocalAuthorityStore", () => {
 			randomId: () => `token_${String(++random).padStart(20, "0")}`,
 			processStartToken: () => "current-start-token",
 			isLockOwnerAlive: async () => false,
-			sleep: async () => { await Promise.resolve(); },
+			sleep: async () => {
+				await Promise.resolve();
+			},
 		});
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();

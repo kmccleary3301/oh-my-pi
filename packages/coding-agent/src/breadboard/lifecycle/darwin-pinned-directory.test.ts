@@ -1,9 +1,9 @@
+import { afterEach, describe, expect, test } from "bun:test";
 import { fstatSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
 	DARWIN_PINNED_DIRECTORY_LIMITS,
 	DarwinPinnedDirectoryError,
@@ -105,9 +105,9 @@ describe.skipIf(process.platform !== "darwin")("Darwin pinned directory", () => 
 		for (const path of ["", ".", "..", "/file", "a//b", "a/./b", "a/../b", "nul\0tail"]) {
 			await expect(pinned.readFile(path, 16)).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
 		}
-		await expect(pinned.readFile(`${"a".repeat(DARWIN_PINNED_DIRECTORY_LIMITS.maxComponentBytes + 1)}/file`, 16)).rejects.toBeInstanceOf(
-			DarwinPinnedDirectoryError,
-		);
+		await expect(
+			pinned.readFile(`${"a".repeat(DARWIN_PINNED_DIRECTORY_LIMITS.maxComponentBytes + 1)}/file`, 16),
+		).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
 	});
 
 	test("enforces file, symlink, entry, path, and total-output caps", async () => {
@@ -121,11 +121,15 @@ describe.skipIf(process.platform !== "darwin")("Darwin pinned directory", () => 
 
 		await expect(pinned.readFile("large", 4)).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
 		await expect(pinned.readlink("link", 4)).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
-		await expect(pinned.listLeaves({ maxEntries: 2, maxPathBytes: 128 })).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
-		await expect(pinned.listLeaves({ maxEntries: 8, maxPathBytes: 8 })).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
-		await expect(pinned.listLeaves({ maxEntries: 8, maxPathBytes: 128, maxTotalPathBytes: 8 })).rejects.toBeInstanceOf(
+		await expect(pinned.listLeaves({ maxEntries: 2, maxPathBytes: 128 })).rejects.toBeInstanceOf(
 			DarwinPinnedDirectoryError,
 		);
+		await expect(pinned.listLeaves({ maxEntries: 8, maxPathBytes: 8 })).rejects.toBeInstanceOf(
+			DarwinPinnedDirectoryError,
+		);
+		await expect(
+			pinned.listLeaves({ maxEntries: 8, maxPathBytes: 128, maxTotalPathBytes: 8 }),
+		).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
 		await expect(pinned.readFile("large", DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes + 1)).rejects.toBeInstanceOf(
 			DarwinPinnedDirectoryError,
 		);
@@ -145,9 +149,13 @@ describe.skipIf(process.platform !== "darwin")("Darwin pinned directory", () => 
 		const pinned = await openPinnedDirectory(root);
 		handles.push(pinned);
 		try {
-			await expect(pinned.listLeaves({ maxEntries: 8, maxPathBytes: 128 })).rejects.toBeInstanceOf(DarwinPinnedDirectoryError);
+			await expect(pinned.listLeaves({ maxEntries: 8, maxPathBytes: 128 })).rejects.toBeInstanceOf(
+				DarwinPinnedDirectoryError,
+			);
 		} finally {
-			await new Promise<void>((resolve, reject) => server.close(error => (error === undefined ? resolve() : reject(error))));
+			await new Promise<void>((resolve, reject) =>
+				server.close(error => (error === undefined ? resolve() : reject(error))),
+			);
 		}
 	});
 

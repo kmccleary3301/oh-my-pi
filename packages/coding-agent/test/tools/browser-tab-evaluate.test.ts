@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { BrowserTool } from "@oh-my-pi/pi-coding-agent/tools/browser";
@@ -35,6 +35,32 @@ async function chromiumCanLaunch(): Promise<boolean> {
 const CHROMIUM_AVAILABLE = await chromiumCanLaunch();
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab evaluation", () => {
+	const cmuxEnvKeys = [
+		"CMUX_SOCKET_PATH",
+		"CMUX_SOCKET_PASSWORD",
+		"CMUX_WORKSPACE_ID",
+		"CMUX_SURFACE_ID",
+		"CMUX_RELAY_ID",
+		"CMUX_RELAY_TOKEN",
+	] as const;
+	let originalCmuxEnv: Partial<Record<(typeof cmuxEnvKeys)[number], string | undefined>>;
+
+	beforeEach(() => {
+		originalCmuxEnv = {};
+		for (const key of cmuxEnvKeys) {
+			originalCmuxEnv[key] = Bun.env[key];
+			delete Bun.env[key];
+		}
+	});
+
+	afterEach(() => {
+		for (const key of cmuxEnvKeys) {
+			const original = originalCmuxEnv[key];
+			if (original === undefined) delete Bun.env[key];
+			else Bun.env[key] = original;
+		}
+	});
+
 	// Launches real headless Chromium; CI cold start easily exceeds bun's 5s default.
 	it("runs tab.evaluate in the page's main JavaScript world", async () => {
 		const tool = new BrowserTool(makeSession());
