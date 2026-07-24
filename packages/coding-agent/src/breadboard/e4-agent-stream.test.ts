@@ -385,58 +385,210 @@ describe("E4AgentStreamBridge", () => {
 		expect(result.content).toEqual([{ type: "text", text: "raced" }]);
 		await bridge.close();
 	});
-	test("cancels a turn admitted after close exactly once without installing a sink", async () => {
-		const pendingSubmit = Promise.withResolvers<SubmitReceipt>();
-		const submitStarted = Promise.withResolvers<void>();
-		const cancellationObserved = Promise.withResolvers<void>();
-		const releaseLateEvent = Promise.withResolvers<void>();
-		const lateEventProcessed = Promise.withResolvers<void>();
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
-		const agentEvents: AgentEvent[] = [];
+	test("fails and cancels an active admitted turn before closing the SDK session", async () => {
+		const submitObserved = Promise.withResolvers<void>();
+		const lifecycle: string[] = [];
 		const session: OpenedSessionRuntime = {
 			...openedSession([], []),
 			async submit() {
-				submitStarted.resolve();
-				return pendingSubmit.promise;
+				submitObserved.resolve();
+				return receipt;
 			},
 			async cancel(request) {
-				cancelled.push(request);
-				cancellationObserved.resolve();
-				releaseLateEvent.resolve();
+				lifecycle.push(`cancel:${String(request.turnId)}`);
 				return {} as CancellationReceipt;
 			},
-			async *events() {
-				await releaseLateEvent.promise;
-				yield wireEvent(3, "tool.result", {
-					call_id: "call-after-close",
-					tool: "read",
-					status: "completed",
-					error: false,
-					result: { output: "must not project" },
-					artifact_ref: null,
-				});
-				lateEventProcessed.resolve();
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+			async close() {
+				lifecycle.push("close");
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
 			replayHeadSequence: 0,
-			emitAgentEvent: event => agentEvents.push(event),
+			emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		const stream = await bridge.stream(model, context);
-		await submitStarted.promise;
-		await bridge.close();
-		pendingSubmit.resolve(receipt);
-		await cancellationObserved.promise;
-		await lateEventProcessed.promise;
+		await submitObserved.promise;
+		await drainMicrotasks();
 		await bridge.close();
 
 		const result = await stream.result();
 		expect(result.stopReason).toBe("aborted");
-		expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "user_requested" }]);
-		expect(agentEvents).toEqual([]);
+		expect(lifecycle).toEqual([`cancel:${String(receipt.turnId)}`, "close"]);
+	});
+
+	test("settles multiple pending submissions and their cancellations before closing the SDK session", async () => {
+		const secondReceipt: SubmitReceipt = {
+			...receipt,
+			clientMessageId: `${String(receipt.clientMessageId)}-2` as ClientMessageId,
+			turnId: "turn-2" as SubmitReceipt["turnId"],
+		};
+		const pendingSubmissions = [
+			Promise.withResolvers<SubmitReceipt>(),
+			Promise.withResolvers<SubmitReceipt>(),
+			Promise.withResolvers<SubmitReceipt>(),
+		];
+		const allSubmissionsObserved = Promise.withResolvers<void>();
+		const allCancellationsObserved = Promise.withResolvers<void>();
+		const cancellationGates: Record<string, PromiseWithResolvers<CancellationReceipt>> = {
+			[String(receipt.turnId)]: Promise.withResolvers<CancellationReceipt>(),
+			[String(secondReceipt.turnId)]: Promise.withResolvers<CancellationReceipt>(),
+		};
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		let submitIndex = 0;
+		let sdkCloseCount = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit() {
+				const pending = pendingSubmissions[submitIndex];
+				submitIndex += 1;
+				if (submitIndex === pendingSubmissions.length) allSubmissionsObserved.resolve();
+				if (!pending) throw new Error("unexpected submission");
+				return pending.promise;
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				if (cancelled.length === 2) allCancellationsObserved.resolve();
+				const gate = cancellationGates[String(request.turnId)];
+				if (!gate) throw new Error(`unexpected cancellation ${String(request.turnId)}`);
+				return gate.promise;
+			},
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+			async close() {
+				sdkCloseCount += 1;
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const streams = await Promise.all([
+			bridge.stream(model, context),
+			bridge.stream(model, context),
+			bridge.stream(model, context),
+		]);
+		await allSubmissionsObserved.promise;
+		const close = bridge.close();
+		await drainMicrotasks();
+		expect(sdkCloseCount).toBe(0);
+
+		pendingSubmissions[0]?.resolve(receipt);
+		pendingSubmissions[1]?.resolve(secondReceipt);
+		pendingSubmissions[2]?.reject(new Error("submit rejected during close"));
+		await allCancellationsObserved.promise;
+		expect(sdkCloseCount).toBe(0);
+		expect(cancelled).toEqual([
+			{ turnId: receipt.turnId, reason: "user_requested" },
+			{ turnId: secondReceipt.turnId, reason: "user_requested" },
+		]);
+
+		cancellationGates[String(receipt.turnId)]?.resolve({} as CancellationReceipt);
+		await drainMicrotasks();
+		expect(sdkCloseCount).toBe(0);
+		cancellationGates[String(secondReceipt.turnId)]?.resolve({} as CancellationReceipt);
+		await close;
+
+		expect(sdkCloseCount).toBe(1);
+		const results = await Promise.all(streams.map(stream => stream.result()));
+		expect(results.map(result => result.stopReason)).toEqual(["aborted", "aborted", "aborted"]);
+	});
+
+	test("closes the SDK session after cancellation rejects", async () => {
+		const submitObserved = Promise.withResolvers<void>();
+		const lifecycle: string[] = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit() {
+				submitObserved.resolve();
+				return receipt;
+			},
+			async cancel(request) {
+				lifecycle.push(`cancel:${String(request.turnId)}`);
+				throw new Error("cancel rejected");
+			},
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+			async close() {
+				lifecycle.push("close");
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const stream = await bridge.stream(model, context);
+		await submitObserved.promise;
+		await drainMicrotasks();
+		await bridge.close();
+
+		expect((await stream.result()).stopReason).toBe("aborted");
+		expect(lifecycle).toEqual([`cancel:${String(receipt.turnId)}`, "close"]);
+	});
+
+	test("coalesces concurrent and repeated close calls", async () => {
+		const releaseClose = Promise.withResolvers<void>();
+		let sdkCloseCount = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+			async close() {
+				sdkCloseCount += 1;
+				await releaseClose.promise;
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const firstClose = bridge.close();
+		const secondClose = bridge.close();
+		let secondCloseSettled = false;
+		void secondClose.then(() => {
+			secondCloseSettled = true;
+		});
+		await drainMicrotasks();
+		expect(sdkCloseCount).toBe(1);
+		expect(secondCloseSettled).toBeFalse();
+
+		releaseClose.resolve();
+		await Promise.all([firstClose, secondClose]);
+		await bridge.close();
+		expect(sdkCloseCount).toBe(1);
 	});
 
 	const drainMicrotasks = async (): Promise<void> => {
@@ -650,9 +802,10 @@ describe("E4AgentStreamBridge", () => {
 			await observerExited.promise;
 			await drainMicrotasks();
 			expect(stream.resultSettled).toBeTrue();
-			await bridge.close();
+			const close = bridge.close();
 
 			pendingSubmit.resolve(receipt);
+			await close;
 			await submitSettled.promise;
 			await drainMicrotasks();
 			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);

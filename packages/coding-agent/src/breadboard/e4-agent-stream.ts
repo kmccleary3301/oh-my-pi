@@ -74,9 +74,11 @@ export class E4AgentStreamBridge {
 	readonly #pendingEvents = new Map<string, LoggedSessionEvent[]>();
 	readonly #submittedTurnIds = new Set<string>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
+	readonly #cancellationsInFlight = new Set<Promise<void>>();
 	#highestObservedSequence: number;
 	#closed = false;
 	#observeFailure: Error | undefined;
+	#closePromise: Promise<void> | undefined;
 
 	constructor(options: E4AgentStreamBridgeOptions) {
 		this.#session = options.session;
@@ -86,27 +88,48 @@ export class E4AgentStreamBridge {
 		this.#requestPermission = options.requestPermission;
 		this.stream = (model, context, streamOptions) => {
 			const stream = new AssistantMessageEventStream();
-			void this.#startTurn(model, context, stream, streamOptions?.signal);
+			let admission!: Promise<void>;
+			admission = this.#startTurn(model, context, stream, streamOptions?.signal).then(
+				() => {
+					this.#submissionsInFlight.delete(admission);
+				},
+				() => {
+					this.#submissionsInFlight.delete(admission);
+				},
+			);
+			this.#submissionsInFlight.add(admission);
 			return stream;
 		};
 		void this.#observe();
 	}
 
-	async close(): Promise<void> {
-		if (this.#closed) return;
+	close(): Promise<void> {
+		if (!this.#closePromise) this.#closePromise = this.#performClose();
+		return this.#closePromise;
+	}
+
+	async #performClose(): Promise<void> {
 		this.#closed = true;
 		this.#observeAbort.abort();
-		for (const sink of this.#sinks.values()) {
+
+		const admittedSinks = [...this.#sinks.values()];
+		for (const sink of admittedSinks) {
 			this.#failSink(sink, "BreadBoard session closed", "aborted");
 		}
 		for (const sink of this.#submittingSinks) {
 			this.#failSink(sink, "BreadBoard session closed", "aborted");
 		}
+		for (const sink of admittedSinks) {
+			this.#cancelSink(sink, "user_requested");
+		}
+
+		await Promise.all([...this.#submissionsInFlight]);
+		await Promise.all([...this.#cancellationsInFlight]);
+
 		this.#submittingSinks.clear();
 		this.#sinks.clear();
 		this.#submittedTurnIds.clear();
 		this.#pendingEvents.clear();
-		this.#submissionsInFlight.clear();
 		await this.#session.close();
 	}
 
@@ -159,16 +182,6 @@ export class E4AgentStreamBridge {
 				if (!this.#closed && !this.#observeFailure) this.#submittedTurnIds.add(String(receipt.turnId));
 				return receipt;
 			});
-			let settled!: Promise<void>;
-			settled = submission.then(
-				() => {
-					this.#submissionsInFlight.delete(settled);
-				},
-				() => {
-					this.#submissionsInFlight.delete(settled);
-				},
-			);
-			this.#submissionsInFlight.add(settled);
 			const receipt = await submission;
 			this.#submittingSinks.delete(sink);
 			sink.turnId = receipt.turnId;
@@ -218,7 +231,16 @@ export class E4AgentStreamBridge {
 	#cancelSink(sink: TurnSink, reason: "user_requested" | "timeout"): void {
 		if (sink.cancelRequested || sink.turnId === undefined) return;
 		sink.cancelRequested = true;
-		void this.#cancel(sink.turnId, reason);
+		let cancellation!: Promise<void>;
+		cancellation = this.#cancel(sink.turnId, reason).then(
+			() => {
+				this.#cancellationsInFlight.delete(cancellation);
+			},
+			() => {
+				this.#cancellationsInFlight.delete(cancellation);
+			},
+		);
+		this.#cancellationsInFlight.add(cancellation);
 	}
 
 	async #observe(): Promise<void> {

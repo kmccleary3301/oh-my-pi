@@ -641,6 +641,10 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 	parsed.continue = false;
 	parsed.messages.splice(messageIndex, 1);
 }
+export type StartupForkPolicy = () => void;
+
+const ALLOW_STARTUP_FORK: StartupForkPolicy = () => {};
+
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
 export async function createSessionManager(
 	parsed: Args,
@@ -648,8 +652,10 @@ export async function createSessionManager(
 	activeSettings: Settings = settings,
 	askToForkSession: SessionPrompt = promptForkSession,
 	askToMoveSession: SessionPrompt = promptMoveSession,
+	beforeFork: StartupForkPolicy = ALLOW_STARTUP_FORK,
 ): Promise<SessionManager | undefined> {
 	if (parsed.fork) {
+		beforeFork();
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
 		}
@@ -728,6 +734,7 @@ export async function createSessionManager(
 					// by checking `typeof parsed.resume === "string"`.
 					return undefined;
 				}
+				beforeFork();
 				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
 			}
 		}
@@ -1081,6 +1088,33 @@ export class BreadboardSessionTransitionError extends Error {
 	}
 }
 
+function resolveEffectiveBreadboardRunConfig(
+	parsed: Pick<Args, "engineMode" | "engineUrl">,
+	activeSettings: Settings,
+	workspacePath: string,
+) {
+	const selectedConfig = parseSelectedBreadboardConfig(activeSettings.getRaw("breadboard"));
+	return resolveBreadboardRunConfig({
+		cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
+		selectedConfig,
+		workspacePath,
+	});
+}
+
+export function createBreadboardStartupForkPolicy(
+	parsed: Pick<Args, "engineMode" | "engineUrl">,
+	activeSettings: Settings = settings,
+	workspacePath: string = getProjectDir(),
+): StartupForkPolicy {
+	return () => {
+		const config = resolveEffectiveBreadboardRunConfig(parsed, activeSettings, workspacePath);
+		if (config.mode === "off") return;
+		throw new BreadboardSessionTransitionError(
+			"BreadBoard cannot fork an OMP session at startup because the current E4 SDK cannot atomically rebind the bridge to the forked transcript. Start a new OMP session or run with BreadBoard mode off.",
+		);
+	};
+}
+
 function rejectBreadboardSessionTransition(plan: SessionTransitionPlan): never {
 	const operation = (() => {
 		switch (plan.reason) {
@@ -1335,12 +1369,7 @@ export async function prepareBreadboardRuntime(
 	activeSettings: Settings = settings,
 	sessionManager?: BreadboardSessionBindingManager,
 ): Promise<PreparedBreadboardRuntime | null> {
-	const selectedConfig = parseSelectedBreadboardConfig(activeSettings.getRaw("breadboard"));
-	const config = resolveBreadboardRunConfig({
-		cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
-		selectedConfig,
-		workspacePath: getProjectDir(),
-	});
+	const config = resolveEffectiveBreadboardRunConfig(parsed, activeSettings, getProjectDir());
 	if (config.mode === "off") return null;
 	const target = resolveBreadboardSessionTarget(parsed, sessionManager, config.sessionConfigPath);
 
@@ -1541,10 +1570,9 @@ export async function runRootCommand(
 	// id from UUID-shaped values owned by later extension flags.
 	normalizeContinueSessionArgs(parsedArgs, rawArgs);
 
-	// Create session manager based on CLI flags. SessionResolutionError signals a
-	// user-facing failure (unknown --resume/--fork id, non-interactive fork
-	// prompt, --fork with --no-session): print + exit cleanly instead of letting
-	// it surface as `[Uncaught Exception]` (see issue #2084).
+	// Resolve startup session selection before the SDK creates or copies storage.
+	// Expected native resolution failures and BreadBoard fork-policy failures are
+	// printed cleanly here instead of surfacing with an internal stack trace.
 	let sessionManager: SessionManager | undefined;
 	try {
 		sessionManager = await logger.time(
@@ -1553,6 +1581,9 @@ export async function runRootCommand(
 			parsedArgs,
 			cwd,
 			settingsInstance,
+			promptForkSession,
+			promptMoveSession,
+			createBreadboardStartupForkPolicy(parsedArgs, settingsInstance, cwd),
 		);
 	} catch (error: unknown) {
 		if (error instanceof SessionResolutionError) {
@@ -1560,6 +1591,10 @@ export async function runRootCommand(
 			if (error.hint) {
 				process.stderr.write(`${chalk.dim(error.hint)}\n`);
 			}
+			process.exit(1);
+		}
+		if (error instanceof BreadboardSessionTransitionError) {
+			process.stderr.write(`BreadBoard session transition error [${error.code}]: ${error.message}\n`);
 			process.exit(1);
 		}
 		throw error;

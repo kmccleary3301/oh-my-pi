@@ -13,8 +13,12 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Args } from "@oh-my-pi/pi-coding-agent/cli/args";
-import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createSessionManager } from "@oh-my-pi/pi-coding-agent/main";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	BreadboardSessionTransitionError,
+	createBreadboardStartupForkPolicy,
+	createSessionManager,
+} from "@oh-my-pi/pi-coding-agent/main";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import * as sessionListingModule from "@oh-my-pi/pi-coding-agent/session/session-listing";
@@ -51,6 +55,115 @@ function buildGlobalMatch(cwd: string): { session: SessionInfo; scope: "global" 
 }
 
 const stubSettings = { get: () => undefined } as unknown as Settings;
+
+describe("createSessionManager — BreadBoard startup fork policy", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("rejects an explicit fork before SessionManager.forkFrom when BreadBoard is active", async () => {
+		const source = "/native/input/session.jsonl";
+		const parsed = {
+			...buildArgs("unused"),
+			resume: undefined,
+			fork: source,
+		};
+		const forkFrom = vi.spyOn(SessionManager, "forkFrom");
+		const policy = createBreadboardStartupForkPolicy(
+			parsed,
+			Settings.isolated({
+				"breadboard.engineMode": "local-external",
+				"breadboard.baseUrl": "http://127.0.0.1:7777",
+			} as never),
+			process.cwd(),
+		);
+
+		let failure: unknown;
+		try {
+			await createSessionManager(parsed, "/current/project", stubSettings, undefined, undefined, policy);
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBeInstanceOf(BreadboardSessionTransitionError);
+		expect(failure).toHaveProperty(
+			"message",
+			"BreadBoard cannot fork an OMP session at startup because the current E4 SDK cannot atomically rebind the bridge to the forked transcript. Start a new OMP session or run with BreadBoard mode off.",
+		);
+		expect((failure as Error).message).not.toContain(source);
+		expect(forkFrom).not.toHaveBeenCalled();
+	});
+
+	it("rejects an accepted cross-project fork before SessionManager.forkFrom when BreadBoard is active", async () => {
+		const otherProject = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-breadboard-xproj-"));
+		try {
+			vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(buildGlobalMatch(otherProject));
+			const forkFrom = vi.spyOn(SessionManager, "forkFrom");
+			const parsed = {
+				...buildArgs("019e84ed"),
+				engineMode: "local-external",
+				engineUrl: "http://127.0.0.1:7777",
+			};
+			const policy = createBreadboardStartupForkPolicy(parsed, Settings.isolated({}), process.cwd());
+
+			await expect(
+				createSessionManager(
+					parsed,
+					"/current/project",
+					stubSettings,
+					async () => "accepted" as const,
+					undefined,
+					policy,
+				),
+			).rejects.toBeInstanceOf(BreadboardSessionTransitionError);
+			expect(forkFrom).not.toHaveBeenCalled();
+		} finally {
+			await fsp.rm(otherProject, { recursive: true, force: true });
+		}
+	});
+
+	it("still executes explicit and accepted cross-project forks when BreadBoard is off", async () => {
+		const otherProject = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-native-xproj-"));
+		const manager = SessionManager.inMemory();
+		try {
+			vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(buildGlobalMatch(otherProject));
+			const forkFrom = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(manager);
+			const explicit = {
+				...buildArgs("unused"),
+				resume: undefined,
+				fork: "/native/input/session.jsonl",
+				engineMode: "off",
+			};
+			const implicit = { ...buildArgs("019e84ed"), engineMode: "off" };
+			const settings = Settings.isolated({ "breadboard.engineMode": "local-external" } as never);
+
+			await expect(
+				createSessionManager(
+					explicit,
+					"/current/project",
+					stubSettings,
+					undefined,
+					undefined,
+					createBreadboardStartupForkPolicy(explicit, settings, process.cwd()),
+				),
+			).resolves.toBe(manager);
+			await expect(
+				createSessionManager(
+					implicit,
+					"/current/project",
+					stubSettings,
+					async () => "accepted" as const,
+					undefined,
+					createBreadboardStartupForkPolicy(implicit, settings, process.cwd()),
+				),
+			).resolves.toBe(manager);
+			expect(forkFrom).toHaveBeenCalledTimes(2);
+		} finally {
+			await manager.close();
+			await fsp.rm(otherProject, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("createSessionManager — cross-project --resume cancellation (#1668)", () => {
 	// An existing directory so the match is treated as a genuinely different
