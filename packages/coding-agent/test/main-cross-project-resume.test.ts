@@ -61,6 +61,40 @@ describe("createSessionManager — BreadBoard startup fork policy", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("guards startup forks only on interactive BreadBoard-capable surfaces", () => {
+		const activeSettings = Settings.isolated({
+			"breadboard.engineMode": "local-external",
+			"breadboard.baseUrl": "http://127.0.0.1:7777",
+		} as never);
+		const effectiveOffSettings = Settings.isolated({
+			"breadboard.engineMode": "local-external",
+		} as never);
+		const surfaces = [
+			{ name: "interactive", canPrepareBreadboardRuntime: true, engineMode: undefined, rejected: true },
+			{ name: "interactive effective-off", canPrepareBreadboardRuntime: true, engineMode: "off", rejected: false },
+			{ name: "print", canPrepareBreadboardRuntime: false, engineMode: undefined, rejected: false },
+			{ name: "rpc", canPrepareBreadboardRuntime: false, engineMode: undefined, rejected: false },
+			{ name: "rpc-ui", canPrepareBreadboardRuntime: false, engineMode: undefined, rejected: false },
+			{ name: "acp", canPrepareBreadboardRuntime: false, engineMode: undefined, rejected: false },
+			{ name: "export", canPrepareBreadboardRuntime: false, engineMode: undefined, rejected: false },
+			{ name: "other native-only", canPrepareBreadboardRuntime: false, engineMode: undefined, rejected: false },
+		] as const;
+
+		for (const surface of surfaces) {
+			const policy = createBreadboardStartupForkPolicy(
+				{ engineMode: surface.engineMode },
+				surface.engineMode === "off" ? effectiveOffSettings : activeSettings,
+				process.cwd(),
+				surface.canPrepareBreadboardRuntime,
+			);
+			if (surface.rejected) {
+				expect(policy, surface.name).toThrow(BreadboardSessionTransitionError);
+			} else {
+				expect(policy, surface.name).not.toThrow();
+			}
+		}
+	});
+
 	it("rejects an explicit fork before SessionManager.forkFrom when BreadBoard is active", async () => {
 		const source = "/native/input/session.jsonl";
 		const parsed = {
@@ -155,6 +189,50 @@ describe("createSessionManager — BreadBoard startup fork policy", () => {
 					async () => "accepted" as const,
 					undefined,
 					createBreadboardStartupForkPolicy(implicit, settings, process.cwd()),
+				),
+			).resolves.toBe(manager);
+			expect(forkFrom).toHaveBeenCalledTimes(2);
+		} finally {
+			await manager.close();
+			await fsp.rm(otherProject, { recursive: true, force: true });
+		}
+	});
+
+	it("executes explicit and accepted cross-project forks on native-only surfaces with active BreadBoard settings", async () => {
+		const otherProject = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-native-surface-xproj-"));
+		const manager = SessionManager.inMemory();
+		try {
+			vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(buildGlobalMatch(otherProject));
+			const forkFrom = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(manager);
+			const explicit = {
+				...buildArgs("unused"),
+				resume: undefined,
+				fork: "/native/input/session.jsonl",
+			};
+			const implicit = buildArgs("019e84ed");
+			const activeSettings = Settings.isolated({
+				"breadboard.engineMode": "local-external",
+				"breadboard.baseUrl": "http://127.0.0.1:7777",
+			} as never);
+
+			await expect(
+				createSessionManager(
+					explicit,
+					"/current/project",
+					stubSettings,
+					undefined,
+					undefined,
+					createBreadboardStartupForkPolicy(explicit, activeSettings, process.cwd(), false),
+				),
+			).resolves.toBe(manager);
+			await expect(
+				createSessionManager(
+					implicit,
+					"/current/project",
+					stubSettings,
+					async () => "accepted" as const,
+					undefined,
+					createBreadboardStartupForkPolicy(implicit, activeSettings, process.cwd(), false),
 				),
 			).resolves.toBe(manager);
 			expect(forkFrom).toHaveBeenCalledTimes(2);

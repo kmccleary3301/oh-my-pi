@@ -269,6 +269,7 @@ describe("BreadBoard native interactive authority", () => {
 			[{ reason: "new" }, "start a new OMP session"],
 			[{ reason: "resume", targetSessionFile: "/tmp/target.jsonl" }, 'switch to OMP session "/tmp/target.jsonl"'],
 			[{ reason: "fork" }, "fork the current OMP session"],
+			[{ reason: "handoff" }, "hand off to a new OMP session"],
 			[{ reason: "branch", targetEntryId: "entry-branch" }, 'branch the OMP session from entry "entry-branch"'],
 			[{ reason: "branchFromBtw", targetEntryId: "entry-btw" }, 'branch /btw from OMP entry "entry-btw"'],
 			[
@@ -287,6 +288,14 @@ describe("BreadBoard native interactive authority", () => {
 				"message",
 				`BreadBoard cannot ${operation} while the current E4 session is bound to this OMP transcript; the current E4 SDK cannot atomically rebind the bridge to the requested transcript.`,
 			);
+			if (plan.reason === "handoff") {
+				const message = (failure as Error).message;
+				expect(message).not.toContain("session-return");
+				const privateSessionId = manager.getSessionId();
+				if (privateSessionId) expect(message).not.toContain(privateSessionId);
+				const privateSessionFile = manager.getSessionFile();
+				if (privateSessionFile) expect(message).not.toContain(privateSessionFile);
+			}
 		}
 	});
 

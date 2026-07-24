@@ -1105,7 +1105,9 @@ export function createBreadboardStartupForkPolicy(
 	parsed: Pick<Args, "engineMode" | "engineUrl">,
 	activeSettings: Settings = settings,
 	workspacePath: string = getProjectDir(),
+	canPrepareBreadboardRuntime = true,
 ): StartupForkPolicy {
+	if (!canPrepareBreadboardRuntime) return ALLOW_STARTUP_FORK;
 	return () => {
 		const config = resolveEffectiveBreadboardRunConfig(parsed, activeSettings, workspacePath);
 		if (config.mode === "off") return;
@@ -1122,6 +1124,8 @@ function rejectBreadboardSessionTransition(plan: SessionTransitionPlan): never {
 				return "start a new OMP session";
 			case "resume":
 				return `switch to OMP session "${plan.targetSessionFile}"`;
+			case "handoff":
+				return "hand off to a new OMP session";
 			case "fork":
 				return "fork the current OMP session";
 			case "branch":
@@ -1583,7 +1587,7 @@ export async function runRootCommand(
 			settingsInstance,
 			promptForkSession,
 			promptMoveSession,
-			createBreadboardStartupForkPolicy(parsedArgs, settingsInstance, cwd),
+			createBreadboardStartupForkPolicy(parsedArgs, settingsInstance, cwd, isInteractive),
 		);
 	} catch (error: unknown) {
 		if (error instanceof SessionResolutionError) {

@@ -804,6 +804,7 @@ export type SessionTransitionPlan =
 	| { readonly reason: "new" }
 	| { readonly reason: "resume"; readonly targetSessionFile: string }
 	| { readonly reason: "fork" }
+	| { readonly reason: "handoff" }
 	| { readonly reason: "branch"; readonly targetEntryId: string }
 	| { readonly reason: "branchFromBtw"; readonly targetEntryId: string }
 	| { readonly reason: "navigateTree"; readonly targetEntryId: string };
@@ -11360,6 +11361,8 @@ export class AgentSession {
 		if (messageCount < 2) {
 			throw new Error("Nothing to hand off (no messages yet)");
 		}
+
+		await this.#sessionTransitionGuard?.({ reason: "handoff" });
 
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 

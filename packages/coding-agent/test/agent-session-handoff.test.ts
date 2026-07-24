@@ -146,6 +146,81 @@ describe("AgentSession handoff", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("rejects a guarded handoff before changing the live session", async () => {
+		const queuedSteer: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "queued steer" }],
+			attribution: "user",
+			timestamp: Date.now(),
+		};
+		const queuedFollowUp: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "queued follow-up" }],
+			attribution: "user",
+			timestamp: Date.now() + 1,
+		};
+		session.agent.steer(queuedSteer);
+		session.agent.followUp(queuedFollowUp);
+		await sessionManager.ensureOnDisk();
+
+		const originalSessionFile = session.sessionFile;
+		if (!originalSessionFile) throw new Error("Expected a persisted session file");
+		const original = {
+			sessionId: session.sessionId,
+			entries: structuredClone(sessionManager.getEntries()),
+			messages: structuredClone(session.agent.state.messages),
+			steering: structuredClone(session.agent.peekSteeringQueue()),
+			followUp: structuredClone(session.agent.peekFollowUpQueue()),
+			model: session.model,
+			fileText: await Bun.file(originalSessionFile).text(),
+		};
+		const transitionError = new Error("handoff transition rejected");
+		const guard = vi.fn(() => {
+			throw transitionError;
+		});
+		session.setSessionTransitionGuard(guard);
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue("must not be generated");
+
+		await expect(session.handoff()).rejects.toBe(transitionError);
+
+		expect(guard).toHaveBeenCalledTimes(1);
+		expect(guard).toHaveBeenCalledWith({ reason: "handoff" });
+		expect(generateHandoffSpy).not.toHaveBeenCalled();
+		expect(session.sessionFile).toBe(originalSessionFile);
+		expect(session.sessionId).toBe(original.sessionId);
+		expect(sessionManager.getEntries()).toEqual(original.entries);
+		expect(session.agent.state.messages).toEqual(original.messages);
+		expect(session.agent.peekSteeringQueue()).toEqual(original.steering);
+		expect(session.agent.peekFollowUpQueue()).toEqual(original.followUp);
+		expect(session.model).toBe(original.model);
+		expect(session.isGeneratingHandoff).toBe(false);
+		expect(await Bun.file(originalSessionFile).text()).toBe(original.fileText);
+
+		const connectedMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "connection still active" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now() + 2,
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: connectedMessage });
+		await waitFor(() =>
+			sessionManager.getEntries().some(entry => entry.type === "message" && entry.message === connectedMessage),
+		);
+	});
+
 	it("does not run auto-compaction after handoff turn completes", async () => {
 		const handoffText = "## Goal\nContinue from here";
 		const generateHandoffSpy = vi
@@ -1433,6 +1508,72 @@ describe("AgentSession handoff", () => {
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
 		expect(endEvents[0]).toMatchObject({ type: "auto_compaction_end", aborted: false, willRetry: false });
+	});
+
+	it("rejects threshold-triggered auto-handoff before generation or session mutation", async () => {
+		session.settings.set("compaction.strategy", "handoff");
+		session.settings.set("compaction.thresholdPercent", 1);
+		session.settings.set("contextPromotion.enabled", false);
+
+		const activeModel = session.model;
+		if (!activeModel) throw new Error("Expected model to be set");
+		const assistantMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "guarded maintenance trigger" }],
+			api: activeModel.api,
+			provider: activeModel.provider,
+			model: activeModel.id,
+			stopReason: "stop",
+			usage: {
+				input: 10_000,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 11_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+		await waitFor(() =>
+			sessionManager.getEntries().some(entry => entry.type === "message" && entry.message === assistantMessage),
+		);
+		await sessionManager.ensureOnDisk();
+
+		const originalSessionFile = session.sessionFile;
+		if (!originalSessionFile) throw new Error("Expected a persisted session file");
+		const original = {
+			sessionId: session.sessionId,
+			entries: structuredClone(sessionManager.getEntries()),
+			messages: structuredClone(session.agent.state.messages),
+			steering: structuredClone(session.agent.peekSteeringQueue()),
+			followUp: structuredClone(session.agent.peekFollowUpQueue()),
+			model: session.model,
+			fileText: await Bun.file(originalSessionFile).text(),
+		};
+		const guard = vi.fn(() => {
+			throw new Error("automatic handoff transition rejected");
+		});
+		session.setSessionTransitionGuard(guard);
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue("must not be generated");
+
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		await waitFor(() => events.some(event => event.type === "auto_compaction_end"));
+
+		expect(guard).toHaveBeenCalledTimes(1);
+		expect(guard).toHaveBeenCalledWith({ reason: "handoff" });
+		expect(generateHandoffSpy).not.toHaveBeenCalled();
+		expect(session.sessionFile).toBe(originalSessionFile);
+		expect(session.sessionId).toBe(original.sessionId);
+		expect(sessionManager.getEntries()).toEqual(original.entries);
+		expect(session.agent.state.messages).toEqual(original.messages);
+		expect(session.agent.peekSteeringQueue()).toEqual(original.steering);
+		expect(session.agent.peekFollowUpQueue()).toEqual(original.followUp);
+		expect(session.model).toBe(original.model);
+		expect(session.isGeneratingHandoff).toBe(false);
+		expect(await Bun.file(originalSessionFile).text()).toBe(original.fileText);
 	});
 
 	it("completes threshold-triggered auto-handoff while the original prompt is still unwinding", async () => {
