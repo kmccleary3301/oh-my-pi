@@ -12,7 +12,7 @@ import { LocalAuthorityStore } from "../breadboard/lifecycle/local-authority-sto
 import {
 	BREADBOARD_ENGINE_MODES,
 	BreadboardRunConfigError,
-	loadSelectedBreadboardConfig,
+	parseSelectedBreadboardConfig,
 	resolveBreadboardRunConfig,
 } from "../breadboard/lifecycle/run-config";
 import { Settings } from "../config/settings";
@@ -37,6 +37,10 @@ export default class Engine extends Command {
 			options: [...BREADBOARD_ENGINE_MODES],
 		}),
 		"engine-url": Flags.string({ description: "Exact BreadBoard engine endpoint URL" }),
+		config: Flags.string({
+			description: "Load an extra config.yml-style overlay for this run (repeatable)",
+			multiple: true,
+		}),
 	};
 
 	async run(): Promise<void> {
@@ -44,8 +48,8 @@ export default class Engine extends Command {
 		try {
 			const { args, flags } = await this.parse(Engine);
 			const action = (args.action ?? "status") as EngineAction;
-			await Settings.init({ cwd: process.cwd() });
-			const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "config.yml"));
+			const activeSettings = await Settings.init({ cwd: process.cwd(), configFiles: flags.config });
+			const selectedConfig = parseSelectedBreadboardConfig(activeSettings.getRaw("breadboard"));
 			const config = resolveBreadboardRunConfig({
 				cli: {
 					engineMode: flags["engine-mode"],

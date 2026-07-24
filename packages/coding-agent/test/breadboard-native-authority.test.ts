@@ -1,19 +1,46 @@
 import { describe, expect, mock, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { PermissionRequestedPayload } from "@breadboard/sdk";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { E4PermissionHandler } from "@oh-my-pi/pi-coding-agent/breadboard/e4-agent-stream";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import Engine from "@oh-my-pi/pi-coding-agent/commands/engine";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
+	BREADBOARD_SESSION_BINDING_CUSTOM_TYPE,
+	createBreadboardPermissionHandler,
 	prepareBreadboardRuntime,
 	prepareConnectedBreadboardRuntime,
+	resolveBreadboardBackendModel,
+	resolveBreadboardSessionTarget,
 	runRootCommand,
 } from "@oh-my-pi/pi-coding-agent/main";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+
+const BREADBOARD_MODEL = getBundledModel("anthropic", "claude-sonnet-4-5");
+if (!BREADBOARD_MODEL) throw new Error("bundled BreadBoard authority test model missing");
+const CLI_SELECTED_MODEL = getBundledModel("openai", "gpt-5.2");
+if (!CLI_SELECTED_MODEL) throw new Error("bundled CLI-selected test model missing");
+const BREADBOARD_MODEL_SELECTOR = `${BREADBOARD_MODEL.provider}/${BREADBOARD_MODEL.id}`;
+const TEST_RUNTIME_AUTHORITY = {
+	modelRegistry: { getAll: () => [BREADBOARD_MODEL] },
+	requestPermission: async () => "cancel" as const,
+};
+const PERMISSION_REQUEST = {
+	requestId: "permission-1",
+	tool: "edit",
+	kind: "write",
+	summary: "Update a source file",
+	defaultScope: null,
+	rewindable: false,
+} as unknown as PermissionRequestedPayload;
 
 describe("BreadBoard native interactive authority", () => {
 	test("injects the BreadBoard turn transport into the ordinary OMP AgentSession path", async () => {
@@ -24,7 +51,7 @@ describe("BreadBoard native interactive authority", () => {
 			"startup.checkUpdate": false,
 			"startup.showSplash": false,
 		});
-		const parsed = parseArgs([]);
+		const parsed = parseArgs(["--model", `${CLI_SELECTED_MODEL.provider}/${CLI_SELECTED_MODEL.id}`]);
 		parsed.noExtensions = true;
 		parsed.noSkills = true;
 		parsed.noRules = true;
@@ -33,6 +60,7 @@ describe("BreadBoard native interactive authority", () => {
 		parsed.sessionDir = tempDir.path();
 
 		const breadboardStream: StreamFn = () => new AssistantMessageEventStream();
+		const closeRuntime = mock(async () => {});
 		let prepared = false;
 		let observedOptions: CreateAgentSessionOptions | undefined;
 
@@ -42,7 +70,12 @@ describe("BreadBoard native interactive authority", () => {
 				settings,
 				prepareBreadboardRuntime: async () => {
 					prepared = true;
-					return { stream: breadboardStream, sessionId: "session-1", async close() {} };
+					return {
+						stream: breadboardStream,
+						sessionId: "session-1",
+						model: BREADBOARD_MODEL,
+						close: closeRuntime,
+					};
 				},
 				createAgentSession: async options => {
 					observedOptions = options;
@@ -58,6 +91,170 @@ describe("BreadBoard native interactive authority", () => {
 		expect(prepared).toBe(true);
 		expect(observedOptions?.mainStreamFn).toBe(breadboardStream);
 		expect(observedOptions?.hasUI).toBe(true);
+		expect(observedOptions?.model).toBe(BREADBOARD_MODEL);
+		expect(observedOptions?.model).not.toBe(CLI_SELECTED_MODEL);
+		expect(closeRuntime).toHaveBeenCalledTimes(1);
+	});
+
+	test("closes the transferred runtime when interactive mode returns", async () => {
+		using tempDir = TempDir.createSync("@breadboard-native-return-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"startup.showSplash": false,
+		});
+		const parsed = parseArgs([]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		parsed.sessionDir = tempDir.join("sessions");
+
+		const manager = SessionManager.create(tempDir.path(), parsed.sessionDir);
+		const closeRuntime = mock(async () => {});
+		let requestPermission: E4PermissionHandler | undefined;
+		let permissionDecision: string | undefined;
+		const select = mock(async () => "Allow");
+		const uiContext = { select } as never;
+		const setToolUIContext = mock(() => {});
+		const runInteractiveMode = mock(async (...args: unknown[]) => {
+			const captureUIContext = args[6] as (uiContext: never, hasUI: boolean) => void;
+			captureUIContext(uiContext, true);
+			permissionDecision = await requestPermission!(PERMISSION_REQUEST, new AbortController().signal);
+		});
+
+		try {
+			await runRootCommand(parsed, [], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				prepareBreadboardRuntime: async (_parsed, _emitAgentEvent, authority) => {
+					requestPermission = authority.requestPermission;
+					return {
+						stream: () => new AssistantMessageEventStream(),
+						sessionId: "session-return",
+						model: BREADBOARD_MODEL,
+						close: closeRuntime,
+					};
+				},
+				createAgentSession: async () =>
+					({
+						session: {
+							agent: { emitExternalEvent() {} },
+							sessionManager: manager,
+						},
+						setToolUIContext,
+					}) as never,
+				runInteractiveMode: runInteractiveMode as never,
+			});
+		} finally {
+			await manager.close();
+			authStorage.close();
+		}
+
+		expect(runInteractiveMode).toHaveBeenCalledTimes(1);
+		expect(closeRuntime).toHaveBeenCalledTimes(1);
+		expect(permissionDecision).toBe("allow");
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(setToolUIContext).toHaveBeenCalledWith(uiContext, true);
+		const bindingEntry = manager
+			.getBranch()
+			.find(entry => entry.type === "custom" && entry.customType === BREADBOARD_SESSION_BINDING_CUSTOM_TYPE);
+		expect(bindingEntry?.type === "custom" ? bindingEntry.data : undefined).toEqual({ sessionId: "session-return" });
+	});
+
+	test("closes the transferred runtime when interactive mode throws", async () => {
+		using tempDir = TempDir.createSync("@breadboard-native-throw-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"startup.showSplash": false,
+		});
+		const parsed = parseArgs([]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		parsed.sessionDir = tempDir.join("sessions");
+
+		const manager = SessionManager.create(tempDir.path(), parsed.sessionDir);
+		const closeRuntime = mock(async () => {});
+		const runInteractiveMode = mock(async () => {
+			throw new Error("interactive-mode-failure");
+		});
+
+		try {
+			await expect(
+				runRootCommand(parsed, [], {
+					discoverAuthStorage: async () => authStorage,
+					settings,
+					prepareBreadboardRuntime: async () => ({
+						stream: () => new AssistantMessageEventStream(),
+						sessionId: "session-throw",
+						model: BREADBOARD_MODEL,
+						close: closeRuntime,
+					}),
+					createAgentSession: async () =>
+						({
+							session: {
+								agent: { emitExternalEvent() {} },
+								sessionManager: manager,
+							},
+							setToolUIContext() {},
+						}) as never,
+					runInteractiveMode: runInteractiveMode as never,
+				}),
+			).rejects.toThrow("interactive-mode-failure");
+		} finally {
+			await manager.close();
+			authStorage.close();
+		}
+
+		expect(runInteractiveMode).toHaveBeenCalledTimes(1);
+		expect(closeRuntime).toHaveBeenCalledTimes(1);
+	});
+
+	test("closes the transferred runtime when session creation fails", async () => {
+		using tempDir = TempDir.createSync("@breadboard-native-create-failure-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"startup.showSplash": false,
+		});
+		const parsed = parseArgs([]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		parsed.sessionDir = tempDir.join("sessions");
+		const closeRuntime = mock(async () => {});
+
+		try {
+			await expect(
+				runRootCommand(parsed, [], {
+					discoverAuthStorage: async () => authStorage,
+					settings,
+					prepareBreadboardRuntime: async () => ({
+						stream: () => new AssistantMessageEventStream(),
+						sessionId: "session-create-failure",
+						model: BREADBOARD_MODEL,
+						close: closeRuntime,
+					}),
+					createAgentSession: async () => {
+						throw new Error("post-transfer-create-failure");
+					},
+				}),
+			).rejects.toThrow("post-transfer-create-failure");
+		} finally {
+			authStorage.close();
+		}
+
+		expect(closeRuntime).toHaveBeenCalledTimes(1);
 	});
 });
 describe("BreadBoard runtime preparation ownership", () => {
@@ -66,6 +263,7 @@ describe("BreadBoard runtime preparation ownership", () => {
 
 		await expect(
 			prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
 				closeSupervisor,
 				openSession: async () => {
 					throw new Error("open failed");
@@ -83,6 +281,7 @@ describe("BreadBoard runtime preparation ownership", () => {
 
 		await expect(
 			prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
 				closeSupervisor,
 				openSession: async () =>
 					({
@@ -106,11 +305,12 @@ describe("BreadBoard runtime preparation ownership", () => {
 
 		await expect(
 			prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
 				closeSupervisor,
 				openSession: async () =>
 					({
 						sessionId: "bridge-failure",
-						snapshot: async () => ({ headSequence: 0 }),
+						snapshot: async () => ({ headSequence: 0, model: BREADBOARD_MODEL_SELECTOR }),
 						close: closeSession,
 					}) as never,
 				createBridge: () => {
@@ -131,11 +331,12 @@ describe("BreadBoard runtime preparation ownership", () => {
 
 		await expect(
 			prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
 				closeSupervisor,
 				openSession: async () =>
 					({
 						sessionId: "registration-failure",
-						snapshot: async () => ({ headSequence: 0 }),
+						snapshot: async () => ({ headSequence: 0, model: BREADBOARD_MODEL_SELECTOR }),
 						close: closeSession,
 					}) as never,
 				createBridge: () => ({
@@ -158,18 +359,25 @@ describe("BreadBoard runtime preparation ownership", () => {
 		const closeSupervisor = mock(async () => {});
 		const closeBridge = mock(async () => {});
 		const cancelCleanup = mock(() => {});
+		let bridgeModel: unknown;
+		let bridgeRequestPermission: unknown;
 
 		const prepared = await prepareConnectedBreadboardRuntime({
+			...TEST_RUNTIME_AUTHORITY,
 			closeSupervisor,
 			openSession: async () =>
 				({
 					sessionId: "ready",
-					snapshot: async () => ({ headSequence: 0 }),
+					snapshot: async () => ({ headSequence: 0, model: BREADBOARD_MODEL_SELECTOR }),
 				}) as never,
-			createBridge: () => ({
-				stream: () => new AssistantMessageEventStream(),
-				close: closeBridge,
-			}),
+			createBridge: options => {
+				bridgeModel = options.modelPolicy?.model;
+				bridgeRequestPermission = options.requestPermission;
+				return {
+					stream: () => new AssistantMessageEventStream(),
+					close: closeBridge,
+				};
+			},
 			registerCleanup: () => cancelCleanup,
 			emitAgentEvent: () => {},
 		});
@@ -178,8 +386,239 @@ describe("BreadBoard runtime preparation ownership", () => {
 		await prepared.close();
 		await prepared.close();
 		expect(cancelCleanup).toHaveBeenCalledTimes(1);
+		expect(prepared.model).toBe(BREADBOARD_MODEL);
+		expect(bridgeModel).toBe(BREADBOARD_MODEL);
+		expect(bridgeRequestPermission).toBe(TEST_RUNTIME_AUTHORITY.requestPermission);
 		expect(closeBridge).toHaveBeenCalledTimes(1);
 		expect(closeSupervisor).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("BreadBoard backend model authority", () => {
+	test("resolves a provider-qualified snapshot model to the exact loaded ModelRegistry entry", async () => {
+		using tempDir = TempDir.createSync("@breadboard-model-resolution-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+
+		try {
+			const expected = modelRegistry
+				.getAll()
+				.find(model => model.provider === BREADBOARD_MODEL.provider && model.id === BREADBOARD_MODEL.id);
+			if (!expected) throw new Error("expected bundled model missing from ModelRegistry");
+			expect(resolveBreadboardBackendModel(BREADBOARD_MODEL_SELECTOR, modelRegistry)).toBe(expected);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	test("fails preparation on missing snapshot model metadata before creating the bridge", async () => {
+		const closeSupervisor = mock(async () => {});
+		const closeSession = mock(async () => {});
+		const createBridge = mock(() => {
+			throw new Error("bridge must not be created");
+		});
+
+		await expect(
+			prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
+				closeSupervisor,
+				openSession: async () =>
+					({
+						sessionId: "missing-model",
+						snapshot: async () => ({ headSequence: 0, model: null }),
+						close: closeSession,
+					}) as never,
+				createBridge,
+				emitAgentEvent: () => {},
+			}),
+		).rejects.toMatchObject({ code: "missing_backend_model" });
+
+		expect(createBridge).not.toHaveBeenCalled();
+		expect(closeSession).toHaveBeenCalledTimes(1);
+		expect(closeSupervisor).toHaveBeenCalledTimes(1);
+	});
+
+	test("fails preparation when snapshot model metadata is not in the loaded registry", async () => {
+		const closeSupervisor = mock(async () => {});
+		const closeSession = mock(async () => {});
+		const createBridge = mock(() => {
+			throw new Error("bridge must not be created");
+		});
+
+		await expect(
+			prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
+				closeSupervisor,
+				openSession: async () =>
+					({
+						sessionId: "unknown-model",
+						snapshot: async () => ({ headSequence: 0, model: "unknown-provider/unknown-model" }),
+						close: closeSession,
+					}) as never,
+				createBridge,
+				emitAgentEvent: () => {},
+			}),
+		).rejects.toMatchObject({ code: "unresolved_backend_model" });
+
+		expect(createBridge).not.toHaveBeenCalled();
+		expect(closeSession).toHaveBeenCalledTimes(1);
+		expect(closeSupervisor).toHaveBeenCalledTimes(1);
+	});
+
+	test("rejects a bare backend model id that is ambiguous in ModelRegistry", async () => {
+		using tempDir = TempDir.createSync("@breadboard-model-ambiguous-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+
+		try {
+			const matchingModels = modelRegistry.getAll().filter(model => model.id === BREADBOARD_MODEL.id);
+			expect(new Set(matchingModels.map(model => model.provider)).size).toBeGreaterThan(1);
+			expect(() => resolveBreadboardBackendModel(BREADBOARD_MODEL.id, modelRegistry)).toThrow(
+				expect.objectContaining({ code: "ambiguous_backend_model" }),
+			);
+		} finally {
+			authStorage.close();
+		}
+	});
+});
+
+describe("BreadBoard native permission UI", () => {
+	test("maps explicit Allow and Deny selections and passes only safe request context", async () => {
+		for (const [selection, expected] of [
+			["Allow", "allow"],
+			["Deny", "deny"],
+		] as const) {
+			const select = mock(
+				async (_title: string, _options: unknown[], _dialogOptions?: { signal?: AbortSignal }) => selection,
+			);
+			const handler = createBreadboardPermissionHandler(() => ({ select }) as never);
+			const controller = new AbortController();
+			const request = {
+				...PERMISSION_REQUEST,
+				tool: "edit\x1b[31m",
+				kind: "write\noperation",
+				summary: "Authorization: Bearer canary-token-never-serialize",
+				arguments: { apiKey: "raw-secret-never-show" },
+			} as unknown as PermissionRequestedPayload;
+
+			await expect(handler(request, controller.signal)).resolves.toBe(expected);
+			expect(select).toHaveBeenCalledTimes(1);
+			const [title, options, dialogOptions] = select.mock.calls[0]!;
+			expect(options).toEqual(["Allow", "Deny"]);
+			expect(dialogOptions).toEqual({ signal: controller.signal });
+			expect(title).toContain("edit");
+			expect(title).toContain("write operation");
+			expect(title).toContain("[redacted]");
+			expect(title).not.toContain("\x1b");
+			expect(title).not.toContain("canary-token-never-serialize");
+			expect(title).not.toContain("raw-secret-never-show");
+		}
+	});
+
+	test("maps selector dismissal to cancel", async () => {
+		const select = mock(async () => undefined);
+		const handler = createBreadboardPermissionHandler(() => ({ select }) as never);
+
+		await expect(handler(PERMISSION_REQUEST, new AbortController().signal)).resolves.toBe("cancel");
+	});
+
+	test("maps an aborted native selector to cancel using the bridge signal", async () => {
+		const controller = new AbortController();
+		const select = mock(
+			async (_title: string, _options: unknown[], dialogOptions?: { signal?: AbortSignal }): Promise<undefined> => {
+				expect(dialogOptions?.signal).toBe(controller.signal);
+				await new Promise<void>((_resolve, reject) => {
+					dialogOptions?.signal?.addEventListener(
+						"abort",
+						() => {
+							const error = new Error("selector aborted");
+							error.name = "AbortError";
+							reject(error);
+						},
+						{ once: true },
+					);
+				});
+				return undefined;
+			},
+		);
+		const handler = createBreadboardPermissionHandler(() => ({ select }) as never);
+
+		const decision = handler(PERMISSION_REQUEST, controller.signal);
+		controller.abort();
+		await expect(decision).resolves.toBe("cancel");
+	});
+
+	test("cancels immediately when permission arrives before UI initialization", async () => {
+		const handler = createBreadboardPermissionHandler(() => undefined);
+
+		await expect(handler(PERMISSION_REQUEST, new AbortController().signal)).resolves.toBe("cancel");
+	});
+});
+
+describe("BreadBoard resume identity authority", () => {
+	test("resolves picker, --continue, and path-based --resume through the durable session binding", async () => {
+		using tempDir = TempDir.createSync("@breadboard-resume-binding-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		manager.appendCustomEntry(BREADBOARD_SESSION_BINDING_CUSTOM_TYPE, { sessionId: "e4-durable-session" });
+		await manager.flush();
+
+		try {
+			const variants = [
+				{ continue: true, resume: undefined },
+				{ continue: false, resume: true },
+				{ continue: false, resume: manager.getSessionFile() },
+			] as const;
+			for (const variant of variants) {
+				const parsed = parseArgs([]);
+				parsed.continue = variant.continue;
+				parsed.resume = variant.resume;
+				expect(resolveBreadboardSessionTarget(parsed, manager, "/tmp/session-config.yml")).toEqual({
+					kind: "attach",
+					sessionId: "e4-durable-session",
+				});
+			}
+		} finally {
+			await manager.close();
+		}
+	});
+
+	test("fails closed for a resumed native transcript without a durable BreadBoard binding", async () => {
+		using tempDir = TempDir.createSync("@breadboard-resume-unbound-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		const parsed = parseArgs([]);
+		parsed.resume = manager.getSessionFile();
+
+		try {
+			expect(() => resolveBreadboardSessionTarget(parsed, manager, "/tmp/session-config.yml")).toThrow(
+				"cannot resume this OMP transcript because it has no durable BreadBoard session binding",
+			);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	test("rejects an unbound resumed transcript before attempting a backend connection", async () => {
+		using tempDir = TempDir.createSync("@breadboard-resume-before-connect-");
+		const agentDir = tempDir.join("agent");
+		const projectDir = tempDir.join("project");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.mkdirSync(projectDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			"breadboard:\n  engineMode: local-external\n  baseUrl: http://127.0.0.1:1\n  sessionConfigPath: /tmp/session.yml\n",
+		);
+		const activeSettings = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+		const manager = SessionManager.create(projectDir, tempDir.join("sessions"));
+		const parsed = parseArgs([]);
+		parsed.resume = manager.getSessionFile();
+
+		try {
+			await expect(
+				prepareBreadboardRuntime(parsed, () => {}, TEST_RUNTIME_AUTHORITY, activeSettings, manager),
+			).rejects.toThrow("cannot resume this OMP transcript because it has no durable BreadBoard session binding");
+		} finally {
+			await manager.close();
+		}
 	});
 });
 
@@ -202,9 +641,44 @@ describe("BreadBoard migrated config authority", () => {
 			resetSettingsForTest();
 			await Settings.init({ cwd: projectDir, agentDir });
 
-			await expect(prepareBreadboardRuntime(parseArgs([]), () => {})).resolves.toBeNull();
+			await expect(prepareBreadboardRuntime(parseArgs([]), () => {}, TEST_RUNTIME_AUTHORITY)).resolves.toBeNull();
 			expect(await Bun.file(path.join(agentDir, "config.yml")).exists()).toBe(true);
 			expect(await Bun.file(path.join(agentDir, "settings.json.bak")).exists()).toBe(true);
+		} finally {
+			resetSettingsForTest();
+			setAgentDir(previousAgentDir);
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	test("interactive startup uses config.yaml plus the explicit config overlay from Settings", async () => {
+		using tempDir = TempDir.createSync("@breadboard-interactive-overlay-");
+		const agentDir = tempDir.join("agent");
+		const projectDir = tempDir.join("project");
+		const overlayPath = tempDir.join("overlay.yml");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.mkdirSync(projectDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yaml"),
+			"breadboard:\n  engineMode: invalid-from-main-config\n  sessionConfigPath: /tmp/session.yml\n",
+		);
+		await Bun.write(overlayPath, "breadboard:\n  engineMode: off\n");
+		const previousAgentDir = getAgentDir();
+		const previousExitCode = process.exitCode;
+
+		try {
+			setAgentDir(agentDir);
+			resetSettingsForTest();
+			const activeSettings = await Settings.init({ cwd: projectDir, agentDir, configFiles: [overlayPath] });
+
+			await expect(
+				prepareBreadboardRuntime(
+					parseArgs(["--config", overlayPath]),
+					() => {},
+					TEST_RUNTIME_AUTHORITY,
+					activeSettings,
+				),
+			).resolves.toBeNull();
 		} finally {
 			resetSettingsForTest();
 			setAgentDir(previousAgentDir);
@@ -240,6 +714,84 @@ describe("BreadBoard migrated config authority", () => {
 			expect(await Bun.file(path.join(agentDir, "settings.json.bak")).exists()).toBe(true);
 		} finally {
 			resetSettingsForTest();
+			process.chdir(previousCwd);
+			setAgentDir(previousAgentDir);
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	test("engine commands use config.yaml and --config overlays from Settings", async () => {
+		using tempDir = TempDir.createSync("@breadboard-engine-overlay-");
+		const agentDir = tempDir.join("agent");
+		const projectDir = tempDir.join("project");
+		const overlayPath = tempDir.join("overlay.yml");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.mkdirSync(projectDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yaml"),
+			"breadboard:\n  engineMode: invalid-from-main-config\n  sessionConfigPath: /tmp/session.yml\n",
+		);
+		await Bun.write(overlayPath, "breadboard:\n  engineMode: off\n");
+		const previousAgentDir = getAgentDir();
+		const previousCwd = process.cwd();
+		const previousExitCode = process.exitCode;
+
+		try {
+			setAgentDir(agentDir);
+			process.chdir(projectDir);
+			resetSettingsForTest();
+			const command = new Engine(["status", "--config", overlayPath], {
+				bin: "omp",
+				version: "0.0.0-test",
+				commands: new Map(),
+			});
+
+			await command.run();
+
+			expect(process.exitCode).toBe(0);
+		} finally {
+			resetSettingsForTest();
+			process.chdir(previousCwd);
+			setAgentDir(previousAgentDir);
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	test("engine commands use PI_CONFIG_FILES overlays from Settings", async () => {
+		using tempDir = TempDir.createSync("@breadboard-engine-env-overlay-");
+		const agentDir = tempDir.join("agent");
+		const projectDir = tempDir.join("project");
+		const overlayPath = tempDir.join("overlay.yml");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.mkdirSync(projectDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			"breadboard:\n  engineMode: invalid-from-main-config\n  sessionConfigPath: /tmp/session.yml\n",
+		);
+		await Bun.write(overlayPath, "breadboard:\n  engineMode: off\n");
+		const previousAgentDir = getAgentDir();
+		const previousCwd = process.cwd();
+		const previousExitCode = process.exitCode;
+		const previousConfigFiles = process.env.PI_CONFIG_FILES;
+
+		try {
+			setAgentDir(agentDir);
+			process.chdir(projectDir);
+			process.env.PI_CONFIG_FILES = overlayPath;
+			resetSettingsForTest();
+			const command = new Engine(["status"], {
+				bin: "omp",
+				version: "0.0.0-test",
+				commands: new Map(),
+			});
+
+			await command.run();
+
+			expect(process.exitCode).toBe(0);
+		} finally {
+			resetSettingsForTest();
+			if (previousConfigFiles === undefined) delete process.env.PI_CONFIG_FILES;
+			else process.env.PI_CONFIG_FILES = previousConfigFiles;
 			process.chdir(previousCwd);
 			setAgentDir(previousAgentDir);
 			process.exitCode = previousExitCode ?? 0;

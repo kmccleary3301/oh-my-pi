@@ -565,21 +565,8 @@ export function resolveBreadboardRunConfig(input: ResolveBreadboardRunConfigInpu
 	});
 }
 
-export async function loadSelectedBreadboardConfig(configFile: string): Promise<SelectedBreadboardConfig> {
-	const file = Bun.file(configFile);
-	if (!(await file.exists())) return {};
-	let parsed: unknown;
-	try {
-		const text = await file.text();
-		parsed = [".yaml", ".yml"].includes(extname(configFile).toLowerCase()) ? YAML.parse(text) : JSONC.parse(text);
-	} catch {
-		fail("invalid_selected_config", "mode", "selected OMP config is unreadable or malformed");
-	}
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		fail("invalid_selected_config", "mode", "selected OMP config must be an object");
-	}
-	if (!("breadboard" in parsed) || parsed.breadboard === undefined) return {};
-	const breadboard = parsed.breadboard;
+export function parseSelectedBreadboardConfig(breadboard: unknown): SelectedBreadboardConfig {
+	if (breadboard === undefined) return {};
 	if (typeof breadboard !== "object" || breadboard === null || Array.isArray(breadboard)) {
 		fail("invalid_selected_config", "mode", "selected OMP breadboard config must be an object");
 	}
@@ -595,4 +582,20 @@ export async function loadSelectedBreadboardConfig(configFile: string): Promise<
 		...("ownerExitPolicy" in breadboard ? { ownerExitPolicy: breadboard.ownerExitPolicy } : {}),
 		...("sessionConfigPath" in breadboard ? { sessionConfigPath: breadboard.sessionConfigPath } : {}),
 	};
+}
+
+export async function loadSelectedBreadboardConfig(configFile: string): Promise<SelectedBreadboardConfig> {
+	const file = Bun.file(configFile);
+	if (!(await file.exists())) return {};
+	let parsed: unknown;
+	try {
+		const text = await file.text();
+		parsed = [".yaml", ".yml"].includes(extname(configFile).toLowerCase()) ? YAML.parse(text) : JSONC.parse(text);
+	} catch {
+		fail("invalid_selected_config", "mode", "selected OMP config is unreadable or malformed");
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		fail("invalid_selected_config", "mode", "selected OMP config must be an object");
+	}
+	return parseSelectedBreadboardConfig("breadboard" in parsed ? parsed.breadboard : undefined);
 }

@@ -8,9 +8,14 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { createCanonicalE4Client, type OpenedSessionRuntime } from "@breadboard/sdk";
+import {
+	createCanonicalE4Client,
+	detectSensitiveValues,
+	type OpenedSessionRuntime,
+	REDACTED_VALUE,
+} from "@breadboard/sdk";
 import { type AgentEvent, EventLoopKeepalive, type StreamFn } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryExists,
@@ -26,16 +31,21 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CanonicalE4SessionPort } from "./breadboard/canonical-e4-session-port";
-import { E4AgentStreamBridge, type E4AgentStreamBridgeOptions } from "./breadboard/e4-agent-stream";
+import {
+	E4AgentStreamBridge,
+	type E4AgentStreamBridgeOptions,
+	type E4PermissionHandler,
+} from "./breadboard/e4-agent-stream";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
 import { LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
 import {
 	BreadboardRunConfigError,
-	loadSelectedBreadboardConfig,
+	parseSelectedBreadboardConfig,
 	resolveBreadboardRunConfig,
 } from "./breadboard/lifecycle/run-config";
 import { resolveNativeLaunchPolicy } from "./breadboard/native-launch-policy";
+import type { OpenSession } from "./breadboard/session-port";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -724,7 +734,12 @@ export async function createSessionManager(
 		return await SessionManager.open(match.session.path, parsed.sessionDir);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		// `--continue` falls back to a fresh native session when none exists.
+		// Preserve that native behavior instead of misclassifying the empty
+		// manager as a resume that requires an existing BreadBoard binding.
+		if (manager.getEntries().length === 0) parsed.continue = false;
+		return manager;
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -1038,9 +1053,82 @@ interface RunRootCommandDependencies {
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
+export const BREADBOARD_SESSION_BINDING_CUSTOM_TYPE = "breadboard.session-binding";
+
+interface BreadboardSessionBindingData {
+	readonly sessionId: string;
+}
+
+type BreadboardSessionBindingManager = Pick<SessionManager, "getBranch">;
+
+function readBreadboardSessionBinding(sessionManager: BreadboardSessionBindingManager): string | undefined {
+	const branch = sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "custom" || entry.customType !== BREADBOARD_SESSION_BINDING_CUSTOM_TYPE) continue;
+		const data = entry.data as Partial<BreadboardSessionBindingData> | undefined;
+		if (typeof data?.sessionId === "string" && data.sessionId.trim().length > 0) return data.sessionId;
+	}
+	return undefined;
+}
+
+export class BreadboardSessionTransitionError extends Error {
+	readonly code = "unsupported_resume_transition";
+
+	constructor(message: string) {
+		super(message);
+		this.name = "BreadboardSessionTransitionError";
+	}
+}
+
+export function resolveBreadboardSessionTarget(
+	parsed: Pick<Args, "continue" | "resume">,
+	sessionManager: BreadboardSessionBindingManager | undefined,
+	sessionConfigPath: string | undefined,
+): OpenSession {
+	if (parsed.continue || parsed.resume === true || typeof parsed.resume === "string") {
+		const sessionId = sessionManager && readBreadboardSessionBinding(sessionManager);
+		if (!sessionId) {
+			throw new BreadboardSessionTransitionError(
+				"BreadBoard cannot resume this OMP transcript because it has no durable BreadBoard session binding. Start a new OMP session instead.",
+			);
+		}
+		return { kind: "attach", sessionId };
+	}
+	if (sessionConfigPath !== undefined) {
+		return { kind: "create", request: { configPath: sessionConfigPath } };
+	}
+	throw new BreadboardRunConfigError(
+		"invalid_session_config",
+		"sessionConfigPath",
+		"a selected sessionConfigPath is required to create a session",
+	);
+}
+
+async function bindBreadboardRuntimeToOmpSession(
+	parsed: Pick<Args, "continue" | "resume">,
+	sessionManager: SessionManager,
+	breadboardSessionId: string,
+): Promise<void> {
+	if (parsed.continue || parsed.resume === true || typeof parsed.resume === "string") {
+		const expectedSessionId = readBreadboardSessionBinding(sessionManager);
+		if (expectedSessionId !== breadboardSessionId) {
+			throw new BreadboardSessionTransitionError(
+				"BreadBoard resumed session identity does not match the durable binding in the OMP transcript.",
+			);
+		}
+		return;
+	}
+	sessionManager.appendCustomEntry(BREADBOARD_SESSION_BINDING_CUSTOM_TYPE, {
+		sessionId: breadboardSessionId,
+	} satisfies BreadboardSessionBindingData);
+	await sessionManager.flush();
+}
+
 export interface PreparedBreadboardRuntime {
 	readonly stream: StreamFn;
 	readonly sessionId: string;
+	readonly model: Model;
 	close(): Promise<void>;
 }
 
@@ -1049,12 +1137,113 @@ interface BreadboardRuntimeBridge {
 	close(): Promise<void>;
 }
 
-export interface ConnectedBreadboardRuntimeOptions {
+type BreadboardModelRegistry = Pick<ModelRegistry, "getAll">;
+
+export interface BreadboardRuntimeAuthority {
+	readonly modelRegistry: BreadboardModelRegistry;
+	readonly requestPermission: E4PermissionHandler;
+}
+
+export interface ConnectedBreadboardRuntimeOptions extends BreadboardRuntimeAuthority {
 	readonly closeSupervisor: () => Promise<void>;
 	readonly openSession: () => Promise<OpenedSessionRuntime>;
 	readonly emitAgentEvent: (event: AgentEvent) => void;
 	readonly createBridge?: (options: E4AgentStreamBridgeOptions) => BreadboardRuntimeBridge;
 	readonly registerCleanup?: (close: () => Promise<void>) => () => void;
+}
+
+export type BreadboardModelAuthorityErrorCode =
+	| "missing_backend_model"
+	| "unresolved_backend_model"
+	| "ambiguous_backend_model";
+
+export class BreadboardModelAuthorityError extends Error {
+	constructor(
+		readonly code: BreadboardModelAuthorityErrorCode,
+		message: string,
+	) {
+		super(message);
+		this.name = "BreadboardModelAuthorityError";
+	}
+}
+
+export function resolveBreadboardBackendModel(
+	backendModel: string | null | undefined,
+	modelRegistry: BreadboardModelRegistry,
+): Model {
+	const selector = backendModel?.trim();
+	if (!selector) {
+		throw new BreadboardModelAuthorityError(
+			"missing_backend_model",
+			"BreadBoard session snapshot does not identify its backend model.",
+		);
+	}
+
+	const models = modelRegistry.getAll();
+	const providerQualifiedMatches = models.filter(model => `${model.provider}/${model.id}` === selector);
+	const matches =
+		providerQualifiedMatches.length > 0 ? providerQualifiedMatches : models.filter(model => model.id === selector);
+	if (matches.length === 0) {
+		throw new BreadboardModelAuthorityError(
+			"unresolved_backend_model",
+			`BreadBoard backend model ${selector} is not present in the loaded OMP model registry.`,
+		);
+	}
+	if (matches.length !== 1) {
+		throw new BreadboardModelAuthorityError(
+			"ambiguous_backend_model",
+			`BreadBoard backend model ${selector} matches multiple loaded OMP models; use a provider-qualified backend model.`,
+		);
+	}
+	return matches[0];
+}
+
+const BREADBOARD_PERMISSION_TEXT_LIMIT = 240;
+
+function safeBreadboardPermissionText(value: string | null): string | undefined {
+	if (value === null) return undefined;
+	const withoutTerminalControls = value
+		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\|$)/g, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\x1b[ -/]*[@-~]/g, "")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+	const detection = detectSensitiveValues(withoutTerminalControls);
+	if (detection.findings.length > 0 || detection.truncated) return REDACTED_VALUE;
+	const compact = withoutTerminalControls.replace(/\s+/g, " ").trim();
+	if (!compact) return undefined;
+	return compact.length <= BREADBOARD_PERMISSION_TEXT_LIMIT
+		? compact
+		: `${compact.slice(0, BREADBOARD_PERMISSION_TEXT_LIMIT - 1)}…`;
+}
+
+export function createBreadboardPermissionHandler(
+	getUIContext: () => ExtensionUIContext | undefined,
+): E4PermissionHandler {
+	return async (request, signal) => {
+		if (signal.aborted) return "cancel";
+		const uiContext = getUIContext();
+		if (!uiContext) return "cancel";
+
+		const details = [
+			safeBreadboardPermissionText(request.tool),
+			safeBreadboardPermissionText(request.kind),
+			safeBreadboardPermissionText(request.summary),
+		].filter((value): value is string => value !== undefined);
+		const title =
+			details.length === 0
+				? "BreadBoard permission request"
+				: `BreadBoard permission request · ${details.join(" · ")}`;
+		try {
+			const choice = await uiContext.select(title, ["Allow", "Deny"], { signal });
+			if (signal.aborted) return "cancel";
+			if (choice === "Allow") return "allow";
+			if (choice === "Deny") return "deny";
+			return "cancel";
+		} catch (error) {
+			if (signal.aborted || (error instanceof Error && error.name === "AbortError")) return "cancel";
+			throw error;
+		}
+	};
 }
 
 export async function prepareConnectedBreadboardRuntime(
@@ -1080,10 +1269,13 @@ export async function prepareConnectedBreadboardRuntime(
 	try {
 		opened = await options.openSession();
 		const snapshot = await opened.snapshot();
+		const model = resolveBreadboardBackendModel(snapshot.model, options.modelRegistry);
 		bridge = (options.createBridge ?? (bridgeOptions => new E4AgentStreamBridge(bridgeOptions)))({
 			session: opened,
 			replayHeadSequence: snapshot.headSequence,
 			emitAgentEvent: options.emitAgentEvent,
+			modelPolicy: { kind: "fixed", model },
+			requestPermission: options.requestPermission,
 		});
 		let closed = false;
 		let cancelCleanup: (() => void) | undefined;
@@ -1103,7 +1295,7 @@ export async function prepareConnectedBreadboardRuntime(
 		cancelCleanup = (options.registerCleanup ?? (cleanup => postmortem.register("breadboard-runtime", cleanup)))(
 			close,
 		);
-		return { stream: bridge.stream, sessionId: String(opened.sessionId), close };
+		return { stream: bridge.stream, sessionId: String(opened.sessionId), model, close };
 	} catch (error) {
 		try {
 			await cleanupBeforeTransfer();
@@ -1117,26 +1309,17 @@ export async function prepareConnectedBreadboardRuntime(
 export async function prepareBreadboardRuntime(
 	parsed: Args,
 	emitAgentEvent: (event: AgentEvent) => void,
+	authority: BreadboardRuntimeAuthority,
+	activeSettings: Settings = settings,
+	sessionManager?: BreadboardSessionBindingManager,
 ): Promise<PreparedBreadboardRuntime | null> {
-	const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "config.yml"));
+	const selectedConfig = parseSelectedBreadboardConfig(activeSettings.getRaw("breadboard"));
 	const config = resolveBreadboardRunConfig({
 		cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
 		selectedConfig,
 		workspacePath: getProjectDir(),
 	});
-	const target =
-		typeof parsed.resume === "string"
-			? { kind: "attach" as const, sessionId: parsed.resume }
-			: config.sessionConfigPath === undefined
-				? null
-				: { kind: "create" as const, request: { configPath: config.sessionConfigPath } };
-	if (target === null) {
-		throw new BreadboardRunConfigError(
-			"invalid_session_config",
-			"sessionConfigPath",
-			"a selected sessionConfigPath is required to create a session",
-		);
-	}
+	const target = resolveBreadboardSessionTarget(parsed, sessionManager, config.sessionConfigPath);
 
 	const store =
 		config.mode === "local-owned"
@@ -1165,6 +1348,8 @@ export async function prepareBreadboardRuntime(
 				}),
 			).open(target),
 		emitAgentEvent,
+		modelRegistry: authority.modelRegistry,
+		requestPermission: authority.requestPermission,
 	});
 }
 
@@ -1461,31 +1646,6 @@ export async function runRootCommand(
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
 
-	let breadboardAgentSession: AgentSession | undefined;
-	if (isInteractive) {
-		try {
-			const prepared = await (deps.prepareBreadboardRuntime ?? prepareBreadboardRuntime)(parsedArgs, event => {
-				breadboardAgentSession?.agent.emitExternalEvent(event);
-			});
-			if (prepared === null) {
-				stopStartupWatchdog();
-				stopThemeWatcher();
-				return;
-			}
-			sessionOptions.mainStreamFn = prepared.stream;
-		} catch (error) {
-			const message =
-				error instanceof BreadboardRunConfigError
-					? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
-					: "BreadBoard lifecycle failed unexpectedly.";
-			process.stderr.write(`${message}\n`);
-			process.exitCode = 1;
-			stopStartupWatchdog();
-			stopThemeWatcher();
-			return;
-		}
-	}
-
 	// OTEL: register global OTLP exporters when an endpoint is configured via
 	// env, then switch on the agent loop's telemetry hooks so traces, run-level
 	// metrics, and structured logs have source events to export. Content capture
@@ -1596,108 +1756,170 @@ export async function runRootCommand(
 			stdoutIsTTY: process.stdout.isTTY,
 		});
 
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
-			...sessionOptions,
-			eventBus,
-			preloadedExtensions: extensionsResult,
-		});
-		breadboardAgentSession = session;
-
-		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
-		// scan, collab mirror, resumed process) has a sessionFile but no in-memory
-		// reviver, so `ensureLive` (IRC sends, hub focus) would refuse it. Install a
-		// factory — bound to THIS top-level session — that rebuilds the subagent from
-		// its persisted JSONL (see persisted-revive.ts). Scoped to the non-ACP
-		// bootstrap: ACP keeps several concurrent top-level sessions and a single
-		// process-global factory must not be clobbered by the most recent one.
-		AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
-			createPersistedSubagentReviverFactory({
-				session,
-				authStorage,
-				modelRegistry,
-				settings: settingsInstance,
-				enableLsp: sessionOptions.enableLsp ?? true,
-			}),
-			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
-		);
-		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
-			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
+		let breadboardAgentSession: AgentSession | undefined;
+		let breadboardUIContext: ExtensionUIContext | undefined;
+		const breadboardPermissionHandler = createBreadboardPermissionHandler(() => breadboardUIContext);
+		let preparedBreadboardRuntime: PreparedBreadboardRuntime | null | undefined;
+		if (isInteractive) {
+			try {
+				preparedBreadboardRuntime = await (deps.prepareBreadboardRuntime ?? prepareBreadboardRuntime)(
+					parsedArgs,
+					event => {
+						breadboardAgentSession?.agent.emitExternalEvent(event);
+					},
+					{ modelRegistry, requestPermission: breadboardPermissionHandler },
+					settingsInstance,
+					sessionManager,
+				);
+				if (preparedBreadboardRuntime === null) {
+					stopStartupWatchdog();
+					stopThemeWatcher();
+					return;
+				}
+				sessionOptions.mainStreamFn = preparedBreadboardRuntime.stream;
+				sessionOptions.model = preparedBreadboardRuntime.model;
+			} catch (error) {
+				const message =
+					error instanceof BreadboardRunConfigError
+						? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
+						: error instanceof BreadboardSessionTransitionError
+							? `BreadBoard session transition error [${error.code}]: ${error.message}`
+							: error instanceof BreadboardModelAuthorityError
+								? `BreadBoard model authority error [${error.code}]: ${error.message}`
+								: "BreadBoard lifecycle failed unexpectedly.";
+				process.stderr.write(`${message}\n`);
+				process.exitCode = 1;
+				stopStartupWatchdog();
+				stopThemeWatcher();
+				return;
+			}
 		}
 
-		if (modelFallbackMessage) notifs.push({ kind: "warn", message: modelFallbackMessage });
-
-		const modelRegistryError = modelRegistry.getError();
-		if (modelRegistryError) notifs.push({ kind: "error", message: modelRegistryError.message });
-
-		if (!isInteractive && !session.model) {
-			if (modelRegistryError) {
-				process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
-			}
-			if (modelFallbackMessage) {
-				process.stderr.write(`${chalk.red(modelFallbackMessage)}\n`);
-			} else {
-				process.stderr.write(`${chalk.red("No models available.")}\n`);
-			}
-			process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
-			process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
-			process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-			process.exit(1);
-		}
-
-		if (mode === "rpc" || mode === "rpc-ui") {
-			// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
-			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
-			stopStartupWatchdog();
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
-		} else if (isInteractive) {
-			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
-			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
-			const modelScopeNotification = buildModelScopeNotification(
-				scopedModels,
-				settingsInstance.get("startup.quiet"),
-			);
-			if (modelScopeNotification) notifs.push(modelScopeNotification);
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-				if (logger.shouldExitAfterTimings()) process.exit(0);
-			}
-			stopStartupWatchdog();
-			logger.endTiming();
-			await (deps.runInteractiveMode ?? runInteractiveMode)(
-				session,
-				VERSION,
-				changelogMarkdown,
-				notifs,
-				versionCheckPromise,
-				initialArgs.messages,
-				setToolUIContext,
-				lspServers,
-				mcpManager,
-				Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
-				deps.forceSetupWizard === true,
-				showStartupSplash,
+		try {
+			const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
+				...sessionOptions,
 				eventBus,
-				initialMessage,
-				initialImages,
-				parsedArgs.join,
-			);
-		} else {
-			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
-			stopStartupWatchdog();
-			const runPrintMode: RunPrintMode = (await import("./modes/print-mode")).runPrintMode;
-			await runPrintMode(session, {
-				mode,
-				messages: initialArgs.messages,
-				initialMessage,
-				initialImages,
-				printThoughts: initialArgs.printThoughts,
+				preloadedExtensions: extensionsResult,
 			});
-			if ($env.PI_TIMING) {
-				logger.printTimings();
+			breadboardAgentSession = session;
+			if (preparedBreadboardRuntime) {
+				await bindBreadboardRuntimeToOmpSession(
+					parsedArgs,
+					session.sessionManager,
+					preparedBreadboardRuntime.sessionId,
+				);
 			}
-			await session.dispose();
-			stopThemeWatcher();
-			await postmortem.quit(0);
+			const setInteractiveToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean): void => {
+				breadboardUIContext = hasUI ? uiContext : undefined;
+				setToolUIContext(uiContext, hasUI);
+			};
+
+			// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
+			// scan, collab mirror, resumed process) has a sessionFile but no in-memory
+			// reviver, so `ensureLive` (IRC sends, hub focus) would refuse it. Install a
+			// factory — bound to THIS top-level session — that rebuilds the subagent from
+			// its persisted JSONL (see persisted-revive.ts). Scoped to the non-ACP
+			// bootstrap: ACP keeps several concurrent top-level sessions and a single
+			// process-global factory must not be clobbered by the most recent one.
+			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session,
+					authStorage,
+					modelRegistry,
+					settings: settingsInstance,
+					enableLsp: sessionOptions.enableLsp ?? true,
+				}),
+				Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
+			);
+			if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
+				authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
+			}
+
+			if (modelFallbackMessage) notifs.push({ kind: "warn", message: modelFallbackMessage });
+
+			const modelRegistryError = modelRegistry.getError();
+			if (modelRegistryError) notifs.push({ kind: "error", message: modelRegistryError.message });
+
+			if (!isInteractive && !session.model) {
+				if (modelRegistryError) {
+					process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
+				}
+				if (modelFallbackMessage) {
+					process.stderr.write(`${chalk.red(modelFallbackMessage)}\n`);
+				} else {
+					process.stderr.write(`${chalk.red("No models available.")}\n`);
+				}
+				process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
+				process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
+				process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
+				process.exit(1);
+			}
+
+			if (mode === "rpc" || mode === "rpc-ui") {
+				// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
+				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
+				stopStartupWatchdog();
+				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
+			} else if (isInteractive) {
+				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+				const changelogMarkdown = await logger.time(
+					"main:getChangelogForDisplay",
+					getChangelogForDisplay,
+					parsedArgs,
+				);
+				const modelScopeNotification = buildModelScopeNotification(
+					scopedModels,
+					settingsInstance.get("startup.quiet"),
+				);
+				if (modelScopeNotification) notifs.push(modelScopeNotification);
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+					if (logger.shouldExitAfterTimings()) {
+						await preparedBreadboardRuntime?.close();
+						process.exit(0);
+					}
+				}
+				stopStartupWatchdog();
+				logger.endTiming();
+				await (deps.runInteractiveMode ?? runInteractiveMode)(
+					session,
+					VERSION,
+					changelogMarkdown,
+					notifs,
+					versionCheckPromise,
+					initialArgs.messages,
+					setInteractiveToolUIContext,
+					lspServers,
+					mcpManager,
+					Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
+					deps.forceSetupWizard === true,
+					showStartupSplash,
+					eventBus,
+					initialMessage,
+					initialImages,
+					parsedArgs.join,
+				);
+			} else {
+				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
+				stopStartupWatchdog();
+				const runPrintMode: RunPrintMode = (await import("./modes/print-mode")).runPrintMode;
+				await runPrintMode(session, {
+					mode,
+					messages: initialArgs.messages,
+					initialMessage,
+					initialImages,
+					printThoughts: initialArgs.printThoughts,
+				});
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+				}
+				await session.dispose();
+				stopThemeWatcher();
+				await postmortem.quit(0);
+			}
+		} finally {
+			breadboardUIContext = undefined;
+			await preparedBreadboardRuntime?.close();
 		}
 	}
 }

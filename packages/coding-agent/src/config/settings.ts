@@ -459,6 +459,16 @@ export class Settings {
 	}
 
 	/**
+	 * Read an untyped value from the effective merged configuration.
+	 *
+	 * This is reserved for independently validated configuration namespaces
+	 * that are not part of the interactive settings schema.
+	 */
+	getRaw(path: string): unknown {
+		return getByPath(this.#merged, path.split("."));
+	}
+
+	/**
 	 * Whether `path` has an explicitly configured value (global config, project
 	 * config, or runtime override) rather than falling back to the schema default.
 	 */
