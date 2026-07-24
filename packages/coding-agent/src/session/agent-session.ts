@@ -800,6 +800,14 @@ const PRUNE_CACHE_WARM_SUFFIX_TOKENS = 8_000;
 const PRUNE_IDLE_FLUSH_MS = 90 * 60_000;
 export type CommandMetadataChangedListener = () => void | Promise<void>;
 export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
+export type SessionTransitionPlan =
+	| { readonly reason: "new" }
+	| { readonly reason: "resume"; readonly targetSessionFile: string }
+	| { readonly reason: "fork" }
+	| { readonly reason: "branch"; readonly targetEntryId: string }
+	| { readonly reason: "branchFromBtw"; readonly targetEntryId: string }
+	| { readonly reason: "navigateTree"; readonly targetEntryId: string };
+export type SessionTransitionGuard = (plan: SessionTransitionPlan) => void | Promise<void>;
 
 const RETRY_BACKOFF_JITTER_RATIO = 0.25;
 /**
@@ -3953,6 +3961,12 @@ export class AgentSession {
 
 	setPlanProposalHandler(handler: PlanProposalHandler | null): void {
 		this.#planProposalHandler = handler ?? undefined;
+	}
+
+	#sessionTransitionGuard: SessionTransitionGuard | undefined;
+
+	setSessionTransitionGuard(guard: SessionTransitionGuard | null): void {
+		this.#sessionTransitionGuard = guard ?? undefined;
 	}
 
 	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
@@ -9954,6 +9968,7 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.#sessionTransitionGuard?.({ reason: "new" });
 
 		this.#disconnectFromAgent();
 		await this.abort();
@@ -10053,6 +10068,7 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.#sessionTransitionGuard?.({ reason: "fork" });
 
 		await this.#flushPendingBashMessages();
 		// Flush current session to ensure all entries are written
@@ -16595,6 +16611,7 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.#sessionTransitionGuard?.({ reason: "resume", targetSessionFile: sessionPath });
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
@@ -16855,6 +16872,7 @@ export class AgentSession {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
+		await this.#sessionTransitionGuard?.({ reason: "branch", targetEntryId: entryId });
 
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
@@ -16943,6 +16961,7 @@ export class AgentSession {
 				return { cancelled: true, sessionFile: previousSessionFile };
 			}
 		}
+		await this.#sessionTransitionGuard?.({ reason: "branchFromBtw", targetEntryId: leafId });
 
 		await this.#cancelPostPromptTasks();
 		if (
@@ -17032,7 +17051,8 @@ export class AgentSession {
 		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
 		sessionContext?: SessionContext;
 	}> {
-		await this.#flushPendingBashMessages();
+		const sessionTransitionGuard = this.#sessionTransitionGuard;
+		if (!sessionTransitionGuard) await this.#flushPendingBashMessages();
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target
@@ -17088,6 +17108,8 @@ export class AgentSession {
 				fromExtension = true;
 			}
 		}
+		await sessionTransitionGuard?.({ reason: "navigateTree", targetEntryId: targetId });
+		if (sessionTransitionGuard) await this.#flushPendingBashMessages();
 
 		// Run default summarizer if needed
 		let summaryText: string | undefined;

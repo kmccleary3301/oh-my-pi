@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { PermissionRequestedPayload } from "@breadboard/sdk";
@@ -6,12 +6,14 @@ import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { E4PermissionHandler } from "@oh-my-pi/pi-coding-agent/breadboard/e4-agent-stream";
+import { LifecycleSupervisor } from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-supervisor";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import Engine from "@oh-my-pi/pi-coding-agent/commands/engine";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	BREADBOARD_SESSION_BINDING_CUSTOM_TYPE,
+	BreadboardSessionTransitionError,
 	createBreadboardPermissionHandler,
 	prepareBreadboardRuntime,
 	prepareConnectedBreadboardRuntime,
@@ -20,6 +22,7 @@ import {
 	runRootCommand,
 } from "@oh-my-pi/pi-coding-agent/main";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { SessionTransitionGuard, SessionTransitionPlan } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -96,6 +99,99 @@ describe("BreadBoard native interactive authority", () => {
 		expect(closeRuntime).toHaveBeenCalledTimes(1);
 	});
 
+	test("preserves native provider selection when the effective BreadBoard mode is off", async () => {
+		using tempDir = TempDir.createSync("@breadboard-off-native-provider-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const settings = Settings.isolated({
+			"breadboard.engineMode": "local-external",
+			"breadboard.sessionConfigPath": "/tmp/session.yml",
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"startup.showSplash": false,
+		} as never);
+		const parsed = parseArgs([
+			"--engine-mode",
+			"off",
+			"--provider",
+			CLI_SELECTED_MODEL.provider,
+			"--model",
+			CLI_SELECTED_MODEL.id,
+		]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		parsed.sessionDir = tempDir.join("sessions");
+		const connect = spyOn(LifecycleSupervisor.prototype, "connect");
+		let observedOptions: CreateAgentSessionOptions | undefined;
+
+		try {
+			await runRootCommand(parsed, [], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					observedOptions = options;
+					throw new Error("off-mode-native-options-observed");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "off-mode-native-options-observed") throw error;
+		} finally {
+			connect.mockRestore();
+			authStorage.close();
+		}
+
+		expect(connect).not.toHaveBeenCalled();
+		expect(observedOptions?.mainStreamFn).toBeUndefined();
+		expect(observedOptions?.model).toMatchObject({
+			id: CLI_SELECTED_MODEL.id,
+			provider: CLI_SELECTED_MODEL.provider,
+		});
+	});
+
+	test("does not install a session transition guard when BreadBoard mode is off", async () => {
+		using tempDir = TempDir.createSync("@breadboard-off-transition-guard-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const settings = Settings.isolated({
+			"breadboard.engineMode": "off",
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"startup.showSplash": false,
+		} as never);
+		const parsed = parseArgs(["--engine-mode", "off"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		parsed.sessionDir = tempDir.join("sessions");
+		const manager = SessionManager.create(tempDir.path(), parsed.sessionDir);
+		const setSessionTransitionGuard = mock((_guard: SessionTransitionGuard | null) => {});
+
+		try {
+			await runRootCommand(parsed, [], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async () =>
+					({
+						session: {
+							agent: { emitExternalEvent() {} },
+							sessionManager: manager,
+							setSessionTransitionGuard,
+						},
+						setToolUIContext() {},
+					}) as never,
+				runInteractiveMode: mock(async () => {}) as never,
+			});
+		} finally {
+			await manager.close();
+			authStorage.close();
+		}
+
+		expect(setSessionTransitionGuard).not.toHaveBeenCalled();
+	});
+
 	test("closes the transferred runtime when interactive mode returns", async () => {
 		using tempDir = TempDir.createSync("@breadboard-native-return-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
@@ -119,6 +215,10 @@ describe("BreadBoard native interactive authority", () => {
 		const select = mock(async () => "Allow");
 		const uiContext = { select } as never;
 		const setToolUIContext = mock(() => {});
+		let transitionGuard: SessionTransitionGuard | undefined;
+		const setSessionTransitionGuard = mock((guard: SessionTransitionGuard | null) => {
+			transitionGuard = guard ?? undefined;
+		});
 		const runInteractiveMode = mock(async (...args: unknown[]) => {
 			const captureUIContext = args[6] as (uiContext: never, hasUI: boolean) => void;
 			captureUIContext(uiContext, true);
@@ -143,6 +243,7 @@ describe("BreadBoard native interactive authority", () => {
 						session: {
 							agent: { emitExternalEvent() {} },
 							sessionManager: manager,
+							setSessionTransitionGuard,
 						},
 						setToolUIContext,
 					}) as never,
@@ -162,6 +263,31 @@ describe("BreadBoard native interactive authority", () => {
 			.getBranch()
 			.find(entry => entry.type === "custom" && entry.customType === BREADBOARD_SESSION_BINDING_CUSTOM_TYPE);
 		expect(bindingEntry?.type === "custom" ? bindingEntry.data : undefined).toEqual({ sessionId: "session-return" });
+		expect(setSessionTransitionGuard).toHaveBeenCalledTimes(1);
+		if (!transitionGuard) throw new Error("Expected BreadBoard session transition guard");
+		for (const [plan, operation] of [
+			[{ reason: "new" }, "start a new OMP session"],
+			[{ reason: "resume", targetSessionFile: "/tmp/target.jsonl" }, 'switch to OMP session "/tmp/target.jsonl"'],
+			[{ reason: "fork" }, "fork the current OMP session"],
+			[{ reason: "branch", targetEntryId: "entry-branch" }, 'branch the OMP session from entry "entry-branch"'],
+			[{ reason: "branchFromBtw", targetEntryId: "entry-btw" }, 'branch /btw from OMP entry "entry-btw"'],
+			[
+				{ reason: "navigateTree", targetEntryId: "entry-tree" },
+				'navigate the OMP session tree to entry "entry-tree"',
+			],
+		] satisfies Array<[SessionTransitionPlan, string]>) {
+			let failure: unknown;
+			try {
+				await transitionGuard(plan);
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(BreadboardSessionTransitionError);
+			expect(failure).toHaveProperty(
+				"message",
+				`BreadBoard cannot ${operation} while the current E4 session is bound to this OMP transcript; the current E4 SDK cannot atomically rebind the bridge to the requested transcript.`,
+			);
+		}
 	});
 
 	test("closes the transferred runtime when interactive mode throws", async () => {
@@ -202,6 +328,7 @@ describe("BreadBoard native interactive authority", () => {
 							session: {
 								agent: { emitExternalEvent() {} },
 								sessionManager: manager,
+								setSessionTransitionGuard() {},
 							},
 							setToolUIContext() {},
 						}) as never,
@@ -552,6 +679,69 @@ describe("BreadBoard native permission UI", () => {
 		const handler = createBreadboardPermissionHandler(() => undefined);
 
 		await expect(handler(PERMISSION_REQUEST, new AbortController().signal)).resolves.toBe("cancel");
+	});
+});
+
+describe("BreadBoard off-mode native authority", () => {
+	test("returns native authority for a fresh transcript without requiring BreadBoard session config", async () => {
+		const connect = spyOn(LifecycleSupervisor.prototype, "connect");
+		const activeSettings = Settings.isolated({ "breadboard.engineMode": "off" } as never);
+		const modelRegistryGetAll = mock(() => {
+			throw new Error("BreadBoard model authority must not be read in off mode");
+		});
+
+		try {
+			await expect(
+				prepareBreadboardRuntime(
+					parseArgs([]),
+					() => {},
+					{
+						modelRegistry: { getAll: modelRegistryGetAll },
+						requestPermission: async () => {
+							throw new Error("BreadBoard permission authority must not be read in off mode");
+						},
+					},
+					activeSettings,
+				),
+			).resolves.toBeNull();
+			expect(connect).not.toHaveBeenCalled();
+			expect(modelRegistryGetAll).not.toHaveBeenCalled();
+		} finally {
+			connect.mockRestore();
+		}
+	});
+
+	test("leaves path resume of an ordinary OMP transcript on the native path", async () => {
+		using tempDir = TempDir.createSync("@breadboard-off-path-resume-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		const parsed = parseArgs(["--engine-mode", "off"]);
+		parsed.resume = manager.getSessionFile();
+
+		try {
+			await expect(
+				prepareBreadboardRuntime(parsed, () => {}, TEST_RUNTIME_AUTHORITY, Settings.isolated(), manager),
+			).resolves.toBeNull();
+		} finally {
+			await manager.close();
+		}
+	});
+
+	test("leaves picker resume and continue of ordinary OMP transcripts on the native path", async () => {
+		using tempDir = TempDir.createSync("@breadboard-off-native-resume-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+
+		try {
+			for (const parsed of [
+				Object.assign(parseArgs(["--engine-mode", "off"]), { resume: true }),
+				Object.assign(parseArgs(["--engine-mode", "off"]), { continue: true }),
+			]) {
+				await expect(
+					prepareBreadboardRuntime(parsed, () => {}, TEST_RUNTIME_AUTHORITY, Settings.isolated(), manager),
+				).resolves.toBeNull();
+			}
+		} finally {
+			await manager.close();
+		}
 	});
 });
 

@@ -176,11 +176,22 @@ describe("E4AgentStreamBridge", () => {
 		await bridge.close();
 	});
 
-	test("drops replayed history and forwards live backend tool lifecycle events", async () => {
+	test("drops replayed history and projects durable native tool result events in agent-loop order", async () => {
 		const submitted: SubmitInput[] = [];
 		const agentEvents: AgentEvent[] = [];
+		const normalizedResult = {
+			content: [{ type: "text" as const, text: '{"output":"contents"}\nArtifact: artifact-1' }],
+			details: { result: { output: "contents" }, artifactRef: "artifact-1" },
+		};
 		const events = [
-			wireEvent(1, "assistant.message.delta", { text: "stale" }),
+			wireEvent(1, "tool.result", {
+				call_id: "call-1",
+				tool: "read",
+				status: "completed",
+				error: false,
+				result: { output: "stale" },
+				artifact_ref: null,
+			}),
 			started,
 			wireEvent(3, "tool_call", {
 				call_id: "call-1",
@@ -195,8 +206,8 @@ describe("E4AgentStreamBridge", () => {
 				tool: "read",
 				status: "completed",
 				error: false,
-				result: "contents",
-				artifact_ref: null,
+				result: { output: "contents" },
+				artifact_ref: "artifact-1",
 			}),
 			wireEvent(5, "assistant.message.delta", { text: "fresh" }),
 			wireEvent(6, "turn_completed", {}),
@@ -212,9 +223,98 @@ describe("E4AgentStreamBridge", () => {
 		const result = await stream.result();
 
 		expect(result.content).toEqual([{ type: "text", text: "fresh" }]);
-		expect(agentEvents.map(event => event.type)).toEqual(["tool_execution_start", "tool_execution_end"]);
+		expect(agentEvents.map(event => event.type)).toEqual([
+			"tool_execution_start",
+			"tool_execution_end",
+			"message_start",
+			"message_end",
+		]);
+		expect(agentEvents[0]).toEqual({
+			type: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "read",
+			args: { path: "README.md" },
+			intent: "inspect",
+		});
+		expect(agentEvents[1]).toEqual({
+			type: "tool_execution_end",
+			toolCallId: "call-1",
+			toolName: "read",
+			result: normalizedResult,
+			isError: false,
+		});
+		const messageStart = agentEvents[2];
+		const messageEnd = agentEvents[3];
+		if (messageStart?.type !== "message_start" || messageEnd?.type !== "message_end") {
+			throw new Error("Expected native tool result message lifecycle");
+		}
+		expect(messageStart.message).toEqual({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: normalizedResult.content,
+			details: normalizedResult.details,
+			isError: false,
+			timestamp: expect.any(Number),
+		});
+		expect(messageEnd.message).toEqual(messageStart.message);
 		await bridge.close();
 	});
+	test("ignores duplicate and out-of-order event sequences for exact-once SSE projection", async () => {
+		const submitted: SubmitInput[] = [];
+		const agentEvents: AgentEvent[] = [];
+		const toolCall = wireEvent(3, "tool_call", {
+			call_id: "call-1",
+			tool: "read",
+			arguments: { path: "README.md" },
+			action: "inspect",
+			diff_preview: null,
+			progress: null,
+		});
+		const toolResultEvent = wireEvent(4, "tool.result", {
+			call_id: "call-1",
+			tool: "read",
+			status: "completed",
+			error: false,
+			result: { output: "contents" },
+			artifact_ref: null,
+		});
+		const textDelta = wireEvent(5, "assistant.message.delta", { text: "fresh" });
+		const textCompleted = wireEvent(6, "assistant.message.end", { text: "fresh" });
+		const events = [
+			started,
+			toolCall,
+			toolCall,
+			toolResultEvent,
+			toolResultEvent,
+			textDelta,
+			textDelta,
+			toolResultEvent,
+			textCompleted,
+			textCompleted,
+			wireEvent(7, "turn_completed", {}),
+		];
+		const bridge = new E4AgentStreamBridge({
+			session: openedSession(events, submitted),
+			replayHeadSequence: 1,
+			emitAgentEvent: event => agentEvents.push(event),
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const stream = await bridge.stream(model, context);
+		const result = await stream.result();
+
+		expect(result.content).toEqual([{ type: "text", text: "fresh" }]);
+		expect(agentEvents.map(event => event.type)).toEqual([
+			"tool_execution_start",
+			"tool_execution_end",
+			"message_start",
+			"message_end",
+		]);
+		expect(agentEvents.filter(event => event.type === "message_end")).toHaveLength(1);
+		await bridge.close();
+	});
+
 	test("discards events from turns submitted by other session clients", async () => {
 		const observed = Promise.withResolvers<void>();
 		let external: LoggedSessionEvent | undefined = wireEvent(
@@ -285,20 +385,206 @@ describe("E4AgentStreamBridge", () => {
 		expect(result.content).toEqual([{ type: "text", text: "raced" }]);
 		await bridge.close();
 	});
-
-	test("terminates a pending submit when the sole event observer fails", async () => {
+	test("cancels a turn admitted after close exactly once without installing a sink", async () => {
 		const pendingSubmit = Promise.withResolvers<SubmitReceipt>();
-		const observerFailed = Promise.withResolvers<void>();
-		const submitReturned = Promise.withResolvers<void>();
+		const submitStarted = Promise.withResolvers<void>();
+		const cancellationObserved = Promise.withResolvers<void>();
+		const releaseLateEvent = Promise.withResolvers<void>();
+		const lateEventProcessed = Promise.withResolvers<void>();
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const agentEvents: AgentEvent[] = [];
 		const session: OpenedSessionRuntime = {
 			...openedSession([], []),
 			async submit() {
-				const submittedReceipt = await pendingSubmit.promise;
-				submitReturned.resolve();
-				return submittedReceipt;
+				submitStarted.resolve();
+				return pendingSubmit.promise;
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				cancellationObserved.resolve();
+				releaseLateEvent.resolve();
+				return {} as CancellationReceipt;
 			},
 			async *events() {
-				observerFailed.resolve();
+				await releaseLateEvent.promise;
+				yield wireEvent(3, "tool.result", {
+					call_id: "call-after-close",
+					tool: "read",
+					status: "completed",
+					error: false,
+					result: { output: "must not project" },
+					artifact_ref: null,
+				});
+				lateEventProcessed.resolve();
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent: event => agentEvents.push(event),
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const stream = await bridge.stream(model, context);
+		await submitStarted.promise;
+		await bridge.close();
+		pendingSubmit.resolve(receipt);
+		await cancellationObserved.promise;
+		await lateEventProcessed.promise;
+		await bridge.close();
+
+		const result = await stream.result();
+		expect(result.stopReason).toBe("aborted");
+		expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "user_requested" }]);
+		expect(agentEvents).toEqual([]);
+	});
+
+	const drainMicrotasks = async (): Promise<void> => {
+		for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+	};
+	const observerExits = [
+		{ label: "rejects", errorMessage: "event observer failed", expectedMessage: "event observer failed" },
+		{
+			label: "ends unexpectedly",
+			errorMessage: undefined,
+			expectedMessage: "BreadBoard event observer ended unexpectedly",
+		},
+	] as const;
+
+	for (const observerExit of observerExits) {
+		test(`terminates a pending submit when the sole event observer ${observerExit.label} before receipt`, async () => {
+			const pendingSubmit = Promise.withResolvers<SubmitReceipt>();
+			const submitStarted = Promise.withResolvers<void>();
+			const submitSettled = Promise.withResolvers<void>();
+			const observerExited = Promise.withResolvers<void>();
+			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+			const session: OpenedSessionRuntime = {
+				...openedSession([], []),
+				async submit() {
+					submitStarted.resolve();
+					try {
+						return await pendingSubmit.promise;
+					} finally {
+						submitSettled.resolve();
+					}
+				},
+				async cancel(request) {
+					cancelled.push(request);
+					return {} as CancellationReceipt;
+				},
+				async *events() {
+					await submitStarted.promise;
+					observerExited.resolve();
+					if (observerExit.errorMessage) {
+						yield await Promise.reject<LoggedSessionEvent>(new Error(observerExit.errorMessage));
+					}
+				},
+			};
+			const bridge = new E4AgentStreamBridge({
+				session,
+				replayHeadSequence: 0,
+				emitAgentEvent() {},
+				modelPolicy: { kind: "fixed", model: model },
+			});
+
+			try {
+				const stream = await bridge.stream(model, context);
+				await observerExited.promise;
+				await drainMicrotasks();
+				expect(stream.resultSettled).toBeTrue();
+				const result = await stream.result();
+
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toBe(observerExit.expectedMessage);
+
+				pendingSubmit.resolve(receipt);
+				await submitSettled.promise;
+				await drainMicrotasks();
+				expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);
+			} finally {
+				pendingSubmit.resolve(receipt);
+				await submitSettled.promise;
+				await drainMicrotasks();
+				await bridge.close();
+			}
+		});
+
+		test(`cancels the admitted turn when its receipt races an observer that ${observerExit.label}`, async () => {
+			const pendingSubmit = Promise.withResolvers<SubmitReceipt>();
+			const submitStarted = Promise.withResolvers<void>();
+			const submitSettled = Promise.withResolvers<void>();
+			const observerExited = Promise.withResolvers<void>();
+			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+			const session: OpenedSessionRuntime = {
+				...openedSession([], []),
+				async submit() {
+					submitStarted.resolve();
+					try {
+						return await pendingSubmit.promise;
+					} finally {
+						submitSettled.resolve();
+					}
+				},
+				async cancel(request) {
+					cancelled.push(request);
+					return {} as CancellationReceipt;
+				},
+				async *events() {
+					await submitStarted.promise;
+					pendingSubmit.resolve(receipt);
+					observerExited.resolve();
+					if (observerExit.errorMessage) {
+						yield await Promise.reject<LoggedSessionEvent>(new Error(observerExit.errorMessage));
+					}
+				},
+			};
+			const bridge = new E4AgentStreamBridge({
+				session,
+				replayHeadSequence: 0,
+				emitAgentEvent() {},
+				modelPolicy: { kind: "fixed", model: model },
+			});
+
+			try {
+				const stream = await bridge.stream(model, context);
+				await observerExited.promise;
+				await submitSettled.promise;
+				await drainMicrotasks();
+				expect(stream.resultSettled).toBeTrue();
+				const result = await stream.result();
+
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toBe(observerExit.expectedMessage);
+				expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);
+			} finally {
+				await bridge.close();
+			}
+		});
+	}
+
+	test("keeps observer failure authoritative when the pending submit rejects", async () => {
+		const pendingSubmit = Promise.withResolvers<SubmitReceipt>();
+		const submitStarted = Promise.withResolvers<void>();
+		const submitSettled = Promise.withResolvers<void>();
+		const observerExited = Promise.withResolvers<void>();
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit() {
+				submitStarted.resolve();
+				try {
+					return await pendingSubmit.promise;
+				} finally {
+					submitSettled.resolve();
+				}
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				return {} as CancellationReceipt;
+			},
+			async *events() {
+				await submitStarted.promise;
+				observerExited.resolve();
 				yield await Promise.reject<LoggedSessionEvent>(new Error("event observer failed"));
 			},
 		};
@@ -311,18 +597,69 @@ describe("E4AgentStreamBridge", () => {
 
 		try {
 			const stream = await bridge.stream(model, context);
-			await observerFailed.promise;
-			pendingSubmit.resolve(receipt);
-			await submitReturned.promise;
-			await Promise.resolve();
-			await Promise.resolve();
-			await Promise.resolve();
+			await observerExited.promise;
+			await drainMicrotasks();
 			expect(stream.resultSettled).toBeTrue();
-			const result = await stream.result();
 
-			expect(result.stopReason).toBe("error");
+			pendingSubmit.reject(new Error("submit failed"));
+			await submitSettled.promise;
+			await drainMicrotasks();
+			const result = await stream.result();
 			expect(result.errorMessage).toBe("event observer failed");
+			expect(cancelled).toEqual([]);
 		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("cancels an admitted turn once when close races its observer failure", async () => {
+		const pendingSubmit = Promise.withResolvers<SubmitReceipt>();
+		const submitStarted = Promise.withResolvers<void>();
+		const submitSettled = Promise.withResolvers<void>();
+		const observerExited = Promise.withResolvers<void>();
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit() {
+				submitStarted.resolve();
+				try {
+					return await pendingSubmit.promise;
+				} finally {
+					submitSettled.resolve();
+				}
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				throw new Error("session already closed");
+			},
+			async *events() {
+				await submitStarted.promise;
+				observerExited.resolve();
+				yield await Promise.reject<LoggedSessionEvent>(new Error("event observer failed"));
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		try {
+			const stream = await bridge.stream(model, context);
+			await observerExited.promise;
+			await drainMicrotasks();
+			expect(stream.resultSettled).toBeTrue();
+			await bridge.close();
+
+			pendingSubmit.resolve(receipt);
+			await submitSettled.promise;
+			await drainMicrotasks();
+			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);
+		} finally {
+			pendingSubmit.resolve(receipt);
+			await submitSettled.promise;
+			await drainMicrotasks();
 			await bridge.close();
 		}
 	});

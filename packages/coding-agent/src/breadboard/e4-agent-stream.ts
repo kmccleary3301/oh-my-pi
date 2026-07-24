@@ -1,5 +1,14 @@
 import type { AgentEvent, AgentToolResult, StreamFn } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Context, ImageContent, Model, TextContent, Usage, UserMessage } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	Context,
+	ImageContent,
+	Model,
+	TextContent,
+	ToolResultMessage,
+	Usage,
+	UserMessage,
+} from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { LoggedSessionEvent, OpenedSession, TurnId } from "./session-port";
 
@@ -27,6 +36,8 @@ interface TurnSink {
 	readonly model: E4BackendModelAttribution;
 	readonly stream: AssistantMessageEventStream;
 	readonly permissionAbort: AbortController;
+	turnId: TurnId | undefined;
+	cancelRequested: boolean;
 	text: string;
 	started: boolean;
 	textStarted: boolean;
@@ -59,16 +70,17 @@ export class E4AgentStreamBridge {
 	readonly #requestPermission: E4PermissionHandler | undefined;
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
+	readonly #submittingSinks = new Set<TurnSink>();
 	readonly #pendingEvents = new Map<string, LoggedSessionEvent[]>();
 	readonly #submittedTurnIds = new Set<string>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
-	readonly #replayHeadSequence: number;
+	#highestObservedSequence: number;
 	#closed = false;
 	#observeFailure: Error | undefined;
 
 	constructor(options: E4AgentStreamBridgeOptions) {
 		this.#session = options.session;
-		this.#replayHeadSequence = options.replayHeadSequence;
+		this.#highestObservedSequence = options.replayHeadSequence;
 		this.#emitAgentEvent = options.emitAgentEvent;
 		this.#modelPolicy = options.modelPolicy;
 		this.#requestPermission = options.requestPermission;
@@ -87,6 +99,10 @@ export class E4AgentStreamBridge {
 		for (const sink of this.#sinks.values()) {
 			this.#failSink(sink, "BreadBoard session closed", "aborted");
 		}
+		for (const sink of this.#submittingSinks) {
+			this.#failSink(sink, "BreadBoard session closed", "aborted");
+		}
+		this.#submittingSinks.clear();
 		this.#sinks.clear();
 		this.#submittedTurnIds.clear();
 		this.#pendingEvents.clear();
@@ -125,6 +141,18 @@ export class E4AgentStreamBridge {
 			return;
 		}
 
+		const sink: TurnSink = {
+			model: backendModel,
+			stream,
+			permissionAbort: new AbortController(),
+			turnId: undefined,
+			cancelRequested: false,
+			text: "",
+			started: false,
+			textStarted: false,
+			terminal: false,
+		};
+		this.#submittingSinks.add(sink);
 		try {
 			const input = submitInputFromContext(context);
 			const submission = this.#session.submit(input).then(receipt => {
@@ -142,27 +170,21 @@ export class E4AgentStreamBridge {
 			);
 			this.#submissionsInFlight.add(settled);
 			const receipt = await submission;
-			if (this.#closed) {
-				this.#pushStandaloneError(stream, model, "BreadBoard session is closed", "error");
-				return;
-			}
+			this.#submittingSinks.delete(sink);
+			sink.turnId = receipt.turnId;
+			const turnKey = String(receipt.turnId);
 			if (this.#observeFailure) {
-				const turnKey = String(receipt.turnId);
 				this.#submittedTurnIds.delete(turnKey);
 				this.#pendingEvents.delete(turnKey);
-				this.#pushStandaloneError(stream, backendModel, this.#observeFailure.message, "error");
+				this.#failSink(sink, this.#observeFailure.message, "error");
+				this.#cancelSink(sink, "timeout");
 				return;
 			}
-			const turnKey = String(receipt.turnId);
-			const sink: TurnSink = {
-				model: backendModel,
-				stream,
-				permissionAbort: new AbortController(),
-				text: "",
-				started: false,
-				textStarted: false,
-				terminal: false,
-			};
+			if (this.#closed) {
+				this.#failSink(sink, "BreadBoard session is closed", "error");
+				this.#cancelSink(sink, "user_requested");
+				return;
+			}
 			this.#sinks.set(turnKey, sink);
 			for (const event of this.#pendingEvents.get(turnKey) ?? []) {
 				this.#applyEvent(sink, event);
@@ -171,7 +193,7 @@ export class E4AgentStreamBridge {
 
 			const cancel = () => {
 				sink.permissionAbort.abort();
-				void this.#cancel(receipt.turnId);
+				this.#cancelSink(sink, "user_requested");
 			};
 			if (signal?.aborted) {
 				cancel();
@@ -179,24 +201,33 @@ export class E4AgentStreamBridge {
 			}
 			signal?.addEventListener("abort", cancel, { once: true });
 		} catch (error) {
-			this.#pushStandaloneError(stream, backendModel, safeErrorMessage(error), "error");
+			this.#submittingSinks.delete(sink);
+			this.#failSink(sink, safeErrorMessage(error), "error");
 		}
 	}
 
-	async #cancel(turnId: TurnId): Promise<void> {
+	async #cancel(turnId: TurnId, reason: "user_requested" | "timeout"): Promise<void> {
 		try {
-			await this.#session.cancel({ turnId, reason: "user_requested" });
+			await this.#session.cancel({ turnId, reason });
 		} catch (error) {
 			const sink = this.#sinks.get(String(turnId));
 			if (sink) this.#failSink(sink, safeErrorMessage(error), "error");
 		}
 	}
 
+	#cancelSink(sink: TurnSink, reason: "user_requested" | "timeout"): void {
+		if (sink.cancelRequested || sink.turnId === undefined) return;
+		sink.cancelRequested = true;
+		void this.#cancel(sink.turnId, reason);
+	}
+
 	async #observe(): Promise<void> {
 		let failure: unknown = new Error("BreadBoard event observer ended unexpectedly");
 		try {
 			for await (const event of this.#session.events({ signal: this.#observeAbort.signal })) {
-				if (event.sequence <= this.#replayHeadSequence || event.turnId === null) continue;
+				if (event.sequence <= this.#highestObservedSequence) continue;
+				this.#highestObservedSequence = event.sequence;
+				if (event.turnId === null) continue;
 				const turnKey = String(event.turnId);
 				let sink = this.#sinks.get(turnKey);
 				if (!sink && !this.#submittedTurnIds.has(turnKey)) {
@@ -216,8 +247,12 @@ export class E4AgentStreamBridge {
 		}
 		if (this.#closed || this.#observeAbort.signal.aborted) return;
 		this.#observeFailure = new Error(safeErrorMessage(failure));
+		for (const sink of this.#submittingSinks) {
+			this.#failSink(sink, this.#observeFailure.message, "error");
+		}
 		for (const sink of this.#sinks.values()) {
 			this.#failSink(sink, this.#observeFailure.message, "error");
+			this.#cancelSink(sink, "timeout");
 		}
 		this.#sinks.clear();
 		this.#submittedTurnIds.clear();
@@ -259,15 +294,31 @@ export class E4AgentStreamBridge {
 					intent: event.payload.action ?? undefined,
 				});
 				return;
-			case "tool_result_observed":
+			case "tool_result_observed": {
+				const toolCallId = String(event.payload.callId);
+				const toolName = event.payload.tool ?? "tool";
+				const result = toolResult(event.payload.result, event.payload.artifactRef);
+				const isError = event.payload.error;
 				this.#emitAgentEvent({
 					type: "tool_execution_end",
-					toolCallId: String(event.payload.callId),
-					toolName: event.payload.tool ?? "tool",
-					result: toolResult(event.payload.result, event.payload.artifactRef),
-					isError: event.payload.error,
+					toolCallId,
+					toolName,
+					result,
+					isError,
 				});
+				const message: ToolResultMessage = {
+					role: "toolResult",
+					toolCallId,
+					toolName,
+					content: result.content,
+					details: result.details,
+					isError,
+					timestamp: Date.now(),
+				};
+				this.#emitAgentEvent({ type: "message_start", message });
+				this.#emitAgentEvent({ type: "message_end", message });
 				return;
+			}
 			case "permission_requested":
 				void this.#handlePermissionRequest(sink, event);
 				return;
@@ -291,12 +342,7 @@ export class E4AgentStreamBridge {
 	): Promise<void> {
 		const requestPermission = this.#requestPermission;
 		if (!requestPermission) {
-			this.#abortForPermission(
-				sink,
-				event.turnId,
-				"BreadBoard permission request requires OMP permission UI wiring",
-				"error",
-			);
+			this.#abortForPermission(sink, "BreadBoard permission request requires OMP permission UI wiring", "error");
 			return;
 		}
 
@@ -305,12 +351,12 @@ export class E4AgentStreamBridge {
 			decision = await requestPermission(event.payload, sink.permissionAbort.signal);
 		} catch (error) {
 			if (sink.terminal || sink.permissionAbort.signal.aborted) return;
-			this.#abortForPermission(sink, event.turnId, safeErrorMessage(error), "error");
+			this.#abortForPermission(sink, safeErrorMessage(error), "error");
 			return;
 		}
 		if (sink.terminal || sink.permissionAbort.signal.aborted || this.#closed) return;
 		if (decision === "cancel") {
-			this.#abortForPermission(sink, event.turnId, "BreadBoard permission request cancelled in OMP", "aborted");
+			this.#abortForPermission(sink, "BreadBoard permission request cancelled in OMP", "aborted");
 			return;
 		}
 
@@ -318,13 +364,13 @@ export class E4AgentStreamBridge {
 			await this.#session.respondPermission({ requestId: event.payload.requestId, decision });
 		} catch (error) {
 			if (sink.terminal || this.#closed) return;
-			this.#abortForPermission(sink, event.turnId, safeErrorMessage(error), "error");
+			this.#abortForPermission(sink, safeErrorMessage(error), "error");
 		}
 	}
 
-	#abortForPermission(sink: TurnSink, turnId: TurnId, message: string, reason: "error" | "aborted"): void {
+	#abortForPermission(sink: TurnSink, message: string, reason: "error" | "aborted"): void {
 		this.#failSink(sink, message, reason);
-		void this.#cancel(turnId);
+		this.#cancelSink(sink, "user_requested");
 	}
 
 	#ensureStarted(sink: TurnSink): void {

@@ -95,7 +95,7 @@ import {
 	discoverAuthStorage,
 	loadSessionExtensions,
 } from "./sdk";
-import type { AgentSession } from "./session/agent-session";
+import type { AgentSession, SessionTransitionPlan } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
@@ -1081,6 +1081,28 @@ export class BreadboardSessionTransitionError extends Error {
 	}
 }
 
+function rejectBreadboardSessionTransition(plan: SessionTransitionPlan): never {
+	const operation = (() => {
+		switch (plan.reason) {
+			case "new":
+				return "start a new OMP session";
+			case "resume":
+				return `switch to OMP session "${plan.targetSessionFile}"`;
+			case "fork":
+				return "fork the current OMP session";
+			case "branch":
+				return `branch the OMP session from entry "${plan.targetEntryId}"`;
+			case "branchFromBtw":
+				return `branch /btw from OMP entry "${plan.targetEntryId}"`;
+			case "navigateTree":
+				return `navigate the OMP session tree to entry "${plan.targetEntryId}"`;
+		}
+	})();
+	throw new BreadboardSessionTransitionError(
+		`BreadBoard cannot ${operation} while the current E4 session is bound to this OMP transcript; the current E4 SDK cannot atomically rebind the bridge to the requested transcript.`,
+	);
+}
+
 export function resolveBreadboardSessionTarget(
 	parsed: Pick<Args, "continue" | "resume">,
 	sessionManager: BreadboardSessionBindingManager | undefined,
@@ -1319,6 +1341,7 @@ export async function prepareBreadboardRuntime(
 		selectedConfig,
 		workspacePath: getProjectDir(),
 	});
+	if (config.mode === "off") return null;
 	const target = resolveBreadboardSessionTarget(parsed, sessionManager, config.sessionConfigPath);
 
 	const store =
@@ -1771,13 +1794,10 @@ export async function runRootCommand(
 					settingsInstance,
 					sessionManager,
 				);
-				if (preparedBreadboardRuntime === null) {
-					stopStartupWatchdog();
-					stopThemeWatcher();
-					return;
+				if (preparedBreadboardRuntime !== null) {
+					sessionOptions.mainStreamFn = preparedBreadboardRuntime.stream;
+					sessionOptions.model = preparedBreadboardRuntime.model;
 				}
-				sessionOptions.mainStreamFn = preparedBreadboardRuntime.stream;
-				sessionOptions.model = preparedBreadboardRuntime.model;
 			} catch (error) {
 				const message =
 					error instanceof BreadboardRunConfigError
@@ -1803,6 +1823,7 @@ export async function runRootCommand(
 			});
 			breadboardAgentSession = session;
 			if (preparedBreadboardRuntime) {
+				session.setSessionTransitionGuard(plan => rejectBreadboardSessionTransition(plan));
 				await bindBreadboardRuntimeToOmpSession(
 					parsedArgs,
 					session.sessionManager,

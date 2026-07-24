@@ -5,11 +5,13 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { AgentSession, type SessionTransitionPlan } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { BuildSessionContextOptions, SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { assistantMsg, userMsg } from "./utilities";
 
 /**
  * Regression for issue #3846: in-TUI `/resume` rebuilt the *previous*
@@ -56,7 +58,10 @@ describe("AgentSession.switchSession previous-context build", () => {
 		}
 	});
 
-	function buildSession(tempDir: TempDir): { session: AgentSession; sessionManager: SessionManager } {
+	function buildSession(
+		tempDir: TempDir,
+		extensionRunner?: ExtensionRunner,
+	): { session: AgentSession; sessionManager: SessionManager } {
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const agent = new Agent({
 			initialState: {
@@ -71,9 +76,79 @@ describe("AgentSession.switchSession previous-context build", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			extensionRunner,
 		});
 		sessions.push(session);
 		return { session, sessionManager };
+	}
+
+	async function seedConversation(session: AgentSession, sessionManager: SessionManager) {
+		const firstUserId = sessionManager.appendMessage(userMsg("first user"));
+		sessionManager.appendMessage(assistantMsg("first assistant"));
+		const secondUserId = sessionManager.appendMessage(userMsg("second user"));
+		sessionManager.appendMessage(assistantMsg("second assistant"));
+		await sessionManager.flush();
+		session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
+		session.agent.replaceQueues([userMsg("queued steer")], [userMsg("queued follow-up")]);
+		return { firstUserId, secondUserId };
+	}
+
+	async function captureSessionState(session: AgentSession, sessionManager: SessionManager) {
+		const sessionFile = session.sessionFile;
+		return {
+			sessionFile,
+			sessionId: session.sessionId,
+			leafId: sessionManager.getLeafId(),
+			entries: JSON.stringify(sessionManager.getEntries()),
+			messages: JSON.stringify(session.messages),
+			model: session.model && `${session.model.provider}/${session.model.id}`,
+			steeringQueue: JSON.stringify(session.agent.peekSteeringQueue()),
+			followUpQueue: JSON.stringify(session.agent.peekFollowUpQueue()),
+			persisted: sessionFile ? await Bun.file(sessionFile).text() : undefined,
+		};
+	}
+
+	async function expectConnectionIntact(session: AgentSession): Promise<void> {
+		let observed = false;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") observed = true;
+		});
+		try {
+			session.agent.emitExternalEvent({ type: "agent_start" });
+			for (let turn = 0; turn < 4 && !observed; turn++) await Promise.resolve();
+			expect(observed).toBe(true);
+		} finally {
+			unsubscribe();
+		}
+	}
+
+	async function expectGuardedTransition(options: {
+		session: AgentSession;
+		sessionManager: SessionManager;
+		expectedPlan: SessionTransitionPlan;
+		run: () => Promise<unknown>;
+		order?: string[];
+	}): Promise<void> {
+		const plans: SessionTransitionPlan[] = [];
+		const transitionError = new Error(`blocked ${options.expectedPlan.reason}`);
+		options.session.setSessionTransitionGuard(plan => {
+			options.order?.push("guard");
+			plans.push(plan);
+			throw transitionError;
+		});
+		const before = await captureSessionState(options.session, options.sessionManager);
+
+		let failure: unknown;
+		try {
+			await options.run();
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBe(transitionError);
+		expect(plans).toEqual([options.expectedPlan]);
+		expect(await captureSessionState(options.session, options.sessionManager)).toEqual(before);
+		await expectConnectionIntact(options.session);
 	}
 
 	/** Wrap `sessionManager.buildSessionContext` so each call's caller-visible
@@ -157,5 +232,153 @@ describe("AgentSession.switchSession previous-context build", () => {
 			{ sessionFile: sessionFile!, transcript: undefined },
 			{ sessionFile: sessionFile!, transcript: undefined },
 		]);
+	});
+
+	it("guards newSession and fork after their public before-hooks and before state mutation", async () => {
+		const tempDir = TempDir.createSync("@pi-session-transition-new-fork-");
+		tempDirs.push(tempDir);
+		const order: string[] = [];
+		const extensionRunner = {
+			hasHandlers: (eventType: string) => eventType === "session_before_switch",
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_before_switch") order.push(event.type);
+				return undefined;
+			},
+		} as unknown as ExtensionRunner;
+		const { session, sessionManager } = buildSession(tempDir, extensionRunner);
+		await seedConversation(session, sessionManager);
+
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "new" },
+			run: () => session.newSession(),
+			order,
+		});
+		expect(order).toEqual(["session_before_switch", "guard"]);
+
+		order.length = 0;
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "fork" },
+			run: () => session.fork(),
+			order,
+		});
+		expect(order).toEqual(["session_before_switch", "guard"]);
+	});
+
+	it("guards switchSession and reload after their public before-hooks and before state mutation", async () => {
+		const tempDir = TempDir.createSync("@pi-session-transition-resume-");
+		tempDirs.push(tempDir);
+		const order: string[] = [];
+		const extensionRunner = {
+			hasHandlers: (eventType: string) => eventType === "session_before_switch",
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_before_switch") order.push(event.type);
+				return undefined;
+			},
+		} as unknown as ExtensionRunner;
+		const { session, sessionManager } = buildSession(tempDir, extensionRunner);
+		await seedConversation(session, sessionManager);
+		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
+		targetManager.appendMessage(userMsg("target session"));
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		await targetManager.close();
+		if (!targetSessionFile) throw new Error("Expected target session file");
+
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "resume", targetSessionFile },
+			run: () => session.switchSession(targetSessionFile),
+			order,
+		});
+		expect(order).toEqual(["session_before_switch", "guard"]);
+
+		order.length = 0;
+		const currentSessionFile = session.sessionFile;
+		if (!currentSessionFile) throw new Error("Expected current session file");
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "resume", targetSessionFile: currentSessionFile },
+			run: () => session.reload(),
+			order,
+		});
+		expect(order).toEqual(["session_before_switch", "guard"]);
+	});
+
+	it("guards branch and branchFromBtw after their public before-hooks and before state mutation", async () => {
+		const tempDir = TempDir.createSync("@pi-session-transition-branch-");
+		tempDirs.push(tempDir);
+		const order: string[] = [];
+		const extensionRunner = {
+			hasHandlers: (eventType: string) => eventType === "session_before_branch",
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_before_branch") order.push(event.type);
+				return undefined;
+			},
+		} as unknown as ExtensionRunner;
+		const { session, sessionManager } = buildSession(tempDir, extensionRunner);
+		const { firstUserId } = await seedConversation(session, sessionManager);
+
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "branch", targetEntryId: firstUserId },
+			run: () => session.branch(firstUserId),
+			order,
+		});
+		expect(order).toEqual(["session_before_branch", "guard"]);
+
+		order.length = 0;
+		const leafId = sessionManager.getLeafId();
+		if (!leafId) throw new Error("Expected current leaf");
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "branchFromBtw", targetEntryId: leafId },
+			run: () => session.branchFromBtw("side question", assistantMsg("side answer")),
+			order,
+		});
+		expect(order).toEqual(["session_before_branch", "guard"]);
+	});
+
+	it("guards navigateTree after its public before-hook and before state mutation", async () => {
+		const tempDir = TempDir.createSync("@pi-session-transition-tree-");
+		tempDirs.push(tempDir);
+		const order: string[] = [];
+		const extensionRunner = {
+			hasHandlers: (eventType: string) => eventType === "session_before_tree",
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_before_tree") order.push(event.type);
+				return undefined;
+			},
+		} as unknown as ExtensionRunner;
+		const { session, sessionManager } = buildSession(tempDir, extensionRunner);
+		const { firstUserId } = await seedConversation(session, sessionManager);
+
+		await expectGuardedTransition({
+			session,
+			sessionManager,
+			expectedPlan: { reason: "navigateTree", targetEntryId: firstUserId },
+			run: () => session.navigateTree(firstUserId),
+			order,
+		});
+		expect(order).toEqual(["session_before_tree", "guard"]);
+	});
+
+	it("leaves native AgentSession tree navigation unchanged when no guard is installed", async () => {
+		const tempDir = TempDir.createSync("@pi-session-transition-native-");
+		tempDirs.push(tempDir);
+		const { session, sessionManager } = buildSession(tempDir);
+		const { firstUserId } = await seedConversation(session, sessionManager);
+
+		const result = await session.navigateTree(firstUserId);
+
+		expect(result.cancelled).toBe(false);
+		expect(sessionManager.getLeafId()).toBeNull();
 	});
 });

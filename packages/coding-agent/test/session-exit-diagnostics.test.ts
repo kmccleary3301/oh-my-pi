@@ -133,6 +133,83 @@ describe("session exit diagnostics", () => {
 		});
 	});
 
+	it("persists an externally projected tool result to the JSONL branch and clears pending diagnostics", async () => {
+		tempDir = TempDir.createSync("@pi-session-exit-completed-tool-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persistent session file path");
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		const toolResult = {
+			role: "toolResult" as const,
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			content: [{ type: "text" as const, text: "command completed" }],
+			details: { exitCode: 0 },
+			isError: false,
+			timestamp: Date.now(),
+		};
+		agent.emitExternalEvent({ type: "message_end", message: pendingAssistant });
+		agent.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			args: { command: "bun run check:ts" },
+		});
+		agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			result: { content: toolResult.content, details: toolResult.details },
+			isError: false,
+		});
+		agent.emitExternalEvent({ type: "message_start", message: toolResult });
+		agent.emitExternalEvent({ type: "message_end", message: toolResult });
+
+		for (let pass = 0; pass < 20; pass += 1) {
+			if (
+				sessionManager.getBranch().some(entry => entry.type === "message" && entry.message.role === "toolResult")
+			) {
+				break;
+			}
+			await Promise.resolve();
+		}
+		await sessionManager.flush();
+
+		const reloaded = await SessionManager.open(sessionFile, tempDir.path());
+		try {
+			const branch = reloaded.getBranch();
+			const persistedResult = branch.find(entry => entry.type === "message" && entry.message.role === "toolResult");
+			if (persistedResult?.type !== "message" || persistedResult.message.role !== "toolResult") {
+				throw new Error("Expected persisted tool result");
+			}
+			expect(persistedResult.message).toEqual(toolResult);
+			expect(collectPendingToolCalls(branch)).toEqual([]);
+			expect(describePendingToolCalls(branch)).toBeUndefined();
+		} finally {
+			await reloaded.close();
+		}
+	});
+
 	it("signal teardown persists the postmortem reason, not the generic dispose", async () => {
 		tempDir = TempDir.createSync("@pi-session-exit-signal-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
