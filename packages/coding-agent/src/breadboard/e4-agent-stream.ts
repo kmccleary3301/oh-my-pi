@@ -44,6 +44,8 @@ export class E4AgentStreamBridge {
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
 	readonly #pendingEvents = new Map<string, LoggedSessionEvent[]>();
+	readonly #submittedTurnIds = new Set<string>();
+	readonly #submissionsInFlight = new Set<Promise<void>>();
 	readonly #replayHeadSequence: number;
 	#closed = false;
 	#observeFailure: Error | undefined;
@@ -68,7 +70,9 @@ export class E4AgentStreamBridge {
 			this.#failSink(sink, "BreadBoard session closed", "aborted");
 		}
 		this.#sinks.clear();
+		this.#submittedTurnIds.clear();
 		this.#pendingEvents.clear();
+		this.#submissionsInFlight.clear();
 		await this.#session.close();
 	}
 
@@ -89,7 +93,25 @@ export class E4AgentStreamBridge {
 
 		try {
 			const input = submitInputFromContext(context);
-			const receipt = await this.#session.submit(input);
+			const submission = this.#session.submit(input).then(receipt => {
+				if (!this.#closed) this.#submittedTurnIds.add(String(receipt.turnId));
+				return receipt;
+			});
+			let settled!: Promise<void>;
+			settled = submission.then(
+				() => {
+					this.#submissionsInFlight.delete(settled);
+				},
+				() => {
+					this.#submissionsInFlight.delete(settled);
+				},
+			);
+			this.#submissionsInFlight.add(settled);
+			const receipt = await submission;
+			if (this.#closed) {
+				this.#pushStandaloneError(stream, model, "BreadBoard session is closed", "error");
+				return;
+			}
 			const turnKey = String(receipt.turnId);
 			const sink: TurnSink = {
 				model,
@@ -129,10 +151,14 @@ export class E4AgentStreamBridge {
 			for await (const event of this.#session.events({ signal: this.#observeAbort.signal })) {
 				if (event.sequence <= this.#replayHeadSequence || event.turnId === null) continue;
 				const turnKey = String(event.turnId);
-				const sink = this.#sinks.get(turnKey);
+				let sink = this.#sinks.get(turnKey);
+				if (!sink && !this.#submittedTurnIds.has(turnKey)) {
+					await this.#waitForSubmission(turnKey);
+					sink = this.#sinks.get(turnKey);
+				}
 				if (sink) {
 					this.#applyEvent(sink, event);
-				} else {
+				} else if (this.#submittedTurnIds.has(turnKey)) {
 					const pending = this.#pendingEvents.get(turnKey) ?? [];
 					pending.push(event);
 					this.#pendingEvents.set(turnKey, pending);
@@ -145,6 +171,12 @@ export class E4AgentStreamBridge {
 				this.#failSink(sink, this.#observeFailure.message, "error");
 			}
 			this.#sinks.clear();
+		}
+	}
+
+	async #waitForSubmission(turnKey: string): Promise<void> {
+		while (!this.#submittedTurnIds.has(turnKey) && this.#submissionsInFlight.size > 0) {
+			await Promise.race(this.#submissionsInFlight);
 		}
 	}
 
@@ -258,6 +290,8 @@ export class E4AgentStreamBridge {
 		for (const [turnId, candidate] of this.#sinks) {
 			if (candidate !== sink) continue;
 			this.#sinks.delete(turnId);
+			this.#submittedTurnIds.delete(turnId);
+			this.#pendingEvents.delete(turnId);
 			break;
 		}
 	}

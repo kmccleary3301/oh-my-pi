@@ -15,6 +15,7 @@ import {
 	loadSelectedBreadboardConfig,
 	resolveBreadboardRunConfig,
 } from "../breadboard/lifecycle/run-config";
+import { Settings } from "../config/settings";
 
 const ENGINE_ACTIONS = ["start", "status", "stop", "restart"] as const;
 type EngineAction = (typeof ENGINE_ACTIONS)[number];
@@ -43,7 +44,8 @@ export default class Engine extends Command {
 		try {
 			const { args, flags } = await this.parse(Engine);
 			const action = (args.action ?? "status") as EngineAction;
-			const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "settings.json"));
+			await Settings.init({ cwd: process.cwd() });
+			const selectedConfig = await loadSelectedBreadboardConfig(join(getAgentDir(), "config.yml"));
 			const config = resolveBreadboardRunConfig({
 				cli: {
 					engineMode: flags["engine-mode"],

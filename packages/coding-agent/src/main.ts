@@ -8,7 +8,7 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { createCanonicalE4Client } from "@breadboard/sdk";
+import { createCanonicalE4Client, type OpenedSessionRuntime } from "@breadboard/sdk";
 import { type AgentEvent, EventLoopKeepalive, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
@@ -26,7 +26,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CanonicalE4SessionPort } from "./breadboard/canonical-e4-session-port";
-import { E4AgentStreamBridge } from "./breadboard/e4-agent-stream";
+import { E4AgentStreamBridge, type E4AgentStreamBridgeOptions } from "./breadboard/e4-agent-stream";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
 import { LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
@@ -1038,13 +1038,83 @@ interface RunRootCommandDependencies {
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
-interface PreparedBreadboardRuntime {
+export interface PreparedBreadboardRuntime {
 	readonly stream: StreamFn;
 	readonly sessionId: string;
 	close(): Promise<void>;
 }
 
-async function prepareBreadboardRuntime(
+interface BreadboardRuntimeBridge {
+	readonly stream: StreamFn;
+	close(): Promise<void>;
+}
+
+export interface ConnectedBreadboardRuntimeOptions {
+	readonly closeSupervisor: () => Promise<void>;
+	readonly openSession: () => Promise<OpenedSessionRuntime>;
+	readonly emitAgentEvent: (event: AgentEvent) => void;
+	readonly createBridge?: (options: E4AgentStreamBridgeOptions) => BreadboardRuntimeBridge;
+	readonly registerCleanup?: (close: () => Promise<void>) => () => void;
+}
+
+export async function prepareConnectedBreadboardRuntime(
+	options: ConnectedBreadboardRuntimeOptions,
+): Promise<PreparedBreadboardRuntime> {
+	let opened: OpenedSessionRuntime | undefined;
+	let bridge: BreadboardRuntimeBridge | undefined;
+	let supervisorClosed = false;
+	const closeSupervisor = async (): Promise<void> => {
+		if (supervisorClosed) return;
+		supervisorClosed = true;
+		await options.closeSupervisor();
+	};
+	const cleanupBeforeTransfer = async (): Promise<void> => {
+		try {
+			if (bridge) await bridge.close();
+			else await opened?.close();
+		} finally {
+			await closeSupervisor();
+		}
+	};
+
+	try {
+		opened = await options.openSession();
+		const snapshot = await opened.snapshot();
+		bridge = (options.createBridge ?? (bridgeOptions => new E4AgentStreamBridge(bridgeOptions)))({
+			session: opened,
+			replayHeadSequence: snapshot.headSequence,
+			emitAgentEvent: options.emitAgentEvent,
+		});
+		let closed = false;
+		let cancelCleanup: (() => void) | undefined;
+		const close = async (): Promise<void> => {
+			if (closed) return;
+			closed = true;
+			try {
+				cancelCleanup?.();
+			} finally {
+				try {
+					await bridge!.close();
+				} finally {
+					await closeSupervisor();
+				}
+			}
+		};
+		cancelCleanup = (options.registerCleanup ?? (cleanup => postmortem.register("breadboard-runtime", cleanup)))(
+			close,
+		);
+		return { stream: bridge.stream, sessionId: String(opened.sessionId), close };
+	} catch (error) {
+		try {
+			await cleanupBeforeTransfer();
+		} catch (cleanupError) {
+			logger.warn("BreadBoard runtime cleanup failed", { error: String(cleanupError) });
+		}
+		throw error;
+	}
+}
+
+export async function prepareBreadboardRuntime(
 	parsed: Args,
 	emitAgentEvent: (event: AgentEvent) => void,
 ): Promise<PreparedBreadboardRuntime | null> {
@@ -1074,38 +1144,28 @@ async function prepareBreadboardRuntime(
 			: undefined;
 	const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
 	const connected = await supervisor.connect();
-	if (connected.kind !== "ready") {
-		process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
-		const closed = await supervisor.close({ consumerClosed: true });
-		if (closed.kind === "failure") process.exitCode = writeLifecyclePresentation(closed).exitCode || 1;
-		return null;
-	}
-
-	const opened = await new CanonicalE4SessionPort(
-		createCanonicalE4Client({
-			baseUrl: connected.handle.binding.endpoint,
-			requestTimeoutMs: config.requestTimeoutMs,
-			fetch: connected.handle.requestFetch,
-		}),
-	).open(target);
-	const snapshot = await opened.snapshot();
-	const bridge = new E4AgentStreamBridge({
-		session: opened,
-		replayHeadSequence: snapshot.headSequence,
-		emitAgentEvent,
-	});
-	let closed = false;
-	let cancelCleanup: (() => void) | undefined;
-	const close = async (): Promise<void> => {
-		if (closed) return;
-		closed = true;
-		cancelCleanup?.();
-		await bridge.close();
+	const closeSupervisor = async (): Promise<void> => {
 		const outcome = await supervisor.close({ consumerClosed: true });
 		if (outcome.kind === "failure") process.exitCode = writeLifecyclePresentation(outcome).exitCode || 1;
 	};
-	cancelCleanup = postmortem.register("breadboard-runtime", close);
-	return { stream: bridge.stream, sessionId: String(opened.sessionId), close };
+	if (connected.kind !== "ready") {
+		process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
+		await closeSupervisor();
+		return null;
+	}
+
+	return prepareConnectedBreadboardRuntime({
+		closeSupervisor,
+		openSession: () =>
+			new CanonicalE4SessionPort(
+				createCanonicalE4Client({
+					baseUrl: connected.handle.binding.endpoint,
+					requestTimeoutMs: config.requestTimeoutMs,
+					fetch: connected.handle.requestFetch,
+				}),
+			).open(target),
+		emitAgentEvent,
+	});
 }
 
 export async function runRootCommand(
