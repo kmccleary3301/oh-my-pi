@@ -7,10 +7,11 @@ import type {
 	LoggedSessionEvent,
 	OpenedSessionRuntime,
 	PermissionDecisionReceipt,
+	StructuredSubmit,
 	SubmitInput,
 	SubmitReceipt,
 } from "@breadboard/sdk";
-import { decodeLoggedSessionEvent } from "@breadboard/sdk";
+import { decodeLoggedSessionEvent, LifecycleE4ClientError } from "@breadboard/sdk";
 import { Agent, type AgentEvent } from "@oh-my-pi/pi-agent-core";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -24,13 +25,18 @@ import { convertToLlm } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { E4AgentStreamBridge } from "./e4-agent-stream";
 
-const wireEvent = (sequence: number, type: string, payload: unknown, turnId = "turn-1"): LoggedSessionEvent =>
+const wireEvent = (
+	sequence: number,
+	type: string,
+	payload: unknown,
+	turnId: string | null = "turn-1",
+): LoggedSessionEvent =>
 	decodeLoggedSessionEvent({
 		stable_cursor: true,
 		id: `event-${sequence}`,
 		seq: sequence,
 		session_id: "session-1",
-		input_id: "input-1",
+		input_id: turnId === null ? null : "input-1",
 		turn_id: turnId,
 		timestamp_ms: sequence,
 		type,
@@ -181,11 +187,390 @@ describe("E4AgentStreamBridge", () => {
 		const stream = await bridge.stream(model, context);
 		const result = await stream.result();
 
-		expect(submitted).toEqual(["new prompt"]);
+		expect(submitted).toHaveLength(1);
+		expect(submitted[0]).toMatchObject({ text: "new prompt" });
+		expect(typeof (submitted[0] as StructuredSubmit).clientMessageId).toBe("string");
 		expect(result.content).toEqual([{ type: "text", text: "hello world" }]);
 		expect(result.provider).toBe(model.provider);
 		await bridge.close();
 	});
+
+	test("reuses the exact structured submission after an ambiguous failure without retrying automatically", async () => {
+		const submitted: SubmitInput[] = [];
+		const retryStarted = Promise.withResolvers<void>();
+		let attempts = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				attempts += 1;
+				if (attempts === 1) throw new LifecycleE4ClientError({ kind: "timeout" });
+				retryStarted.resolve();
+				const structured = input as StructuredSubmit;
+				return {
+					...receipt,
+					clientMessageId: structured.clientMessageId as ClientMessageId,
+				};
+			},
+			async *events(request) {
+				await Promise.race([
+					retryStarted.promise,
+					new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					),
+				]);
+				if (request?.signal?.aborted) return;
+				yield started;
+				yield wireEvent(3, "turn_completed", {});
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		try {
+			const firstStream = await bridge.stream(model, context);
+			const firstResult = await firstStream.result();
+			expect(firstResult.stopReason).toBe("error");
+			expect(submitted).toHaveLength(1);
+
+			const retryStream = await bridge.stream(model, context);
+			const retryResult = await retryStream.result();
+			expect(retryResult.stopReason).toBe("stop");
+			expect(submitted).toHaveLength(2);
+			expect(submitted[1]).toBe(submitted[0]);
+			expect(typeof (submitted[0] as StructuredSubmit).clientMessageId).toBe("string");
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("fails closed on a different prompt while an ambiguous submission is unresolved", async () => {
+		const submitted: SubmitInput[] = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				throw new LifecycleE4ClientError({ kind: "caller-abort" });
+			},
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+		const differentContext: Context = {
+			messages: [{ role: "user", content: "different prompt", timestamp: 4 }],
+		};
+
+		try {
+			expect((await (await bridge.stream(model, context)).result()).stopReason).toBe("error");
+			const differentResult = await (await bridge.stream(model, differentContext)).result();
+
+			expect(differentResult.stopReason).toBe("error");
+			expect(differentResult.errorMessage).toContain("previous submission is unresolved");
+			expect(submitted).toHaveLength(1);
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("compares attachment uploads by content digest before reusing an ambiguous submission", async () => {
+		const submitted: SubmitInput[] = [];
+		const retryStarted = Promise.withResolvers<void>();
+		let attempts = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				attempts += 1;
+				if (attempts === 1) {
+					throw new LifecycleE4ClientError({
+						kind: "http",
+						status: 0,
+						code: null,
+						correlation: {},
+						body: "[redacted]",
+					});
+				}
+				retryStarted.resolve();
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async *events(request) {
+				await Promise.race([
+					retryStarted.promise,
+					new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					),
+				]);
+				if (request?.signal?.aborted) return;
+				yield started;
+				yield wireEvent(3, "turn_completed", {});
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+		const withImage = (data: string): Context => ({
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "inspect image" },
+						{ type: "image", mimeType: "image/png", data },
+					],
+					timestamp: 4,
+				},
+			],
+		});
+		const original = withImage(Buffer.from([0, 1, 2]).toString("base64"));
+		const differentBytes = withImage(Buffer.from([0, 1, 3]).toString("base64"));
+		const equivalent = withImage(Buffer.from([0, 1, 2]).toString("base64"));
+
+		try {
+			expect((await (await bridge.stream(model, original)).result()).stopReason).toBe("error");
+			const differentResult = await (await bridge.stream(model, differentBytes)).result();
+			expect(differentResult.errorMessage).toContain("previous submission is unresolved");
+			expect(submitted).toHaveLength(1);
+
+			expect((await (await bridge.stream(model, equivalent)).result()).stopReason).toBe("stop");
+			expect(submitted).toHaveLength(2);
+			expect(submitted[1]).toBe(submitted[0]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("fails and cancels only the sink correlated to a turn-owned runtime error", async () => {
+		const submissionsReady = Promise.withResolvers<void>();
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const secondReceipt: SubmitReceipt = {
+			...receipt,
+			clientMessageId: "client-message-2" as ClientMessageId,
+			inputId: "input-2" as SubmitReceipt["inputId"],
+			turnId: "turn-2" as SubmitReceipt["turnId"],
+		};
+		let submissionCount = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submissionCount += 1;
+				if (submissionCount === 2) submissionsReady.resolve();
+				const selected = submissionCount === 1 ? receipt : secondReceipt;
+				return {
+					...selected,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				await Promise.race([
+					submissionsReady.promise,
+					new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					),
+				]);
+				if (request?.signal?.aborted) return;
+				yield started;
+				yield wireEvent(3, "turn_start", {}, "turn-2");
+				yield wireEvent(4, "assistant.message.delta", { text: "partial" });
+				yield wireEvent(5, "error", { code: "worker_crash", message: "sensitive backend detail" });
+				yield wireEvent(6, "turn_completed", {});
+				yield wireEvent(7, "assistant.message.delta", { text: "healthy" }, "turn-2");
+				yield wireEvent(8, "turn_completed", {}, "turn-2");
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+		const secondContext: Context = {
+			messages: [{ role: "user", content: "second prompt", timestamp: 4 }],
+		};
+
+		try {
+			const firstStream = await bridge.stream(model, context);
+			const secondStream = await bridge.stream(model, secondContext);
+			const [firstResult, secondResult] = await Promise.all([firstStream.result(), secondStream.result()]);
+
+			expect(firstResult.stopReason).toBe("error");
+			expect(firstResult.content).toEqual([{ type: "text", text: "partial" }]);
+			expect(firstResult.errorMessage).toBe("BreadBoard runtime error [worker_crash]: [redacted]");
+			expect(firstResult.errorMessage).not.toContain("sensitive backend detail");
+			expect(secondResult.stopReason).toBe("stop");
+			expect(secondResult.content).toEqual([{ type: "text", text: "healthy" }]);
+			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("invalidates the bridge on a session-scoped runtime error", async () => {
+		const secondSubmitStarted = Promise.withResolvers<void>();
+		const releaseSecondSubmit = Promise.withResolvers<void>();
+		const runtimeErrorObserved = Promise.withResolvers<void>();
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const secondReceipt: SubmitReceipt = {
+			...receipt,
+			clientMessageId: "client-message-2" as ClientMessageId,
+			inputId: "input-2" as SubmitReceipt["inputId"],
+			turnId: "turn-2" as SubmitReceipt["turnId"],
+		};
+		let submissionCount = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submissionCount += 1;
+				if (submissionCount === 1) {
+					return {
+						...receipt,
+						clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+					};
+				}
+				secondSubmitStarted.resolve();
+				await releaseSecondSubmit.promise;
+				return {
+					...secondReceipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				await Promise.race([
+					secondSubmitStarted.promise,
+					new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					),
+				]);
+				if (request?.signal?.aborted) return;
+				yield started;
+				yield wireEvent(3, "assistant.message.delta", { text: "partial" });
+				runtimeErrorObserved.resolve();
+				yield wireEvent(4, "error", { code: "engine_crash", message: "sensitive backend detail" }, null);
+				await releaseSecondSubmit.promise;
+				if (request?.signal?.aborted) return;
+				yield wireEvent(5, "turn_completed", {});
+				yield wireEvent(6, "turn_start", {}, "turn-2");
+				yield wireEvent(7, "assistant.message.delta", { text: "should not run" }, "turn-2");
+				yield wireEvent(8, "turn_completed", {}, "turn-2");
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+		const secondContext: Context = {
+			messages: [{ role: "user", content: "second prompt", timestamp: 4 }],
+		};
+		const laterContext: Context = {
+			messages: [{ role: "user", content: "later prompt", timestamp: 5 }],
+		};
+
+		try {
+			const activeStream = await bridge.stream(model, context);
+			const submittingStream = await bridge.stream(model, secondContext);
+			await runtimeErrorObserved.promise;
+			releaseSecondSubmit.resolve();
+			const [activeResult, submittingResult] = await Promise.all([activeStream.result(), submittingStream.result()]);
+
+			expect(activeResult.stopReason).toBe("error");
+			expect(activeResult.content).toEqual([{ type: "text", text: "partial" }]);
+			expect(activeResult.errorMessage).toBe("BreadBoard runtime error [engine_crash]: [redacted]");
+			expect(activeResult.errorMessage).not.toContain("sensitive backend detail");
+			expect(submittingResult.stopReason).toBe("error");
+			expect(submittingResult.errorMessage).toBe("BreadBoard runtime error [engine_crash]: [redacted]");
+
+			const laterResult = await (await bridge.stream(model, laterContext)).result();
+			expect(laterResult.stopReason).toBe("error");
+			expect(laterResult.errorMessage).toBe("BreadBoard runtime error [engine_crash]: [redacted]");
+			expect(submissionCount).toBe(2);
+			expect(cancelled).toEqual([
+				{ turnId: receipt.turnId, reason: "timeout" },
+				{ turnId: secondReceipt.turnId, reason: "timeout" },
+			]);
+		} finally {
+			releaseSecondSubmit.resolve();
+			await bridge.close();
+		}
+	});
+
+	for (const runtimeFamily of [
+		{
+			label: "an unsupported backend runtime family",
+			event: wireEvent(4, "error", { code: "unsupported_runtime_event_family" }),
+			expectedMessage: "BreadBoard runtime error [unsupported_runtime_event_family]: [redacted]",
+		},
+		{
+			label: "an unknown canonical runtime family",
+			event: {
+				...wireEvent(4, "warning", {}),
+				kind: "future_runtime_observed",
+			} as unknown as LoggedSessionEvent,
+			expectedMessage: "BreadBoard unsupported canonical runtime event family",
+		},
+	] as const) {
+		test(`does not silently drop ${runtimeFamily.label}`, async () => {
+			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+			const session: OpenedSessionRuntime = {
+				...openedSession(
+					[
+						started,
+						wireEvent(3, "assistant.message.delta", { text: "partial" }),
+						runtimeFamily.event,
+						wireEvent(5, "turn_completed", {}),
+					],
+					[],
+				),
+				async cancel(request) {
+					cancelled.push(request);
+					return {} as CancellationReceipt;
+				},
+			};
+			const bridge = new E4AgentStreamBridge({
+				session,
+				replayHeadSequence: 0,
+				emitAgentEvent() {},
+				modelPolicy: { kind: "fixed", model: model },
+			});
+
+			try {
+				const result = await (await bridge.stream(model, context)).result();
+				expect(result.stopReason).toBe("error");
+				expect(result.content).toEqual([{ type: "text", text: "partial" }]);
+				expect(result.errorMessage).toBe(runtimeFamily.expectedMessage);
+				expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);
+			} finally {
+				await bridge.close();
+			}
+		});
+	}
 
 	test("drops replayed history and projects durable native tool result events in agent-loop order", async () => {
 		const submitted: SubmitInput[] = [];
@@ -529,7 +914,9 @@ describe("E4AgentStreamBridge", () => {
 			}
 			await sessionManager.flush();
 
-			expect(submitted).toEqual(["Inspect the README"]);
+			expect(submitted).toHaveLength(1);
+			expect(submitted[0]).toMatchObject({ text: "Inspect the README" });
+			expect(typeof (submitted[0] as StructuredSubmit).clientMessageId).toBe("string");
 			expect(agent.state.messages.map(message => message.role)).toEqual([
 				"user",
 				"assistant",
@@ -743,7 +1130,9 @@ describe("E4AgentStreamBridge", () => {
 		const stream = await bridge.stream(model, context);
 		const result = await stream.result();
 
-		expect(submitted).toEqual(["new prompt"]);
+		expect(submitted).toHaveLength(1);
+		expect(submitted[0]).toMatchObject({ text: "new prompt" });
+		expect(typeof (submitted[0] as StructuredSubmit).clientMessageId).toBe("string");
 		expect(result.content).toEqual([{ type: "text", text: "raced" }]);
 		await bridge.close();
 	});

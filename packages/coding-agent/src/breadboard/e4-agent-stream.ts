@@ -1,3 +1,10 @@
+import {
+	CanonicalE4ClientError,
+	deterministicSerialize,
+	LifecycleE4ClientError,
+	type StructuredSubmit,
+	sha256Bytes,
+} from "@breadboard/sdk";
 import type { AgentEvent, AgentToolResult, StreamFn } from "@oh-my-pi/pi-agent-core";
 import type {
 	AssistantMessage,
@@ -53,6 +60,11 @@ interface TurnSink {
 	terminal: boolean;
 }
 
+interface PendingSubmit {
+	readonly canonicalDigest: string;
+	readonly input: StructuredSubmit;
+}
+
 export interface E4AgentStreamBridgeOptions {
 	readonly session: OpenedSession;
 	readonly replayHeadSequence: number;
@@ -88,6 +100,7 @@ export class E4AgentStreamBridge {
 	readonly #outOfOrderSequences = new Set<number>();
 	#closed = false;
 	#observeFailure: Error | undefined;
+	#pendingSubmit: PendingSubmit | undefined;
 	#closePromise: Promise<void> | undefined;
 
 	constructor(options: E4AgentStreamBridgeOptions) {
@@ -191,13 +204,29 @@ export class E4AgentStreamBridge {
 			terminal: false,
 		};
 		this.#submittingSinks.add(sink);
+		let attempt: PendingSubmit | undefined;
 		try {
-			const input = submitInputFromContext(context);
-			const submission = this.#session.submit(input).then(receipt => {
+			const logicalInput = submitInputFromContext(context);
+			const canonicalDigest = await canonicalSubmitDigest(logicalInput);
+			const pending = this.#pendingSubmit;
+			if (pending && pending.canonicalDigest !== canonicalDigest) {
+				this.#submittingSinks.delete(sink);
+				this.#failSink(sink, "BreadBoard previous submission is unresolved; retry the unchanged input", "error");
+				return;
+			}
+			attempt = pending ?? {
+				canonicalDigest,
+				input: {
+					...logicalInput,
+					clientMessageId: crypto.randomUUID(),
+				},
+			};
+			const submission = this.#session.submit(attempt.input).then(receipt => {
 				if (!this.#closed && !this.#observeFailure) this.#submittedTurnIds.add(String(receipt.turnId));
 				return receipt;
 			});
 			const receipt = await submission;
+			if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
 			this.#submittingSinks.delete(sink);
 			sink.turnId = receipt.turnId;
 			const turnKey = String(receipt.turnId);
@@ -230,6 +259,10 @@ export class E4AgentStreamBridge {
 			signal?.addEventListener("abort", cancel, { once: true });
 		} catch (error) {
 			this.#submittingSinks.delete(sink);
+			if (attempt) {
+				if (isAmbiguousSubmitFailure(error)) this.#pendingSubmit ??= attempt;
+				else if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
+			}
 			this.#failSink(sink, safeErrorMessage(error), "error");
 		}
 	}
@@ -268,7 +301,26 @@ export class E4AgentStreamBridge {
 				while (this.#outOfOrderSequences.delete(this.#highestObservedSequence + 1)) {
 					this.#highestObservedSequence += 1;
 				}
-				if (event.turnId === null) continue;
+				if (event.kind === "runtime_error_observed" && (event.scope === "session" || event.turnId === null)) {
+					this.#invalidateBridge(
+						`BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`,
+					);
+					return;
+				}
+				if (event.turnId === null) {
+					switch (event.kind) {
+						case "todo_updated":
+						case "checkpoint_list_observed":
+						case "checkpoint_restored":
+						case "skills_catalog_observed":
+						case "skills_selection_observed":
+						case "ctree_snapshot_observed":
+							continue;
+						default:
+							this.#invalidateBridge("BreadBoard unsupported canonical runtime event family");
+							return;
+					}
+				}
 				const turnKey = String(event.turnId);
 				let sink = this.#sinks.get(turnKey);
 				if (!sink && !this.#submittedTurnIds.has(turnKey)) {
@@ -287,12 +339,18 @@ export class E4AgentStreamBridge {
 			failure = error;
 		}
 		if (this.#closed || this.#observeAbort.signal.aborted) return;
-		this.#observeFailure = new Error(safeErrorMessage(failure));
+		this.#invalidateBridge(safeErrorMessage(failure));
+	}
+
+	#invalidateBridge(message: string): void {
+		if (this.#observeFailure) return;
+		this.#observeFailure = new Error(message);
+		this.#observeAbort.abort();
 		for (const sink of this.#submittingSinks) {
-			this.#failSink(sink, this.#observeFailure.message, "error");
+			this.#failSink(sink, message, "error");
 		}
-		for (const sink of this.#sinks.values()) {
-			this.#failSink(sink, this.#observeFailure.message, "error");
+		for (const sink of [...this.#sinks.values()]) {
+			this.#failSink(sink, message, "error");
 			this.#cancelSink(sink, "timeout");
 		}
 		this.#sinks.clear();
@@ -347,7 +405,42 @@ export class E4AgentStreamBridge {
 			case "turn_cancelled":
 				this.#failSink(sink, `BreadBoard turn cancelled [${event.payload.reason}]`, "aborted");
 				return;
+			case "runtime_error_observed":
+				this.#failSink(
+					sink,
+					`BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`,
+					"error",
+				);
+				this.#cancelSink(sink, "timeout");
+				return;
+			case "input_observed":
+			case "conversation_compaction_started":
+			case "conversation_compaction_completed":
+			case "assistant_reasoning_delta":
+			case "assistant_thought_summary_delta":
+			case "tool_execution_started":
+			case "tool_execution_stdout_delta":
+			case "tool_execution_stderr_delta":
+			case "tool_execution_completed":
+			case "todo_updated":
+			case "permission_responded":
+			case "checkpoint_list_observed":
+			case "checkpoint_restored":
+			case "skills_catalog_observed":
+			case "skills_selection_observed":
+			case "ctree_node_observed":
+			case "ctree_snapshot_observed":
+			case "task_event_observed":
+			case "warning_observed":
+			case "reward_updated":
+			case "limits_updated":
+			case "completion_observed":
+			case "log_linked":
+			case "run_finished":
+				return;
 			default:
+				this.#failSink(sink, "BreadBoard unsupported canonical runtime event family", "error");
+				this.#cancelSink(sink, "timeout");
 				return;
 		}
 	}
@@ -518,20 +611,15 @@ export class E4AgentStreamBridge {
 	}
 }
 
-function submitInputFromContext(context: Context):
-	| string
-	| {
-			readonly text: string;
-			readonly attachments: readonly { readonly kind: "upload"; readonly filename: string; readonly data: Blob }[];
-	  } {
+function submitInputFromContext(context: Context): LogicalSubmit {
 	const message = lastUserMessage(context);
-	if (typeof message.content === "string") return message.content;
+	if (typeof message.content === "string") return { text: message.content };
 	const text = message.content
 		.filter((block): block is TextContent => block.type === "text")
 		.map(block => block.text)
 		.join("\n");
 	const images = message.content.filter((block): block is ImageContent => block.type === "image");
-	if (images.length === 0) return text;
+	if (images.length === 0) return { text };
 	return {
 		text,
 		attachments: images.map((image, index) => ({
@@ -540,6 +628,58 @@ function submitInputFromContext(context: Context):
 			data: new Blob([Buffer.from(image.data, "base64")], { type: image.mimeType }),
 		})),
 	};
+}
+
+type LogicalSubmit = Omit<StructuredSubmit, "clientMessageId">;
+
+async function canonicalSubmitDigest(input: LogicalSubmit): Promise<string> {
+	const attachments: Array<
+		| { readonly kind: "handle"; readonly id: string }
+		| {
+				readonly kind: "upload";
+				readonly filename: string;
+				readonly contentType: string;
+				readonly size: number;
+				readonly contentDigest: string;
+		  }
+	> = [];
+	for (const attachment of input.attachments ?? []) {
+		if (typeof attachment === "string") {
+			attachments.push({ kind: "handle", id: attachment.trim() });
+			continue;
+		}
+		if (attachment.kind === "handle") {
+			attachments.push(attachment);
+			continue;
+		}
+		const bytes = new Uint8Array(await attachment.data.arrayBuffer());
+		try {
+			attachments.push({
+				kind: "upload",
+				filename: attachment.filename,
+				contentType: attachment.data.type,
+				size: attachment.data.size,
+				contentDigest: await sha256Bytes(bytes),
+			});
+		} finally {
+			bytes.fill(0);
+		}
+	}
+	const serialized = deterministicSerialize({ text: input.text, attachments });
+	try {
+		return await sha256Bytes(serialized);
+	} finally {
+		serialized.fill(0);
+	}
+}
+
+function isAmbiguousSubmitFailure(error: unknown): boolean {
+	if (!(error instanceof CanonicalE4ClientError || error instanceof LifecycleE4ClientError)) return false;
+	return (
+		error.failure.kind === "timeout" ||
+		error.failure.kind === "caller-abort" ||
+		(error.failure.kind === "http" && error.failure.status === 0)
+	);
 }
 
 function lastUserMessage(context: Context): UserMessage {
