@@ -1,6 +1,7 @@
 import * as path from "node:path";
 
-export const DEFAULT_UPSTREAM_REF = "v17.0.7";
+export const UPSTREAM_ORACLE_COMMIT = "7b141199d524b859c357fc89654f10b62b9f3df1";
+export const DEFAULT_UPSTREAM_REF = UPSTREAM_ORACLE_COMMIT;
 export const POLICY_PATH = path.join(import.meta.dir, "p31", "upstream-sync-policy.json");
 
 export const SYNC_CLASSES = [

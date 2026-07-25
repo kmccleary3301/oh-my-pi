@@ -22,7 +22,7 @@ function fixtureGit(policy: SyncPolicy): FixtureGit {
 	const run: GitRunner = async args => {
 		const command = [...args];
 		calls.push(command);
-		if (command[0] === "rev-parse" && command.includes("v17.0.7^{commit}")) {
+		if (command[0] === "rev-parse" && command.includes(`${DEFAULT_UPSTREAM_REF}^{commit}`)) {
 			return { exitCode: 0, stdout: `${V17_COMMIT}\n`, stderr: "" } satisfies GitResult;
 		}
 		if (command[0] === "rev-parse" && command.includes("HEAD^{commit}")) {
@@ -116,7 +116,7 @@ describe("upstream sync inspection", () => {
 	it("reports exact v17.0.7 ancestry with base equal to merge-base", async () => {
 		const fixture = fixtureGit(policy);
 		const result = await inspectUpstreamSync({ git: fixture.run, policy });
-		expect(result.upstreamRef).toBe("v17.0.7");
+		expect(result.upstreamRef).toBe(DEFAULT_UPSTREAM_REF);
 		expect(result.commits.upstream).toBe(V17_COMMIT);
 		expect(result.commits.head).toBe(CURRENT_COMMIT);
 		expect(result.commits.base).toBe(V17_COMMIT);
