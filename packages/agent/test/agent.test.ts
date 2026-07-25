@@ -29,7 +29,7 @@ describe("Agent", () => {
 		});
 		const message = createAssistantMessage([{ type: "text", text: "external" }]);
 
-		const pending = agent.emitExternalEventAndWait({ type: "message_end", message });
+		const pending = agent.emitExternalEventAndWait({ type: "message_end", message }, "external-message");
 		await entered.promise;
 
 		expect(agent.state.messages).toContain(message);
@@ -38,6 +38,45 @@ describe("Agent", () => {
 		await pending;
 		expect(handled).toBe(true);
 	});
+
+	it.each(["sync", "async"] as const)(
+		"retries only failed subscribers after a %s external-event failure",
+		async failureMode => {
+			const agent = new Agent();
+			const message = createAssistantMessage([{ type: "text", text: "retry-safe" }]);
+			let shouldFail = true;
+			let successfulCalls = 0;
+			let failingCalls = 0;
+			agent.subscribe(() => {
+				successfulCalls += 1;
+			});
+			agent.subscribe(() => {
+				failingCalls += 1;
+				if (!shouldFail) return;
+				if (failureMode === "sync") throw new Error("sync listener failed");
+				return Promise.reject(new Error("async listener failed"));
+			});
+
+			await expect(
+				agent.emitExternalEventAndWait({ type: "message_end", message }, "retry-safe-message"),
+			).rejects.toThrow(`${failureMode} listener failed`);
+			expect(agent.state.messages).toEqual([message]);
+			expect(successfulCalls).toBe(1);
+			expect(failingCalls).toBe(1);
+
+			shouldFail = false;
+			await agent.emitExternalEventAndWait({ type: "message_end", message }, "retry-safe-message");
+			expect(agent.state.messages).toEqual([message]);
+			expect(successfulCalls).toBe(1);
+			expect(failingCalls).toBe(2);
+
+			agent.releaseExternalEvent("retry-safe-message");
+			await agent.emitExternalEventAndWait({ type: "message_end", message }, "retry-safe-message");
+			expect(agent.state.messages).toEqual([message, message]);
+			expect(successfulCalls).toBe(2);
+			expect(failingCalls).toBe(3);
+		},
+	);
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
 		const mock = createMockModel({ responses: [{ content: ["Processed"] }] });

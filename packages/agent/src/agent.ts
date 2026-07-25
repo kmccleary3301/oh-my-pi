@@ -337,6 +337,8 @@ export class Agent {
 	};
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#appliedExternalEventKeys = new Set<string>();
+	#completedExternalEventKeys = new WeakMap<(e: AgentEvent) => void, Set<string>>();
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -789,12 +791,29 @@ export class Agent {
 
 	/**
 	 * Applies an externally-owned event and waits until every subscriber has
-	 * finished handling it. Durable adapters use this to acknowledge upstream
-	 * cursors only after AgentSession has persisted the corresponding message.
+	 * finished handling it. The idempotency key keeps Agent state and successful
+	 * subscribers exact-once when a failed subscriber forces the adapter to
+	 * replay before its durable upstream cursor can advance.
+	 *
+	 * Call `releaseExternalEvent` only after the upstream cursor is durable.
 	 */
-	async emitExternalEventAndWait(event: AgentEvent): Promise<void> {
-		this.#applyExternalEvent(event);
-		await this.#emitAndWait(event);
+	async emitExternalEventAndWait(event: AgentEvent, idempotencyKey: string): Promise<void> {
+		const key = idempotencyKey.trim();
+		if (!key) throw new Error("External event idempotency key is required");
+		if (!this.#appliedExternalEventKeys.has(key)) {
+			this.#applyExternalEvent(event);
+			this.#appliedExternalEventKeys.add(key);
+		}
+		await this.#emitAndWait(event, key);
+	}
+
+	releaseExternalEvent(idempotencyKey: string): void {
+		const key = idempotencyKey.trim();
+		if (!key) throw new Error("External event idempotency key is required");
+		this.#appliedExternalEventKeys.delete(key);
+		for (const listener of this.#listeners) {
+			this.#completedExternalEventKeys.get(listener)?.delete(key);
+		}
 	}
 
 	#applyExternalEvent(event: AgentEvent): void {
@@ -1428,16 +1447,19 @@ export class Agent {
 		}
 	}
 
-	async #emitAndWait(e: AgentEvent): Promise<void> {
-		const pending: Promise<void>[] = [];
-		for (const listener of this.#listeners) {
-			try {
-				pending.push(Promise.resolve(listener(e)));
-			} catch (error) {
-				pending.push(Promise.reject(error));
-			}
-		}
-		const results = await Promise.allSettled(pending);
+	async #emitAndWait(e: AgentEvent, idempotencyKey: string): Promise<void> {
+		const attempts = [...this.#listeners]
+			.filter(listener => !this.#completedExternalEventKeys.get(listener)?.has(idempotencyKey))
+			.map(async listener => {
+				await (listener(e) as unknown);
+				let completed = this.#completedExternalEventKeys.get(listener);
+				if (!completed) {
+					completed = new Set();
+					this.#completedExternalEventKeys.set(listener, completed);
+				}
+				completed.add(idempotencyKey);
+			});
+		const results = await Promise.allSettled(attempts);
 		const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
 		if (failed) throw failed.reason;
 	}
