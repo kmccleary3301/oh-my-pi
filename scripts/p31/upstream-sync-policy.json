@@ -1,0 +1,127 @@
+{
+  "schemaVersion": "p31.upstream-sync-policy.v1",
+  "classes": [
+    "breadboard-owned",
+    "upstream-owned",
+    "generated",
+    "manual-review"
+  ],
+  "rules": [
+    {
+      "id": "breadboard-authority-adapters-provenance",
+      "class": "breadboard-owned",
+      "description": "BreadBoard-owned adapters, lifecycle/session authority, and SDK provenance must remain under BreadBoard authority.",
+      "patterns": [
+        "packages/coding-agent/src/breadboard/**",
+        "packages/coding-agent/breadboard-sdk-provenance.json",
+        "packages/coding-agent/vendor/breadboard-sdk-*.tgz",
+        "packages/coding-agent/scripts/verify-breadboard-sdk-provenance.ts",
+        "packages/coding-agent/test/breadboard-*.test.ts",
+        "packages/coding-agent/test/fixtures/breadboard-**",
+        "scripts/inspect-upstream-sync.ts",
+        "scripts/inspect-upstream-sync.test.ts",
+        "scripts/p31/**"
+      ]
+    },
+    {
+      "id": "manual-review-boundaries",
+      "class": "manual-review",
+      "description": "Package, lockfile, license/notice, and executable entrypoint boundaries require manual review; generated build outputs are handled by the generated rule.",
+      "patterns": [
+        "package.json",
+        "**/package.json",
+        "bun.lock",
+        "**/bun.lock",
+        "package-lock.json",
+        "**/package-lock.json",
+        "npm-shrinkwrap.json",
+        "**/npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "**/pnpm-lock.yaml",
+        "yarn.lock",
+        "**/yarn.lock",
+        "Cargo.lock",
+        "**/Cargo.lock",
+        "Dockerfile",
+        "Dockerfile.*",
+        "**/Dockerfile",
+        "**/Dockerfile.*",
+        "LICENSE",
+        "LICENSE.*",
+        "**/LICENSE",
+        "**/LICENSE.*",
+        "**/*license*",
+        "**/*LICENSE*",
+        "NOTICE",
+        "NOTICE.*",
+        "**/NOTICE",
+        "**/NOTICE.*",
+        "packages/*/src/cli.ts",
+        "packages/*/src/cli/**",
+        "**/*notice*",
+        "**/*NOTICE*",
+        "packages/*/src/cli-commands.ts",
+        "packages/*/src/commands/launch.ts",
+        "packages/*/src/main.ts",
+        "packages/*/src/index.ts",
+        "packages/*/bin/**",
+        "bin/**",
+        "entrypoint",
+        "entrypoint.*",
+        "**/entrypoint",
+        "**/entrypoint.*"
+      ]
+    },
+    {
+      "id": "generated-artifacts",
+      "class": "generated",
+      "description": "Generated trees and generated/provenance outputs are reported separately from source ownership.",
+      "patterns": [
+        "generated/**",
+        "**/generated/**",
+        "**/*.generated.*",
+        "**/*.gen.*",
+        "**/*.manifest.json",
+        "docs/conformance/**/*.json",
+        "**/*.tsv",
+        "dist/**",
+        "**/dist/**",
+        "build/**",
+        "**/build/**",
+        "**/build.*",
+        "**/*-build.*",
+        "coverage/**",
+        "**/coverage/**",
+        ".tmp/**",
+        "**/.tmp/**",
+        "**/*.snap"
+      ]
+    },
+    {
+      "id": "upstream-ordinary-omp",
+      "class": "upstream-owned",
+      "description": "Ordinary OMP package, crate, Python, and script paths remain upstream-authoritative.",
+      "patterns": [
+        "packages/*/src/**",
+        "packages/*/test/**",
+        "packages/*/tests/**",
+        "packages/*/bench/**",
+        "packages/*/examples/**",
+        "packages/*/scripts/**",
+        "crates/**",
+        "python/**",
+        "scripts/**/*.ts",
+        ".github/workflows/**"
+      ]
+    },
+    {
+      "id": "manual-review-unknown",
+      "class": "manual-review",
+      "description": "Unknown or conflicting paths fail closed and must be reviewed before an upstream merge or rebase.",
+      "patterns": [
+        "**"
+      ],
+      "fallback": true
+    }
+  ]
+}
