@@ -315,6 +315,11 @@ describe("E4AgentStreamBridge", () => {
 			expect(retryResult.errorMessage).toContain("result is already in the transcript");
 			expect(submitted).toHaveLength(2);
 			expect(submitted[1]).toBe(submitted[0]);
+			const repeatedRetryResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(repeatedRetryResult.stopReason).toBe("error");
+			expect(repeatedRetryResult.errorMessage).toContain("result is already in the transcript");
+			expect(submitted).toHaveLength(3);
+			expect(submitted[2]).toBe(submitted[0]);
 		} finally {
 			await bridge.close();
 		}

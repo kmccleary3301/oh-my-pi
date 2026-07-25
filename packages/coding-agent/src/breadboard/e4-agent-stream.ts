@@ -120,6 +120,7 @@ export class E4AgentStreamBridge {
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
 	readonly #adoptedTerminalTurnIds = new Set<string>();
+	readonly #observedSubmitAttempts = new Map<string, PendingSubmit>();
 	readonly #submittingSinks = new Set<TurnSink>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
 	readonly #undurableSinks = new Set<TurnSink>();
@@ -178,6 +179,7 @@ export class E4AgentStreamBridge {
 		await Promise.all([...this.#cancellationsInFlight]);
 		this.#sinks.clear();
 		this.#adoptedTerminalTurnIds.clear();
+		this.#observedSubmitAttempts.clear();
 		this.#submittingSinks.clear();
 		let projectionFailure: unknown;
 		try {
@@ -321,11 +323,12 @@ export class E4AgentStreamBridge {
 			if (this.#pendingSubmit?.recoveringAfterAbort) {
 				throw new Error("BreadBoard previous submission cancellation is still resolving");
 			}
-			attempt = this.#pendingSubmit ?? {
-				canonicalDigest,
-				input: { ...input, clientMessageId: crypto.randomUUID() },
-				recoveringAfterAbort: false,
-			};
+			attempt = this.#pendingSubmit ??
+				this.#observedSubmitAttempts.get(canonicalDigest) ?? {
+					canonicalDigest,
+					input: { ...input, clientMessageId: crypto.randomUUID() },
+					recoveringAfterAbort: false,
+				};
 			const receipt = await this.#submitAttempt(attempt, sink, signal);
 			if (!receipt) return;
 			if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
@@ -338,7 +341,8 @@ export class E4AgentStreamBridge {
 			}
 			const turnKey = String(receipt.turnId);
 			const observedSink = this.#sinks.get(turnKey);
-			if (observedSink?.adopted || this.#adoptedTerminalTurnIds.delete(turnKey)) {
+			if (observedSink?.adopted || this.#adoptedTerminalTurnIds.has(turnKey)) {
+				this.#rememberObservedSubmit(attempt);
 				this.#failSink(
 					sink,
 					"BreadBoard submission was already observed; its result is already in the transcript",
@@ -646,8 +650,18 @@ export class E4AgentStreamBridge {
 		sink.stream?.push({ type: "start", partial: assistantMessage(sink.model, "", "stop") });
 	}
 
+	#rememberObservedSubmit(attempt: PendingSubmit): void {
+		this.#observedSubmitAttempts.delete(attempt.canonicalDigest);
+		this.#observedSubmitAttempts.set(attempt.canonicalDigest, attempt);
+		while (this.#observedSubmitAttempts.size > 16) {
+			const oldest = this.#observedSubmitAttempts.keys().next().value;
+			if (oldest === undefined) break;
+			this.#observedSubmitAttempts.delete(oldest);
+		}
+	}
+
 	#rememberAdoptedTerminal(sink: TurnSink): void {
-		if (!this.#pendingSubmit || sink.turnId === undefined) return;
+		if (sink.turnId === undefined) return;
 		this.#adoptedTerminalTurnIds.add(String(sink.turnId));
 		while (this.#adoptedTerminalTurnIds.size > 16) {
 			const oldest = this.#adoptedTerminalTurnIds.values().next().value;
