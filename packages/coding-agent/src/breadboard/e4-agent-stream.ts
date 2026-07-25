@@ -64,6 +64,7 @@ interface TurnSink {
 interface PendingSubmit {
 	readonly canonicalDigest: string;
 	readonly input: StructuredSubmit;
+	recoveringAfterAbort: boolean;
 }
 
 export interface E4DurableCursor {
@@ -118,6 +119,7 @@ export class E4AgentStreamBridge {
 	readonly #initialCursor: E4DurableCursor | undefined;
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
+	readonly #adoptedTerminalTurnIds = new Set<string>();
 	readonly #submittingSinks = new Set<TurnSink>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
 	readonly #undurableSinks = new Set<TurnSink>();
@@ -175,8 +177,37 @@ export class E4AgentStreamBridge {
 		await Promise.all([...this.#submissionsInFlight]);
 		await Promise.all([...this.#cancellationsInFlight]);
 		this.#sinks.clear();
+		this.#adoptedTerminalTurnIds.clear();
 		this.#submittingSinks.clear();
-		await this.#session.close();
+		let projectionFailure: unknown;
+		try {
+			await this.#commitTerminalCursor();
+		} catch (error) {
+			projectionFailure = error;
+		}
+		try {
+			await this.#session.close();
+		} catch (error) {
+			if (projectionFailure !== undefined) {
+				throw new AggregateError(
+					[projectionFailure, error],
+					"BreadBoard projection commit and session close failed",
+				);
+			}
+			throw error;
+		}
+		if (projectionFailure !== undefined) throw projectionFailure;
+	}
+
+	async #commitTerminalCursor(): Promise<void> {
+		const cursor = this.#terminalCursor;
+		if (!cursor) return;
+		if (this.#undurableSinks.size > 0) {
+			throw new Error("BreadBoard cannot commit a terminal cursor while replay projection is incomplete");
+		}
+		await this.#projectionCommitted(cursor);
+		for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
+		this.#terminalCursor = undefined;
 	}
 
 	#newSink(model: E4BackendModelAttribution, stream?: AssistantMessageEventStream): TurnSink {
@@ -201,6 +232,44 @@ export class E4AgentStreamBridge {
 		};
 	}
 
+	async #submitAttempt(
+		attempt: PendingSubmit,
+		sink: TurnSink,
+		signal: AbortSignal | undefined,
+	): Promise<Awaited<ReturnType<OpenedSession["submit"]>> | undefined> {
+		if (signal?.aborted) {
+			this.#failSink(sink, "BreadBoard submission cancelled before admission", "aborted");
+			return undefined;
+		}
+		const submission = this.#session.submit(attempt.input);
+		if (!signal) return submission;
+		let abortSubmission!: () => void;
+		const aborted = new Promise<{ readonly kind: "aborted" }>(resolve => {
+			abortSubmission = () => resolve({ kind: "aborted" });
+			signal.addEventListener("abort", abortSubmission, { once: true });
+		});
+		let result:
+			| { readonly kind: "receipt"; readonly receipt: Awaited<ReturnType<OpenedSession["submit"]>> }
+			| { readonly kind: "aborted" };
+		try {
+			result = await Promise.race([submission.then(receipt => ({ kind: "receipt" as const, receipt })), aborted]);
+		} finally {
+			signal.removeEventListener("abort", abortSubmission);
+		}
+		if (result.kind === "receipt") return result.receipt;
+
+		attempt.recoveringAfterAbort = true;
+		this.#pendingSubmit ??= attempt;
+		void submission
+			.then(receipt => this.#session.cancel({ turnId: receipt.turnId, reason: "user_requested" }))
+			.catch(() => undefined)
+			.finally(() => {
+				if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
+			});
+		this.#failSink(sink, "BreadBoard submission cancelled while admission was in progress", "aborted");
+		return undefined;
+	}
+
 	async #startTurn(
 		model: Model,
 		context: Context,
@@ -217,19 +286,8 @@ export class E4AgentStreamBridge {
 			return;
 		}
 		if (this.#terminalCursor) {
-			if (this.#undurableSinks.size > 0) {
-				this.#pushStandaloneError(
-					stream,
-					model,
-					"BreadBoard cannot admit a turn while replay projection is incomplete",
-					"error",
-				);
-				return;
-			}
 			try {
-				await this.#projectionCommitted(this.#terminalCursor);
-				for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
-				this.#terminalCursor = undefined;
+				await this.#commitTerminalCursor();
 			} catch (error) {
 				const message = `BreadBoard projection cursor commit failed: ${safeErrorMessage(error)}`;
 				this.#invalidateBridge(message);
@@ -260,11 +318,16 @@ export class E4AgentStreamBridge {
 			if (this.#pendingSubmit && this.#pendingSubmit.canonicalDigest !== canonicalDigest) {
 				throw new Error("BreadBoard previous submission is unresolved; retry the unchanged input");
 			}
+			if (this.#pendingSubmit?.recoveringAfterAbort) {
+				throw new Error("BreadBoard previous submission cancellation is still resolving");
+			}
 			attempt = this.#pendingSubmit ?? {
 				canonicalDigest,
 				input: { ...input, clientMessageId: crypto.randomUUID() },
+				recoveringAfterAbort: false,
 			};
-			const receipt = await this.#session.submit(attempt.input);
+			const receipt = await this.#submitAttempt(attempt, sink, signal);
+			if (!receipt) return;
 			if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
 			sink.turnId = receipt.turnId;
 			const failure = this.#currentObserveFailure();
@@ -274,7 +337,16 @@ export class E4AgentStreamBridge {
 				return;
 			}
 			const turnKey = String(receipt.turnId);
-			if (this.#sinks.has(turnKey)) {
+			const observedSink = this.#sinks.get(turnKey);
+			if (observedSink?.adopted || this.#adoptedTerminalTurnIds.delete(turnKey)) {
+				this.#failSink(
+					sink,
+					"BreadBoard submission was already observed; its result is already in the transcript",
+					"error",
+				);
+				return;
+			}
+			if (observedSink) {
 				this.#invalidateBridge(`BreadBoard submission receipt collided with observed turn ${turnKey}`);
 				return;
 			}
@@ -574,6 +646,16 @@ export class E4AgentStreamBridge {
 		sink.stream?.push({ type: "start", partial: assistantMessage(sink.model, "", "stop") });
 	}
 
+	#rememberAdoptedTerminal(sink: TurnSink): void {
+		if (!this.#pendingSubmit || sink.turnId === undefined) return;
+		this.#adoptedTerminalTurnIds.add(String(sink.turnId));
+		while (this.#adoptedTerminalTurnIds.size > 16) {
+			const oldest = this.#adoptedTerminalTurnIds.values().next().value;
+			if (oldest === undefined) break;
+			this.#adoptedTerminalTurnIds.delete(oldest);
+		}
+	}
+
 	async #completeSink(
 		sink: TurnSink,
 		event: Extract<LoggedSessionEvent, { readonly kind: "turn_completed" }>,
@@ -598,6 +680,7 @@ export class E4AgentStreamBridge {
 			this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 			this.#terminalCursor = cursorFor(event);
 		}
+		if (sink.adopted) this.#rememberAdoptedTerminal(sink);
 		sink.terminal = true;
 		this.#removeSink(sink);
 	}
@@ -627,6 +710,7 @@ export class E4AgentStreamBridge {
 			this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 			this.#terminalCursor = cursorFor(event);
 		}
+		if (sink.adopted) this.#rememberAdoptedTerminal(sink);
 		sink.terminal = true;
 		this.#removeSink(sink);
 	}

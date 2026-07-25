@@ -264,6 +264,169 @@ describe("E4AgentStreamBridge", () => {
 		}
 	});
 
+	test("rejects an unchanged retry after its ambiguous submission was already observed to completion", async () => {
+		const submitted: SubmitInput[] = [];
+		const firstFailed = Promise.withResolvers<void>();
+		const terminalProjected = Promise.withResolvers<void>();
+		let attempts = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				attempts += 1;
+				if (attempts === 1) {
+					firstFailed.resolve();
+					throw new LifecycleE4ClientError({ kind: "timeout" });
+				}
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async *events(request) {
+				await firstFailed.promise;
+				yield started;
+				yield wireEvent(3, "turn_completed", {});
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				if (cursor.sequence === 3) terminalProjected.resolve();
+			},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		try {
+			const firstResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(firstResult.stopReason).toBe("error");
+			await terminalProjected.promise;
+
+			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(retryResult.stopReason).toBe("error");
+			expect(retryResult.errorMessage).toContain("result is already in the transcript");
+			expect(submitted).toHaveLength(2);
+			expect(submitted[1]).toBe(submitted[0]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("rejects an unchanged retry while its ambiguously submitted turn is being observed", async () => {
+		const submitted: SubmitInput[] = [];
+		const firstFailed = Promise.withResolvers<void>();
+		const startedProjected = Promise.withResolvers<void>();
+		let attempts = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				attempts += 1;
+				if (attempts === 1) {
+					firstFailed.resolve();
+					throw new LifecycleE4ClientError({ kind: "timeout" });
+				}
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async *events(request) {
+				await firstFailed.promise;
+				yield started;
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				if (cursor.sequence === started.sequence) startedProjected.resolve();
+			},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		try {
+			const firstResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(firstResult.stopReason).toBe("error");
+			await startedProjected.promise;
+
+			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(retryResult.stopReason).toBe("error");
+			expect(retryResult.errorMessage).toContain("result is already in the transcript");
+			expect(submitted).toHaveLength(2);
+			expect(submitted[1]).toBe(submitted[0]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("aborts a pending admission without holding session close until the submit request times out", async () => {
+		const submission = Promise.withResolvers<SubmitReceipt>();
+		const submitStarted = Promise.withResolvers<void>();
+		const cancellationObserved = Promise.withResolvers<void>();
+		const cancellationTurnIds: string[] = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit() {
+				submitStarted.resolve();
+				return submission.promise;
+			},
+			async cancel(request) {
+				cancellationTurnIds.push(String(request.turnId));
+				cancellationObserved.resolve();
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+		const abort = new AbortController();
+
+		const stream = await startBridgeStream(bridge, model, context, { signal: abort.signal });
+		await submitStarted.promise;
+		abort.abort();
+		const result = await stream.result();
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toContain("cancelled while admission was in progress");
+
+		const closeOutcome = await Promise.race([
+			bridge.close().then(() => "closed" as const),
+			Bun.sleep(100).then(() => "blocked" as const),
+		]);
+		expect(closeOutcome).toBe("closed");
+
+		submission.resolve(receipt);
+		await cancellationObserved.promise;
+		expect(cancellationTurnIds).toEqual([String(receipt.turnId)]);
+	});
+
 	test("fails closed on a different prompt while an ambiguous submission is unresolved", async () => {
 		const submitted: SubmitInput[] = [];
 		const session: OpenedSessionRuntime = {
@@ -2206,6 +2369,64 @@ describe("E4AgentStreamBridge", () => {
 		expect(lifecycle.slice(-2)).toEqual(["commit:6", "submit:2"]);
 		await bridge.close();
 		expect((await secondStream.result()).stopReason).toBe("aborted");
+	});
+
+	test("commits the held terminal cursor during close when no next turn is submitted", async () => {
+		const submitted: SubmitInput[] = [];
+		const admitted = Promise.withResolvers<void>();
+		const globalProcessed = Promise.withResolvers<void>();
+		const commits: Array<{ eventId: string; sequence: number }> = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], submitted),
+			async submit(input) {
+				submitted.push(input);
+				admitted.resolve();
+				return receipt;
+			},
+			async *events(request) {
+				await admitted.promise;
+				yield started;
+				yield wireEvent(3, "assistant.message.delta", { text: "durable boundary" });
+				yield wireEvent(4, "assistant.message.end", { text: "durable boundary" });
+				yield wireEvent(5, "turn_completed", {});
+				yield wireEvent(
+					6,
+					"todo_event",
+					{
+						todo: {
+							op: "snapshot",
+							scope_label: "Verification",
+							items: [{ id: "task-1", title: "Commit on close", status: "done" }],
+						},
+					},
+					null,
+				);
+				globalProcessed.resolve();
+				await new Promise<void>(resolve =>
+					request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			async emitAgentEvent() {},
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				commits.push(cursor);
+			},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		const stream = await startBridgeStream(bridge, model, context);
+		expect((await stream.result()).stopReason).toBe("stop");
+		await globalProcessed.promise;
+		expect(commits).toEqual([{ eventId: "event-2", sequence: 2 }]);
+
+		await bridge.close();
+		expect(commits).toEqual([
+			{ eventId: "event-2", sequence: 2 },
+			{ eventId: "event-6", sequence: 6 },
+		]);
 	});
 
 	test("settles a tool-owning permission cancellation before releasing keys or admitting the next turn", async () => {
