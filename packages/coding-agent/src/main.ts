@@ -9,7 +9,6 @@ import * as os from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import {
-	createCanonicalE4Client,
 	detectSensitiveValues,
 	type OpenedSessionRuntime,
 	REDACTED_VALUE,
@@ -31,7 +30,6 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import { CanonicalE4SessionPort } from "./breadboard/canonical-e4-session-port";
 import {
 	breadboardProjectionEventId,
 	E4AgentStreamBridge,
@@ -39,6 +37,7 @@ import {
 	type E4DurableCursor,
 	type E4PermissionHandler,
 } from "./breadboard/e4-agent-stream";
+import { createCanonicalBreadboardEnginePort } from "./breadboard/engine-port";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
 import { LIFECYCLE_FAILURE_STATES, type LifecycleState } from "./breadboard/lifecycle/lifecycle-state";
 import { type LifecycleDispatchResult, LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
@@ -1726,22 +1725,16 @@ export async function prepareBreadboardRuntime(
 		throw new BreadboardLifecycleStartupError(connected);
 	}
 
+	const enginePort = createCanonicalBreadboardEnginePort(connected.handle, {
+		requestTimeoutMs: config.requestTimeoutMs,
+		onLateSessionCloseError: () => {
+			process.stderr.write("BreadBoard session cleanup failed after caller abort.\n");
+			process.exitCode = 1;
+		},
+	});
 	return prepareConnectedBreadboardRuntime({
 		closeSupervisor,
-		openSession: () =>
-			new CanonicalE4SessionPort(
-				createCanonicalE4Client({
-					baseUrl: connected.handle.binding.endpoint,
-					requestTimeoutMs: config.requestTimeoutMs,
-					fetch: connected.handle.requestFetch,
-				}),
-				{
-					onLateCloseError: () => {
-						process.stderr.write("BreadBoard session cleanup failed after caller abort.\n");
-						process.exitCode = 1;
-					},
-				},
-			).open(target),
+		openSession: () => enginePort.openSession(target),
 		emitAgentEvent: async (event, idempotencyKey) => {
 			await emitAgentEvent(event, idempotencyKey);
 		},

@@ -52,7 +52,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",
     "@babel/parser": "catalog:",
-    "@breadboard/sdk": "file:./vendor/breadboard-sdk-0.2.4.tgz",
+    "@breadboard/sdk": "file:./vendor/breadboard-sdk-0.2.5.tgz",
     "@mozilla/readability": "catalog:",
     "@oh-my-pi/hashline": "catalog:",
     "@oh-my-pi/omp-stats": "catalog:",
