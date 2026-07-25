@@ -5,6 +5,7 @@ import type {
 	ImageContent,
 	Model,
 	TextContent,
+	ToolCall,
 	ToolResultMessage,
 	Usage,
 	UserMessage,
@@ -36,7 +37,13 @@ interface TurnSink {
 	readonly model: E4BackendModelAttribution;
 	readonly stream: AssistantMessageEventStream;
 	readonly permissionAbort: AbortController;
-	readonly toolNamesByCallId: Map<string, string>;
+	readonly toolCallsByCallId: Map<string, Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>>;
+	readonly pendingToolResultsByCallId: Map<
+		string,
+		Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>
+	>;
+	readonly projectedToolCallIds: Set<string>;
+	readonly projectedToolResultIds: Set<string>;
 	turnId: TurnId | undefined;
 	cancelRequested: boolean;
 	text: string;
@@ -78,6 +85,7 @@ export class E4AgentStreamBridge {
 	readonly #submissionsInFlight = new Set<Promise<void>>();
 	readonly #cancellationsInFlight = new Set<Promise<void>>();
 	#highestObservedSequence: number;
+	readonly #outOfOrderSequences = new Set<number>();
 	#closed = false;
 	#observeFailure: Error | undefined;
 	#closePromise: Promise<void> | undefined;
@@ -130,8 +138,8 @@ export class E4AgentStreamBridge {
 
 		this.#submittingSinks.clear();
 		this.#sinks.clear();
-		this.#submittedTurnIds.clear();
 		this.#pendingEvents.clear();
+		this.#outOfOrderSequences.clear();
 		await this.#session.close();
 	}
 
@@ -170,7 +178,10 @@ export class E4AgentStreamBridge {
 			model: backendModel,
 			stream,
 			permissionAbort: new AbortController(),
-			toolNamesByCallId: new Map(),
+			toolCallsByCallId: new Map(),
+			pendingToolResultsByCallId: new Map(),
+			projectedToolCallIds: new Set(),
+			projectedToolResultIds: new Set(),
 			turnId: undefined,
 			cancelRequested: false,
 			text: "",
@@ -251,8 +262,12 @@ export class E4AgentStreamBridge {
 		let failure: unknown = new Error("BreadBoard event observer ended unexpectedly");
 		try {
 			for await (const event of this.#session.events({ signal: this.#observeAbort.signal })) {
-				if (event.sequence <= this.#highestObservedSequence) continue;
-				this.#highestObservedSequence = event.sequence;
+				if (event.sequence <= this.#highestObservedSequence || this.#outOfOrderSequences.has(event.sequence))
+					continue;
+				this.#outOfOrderSequences.add(event.sequence);
+				while (this.#outOfOrderSequences.delete(this.#highestObservedSequence + 1)) {
+					this.#highestObservedSequence += 1;
+				}
 				if (event.turnId === null) continue;
 				const turnKey = String(event.turnId);
 				let sink = this.#sinks.get(turnKey);
@@ -315,41 +330,11 @@ export class E4AgentStreamBridge {
 				return;
 			}
 			case "tool_called":
-				sink.toolNamesByCallId.set(String(event.payload.callId), event.payload.tool);
-				this.#emitAgentEvent({
-					type: "tool_execution_start",
-					toolCallId: String(event.payload.callId),
-					toolName: event.payload.tool,
-					args: event.payload.arguments ?? {},
-					intent: event.payload.action ?? undefined,
-				});
+				this.#projectToolCall(sink, event);
 				return;
-			case "tool_result_observed": {
-				const toolCallId = String(event.payload.callId);
-				const toolName = event.payload.tool ?? sink.toolNamesByCallId.get(toolCallId) ?? "tool";
-				sink.toolNamesByCallId.delete(toolCallId);
-				const result = toolResult(event.payload.result, event.payload.artifactRef);
-				const isError = event.payload.error;
-				this.#emitAgentEvent({
-					type: "tool_execution_end",
-					toolCallId,
-					toolName,
-					result,
-					isError,
-				});
-				const message: ToolResultMessage = {
-					role: "toolResult",
-					toolCallId,
-					toolName,
-					content: result.content,
-					details: result.details,
-					isError,
-					timestamp: Date.now(),
-				};
-				this.#emitAgentEvent({ type: "message_start", message });
-				this.#emitAgentEvent({ type: "message_end", message });
+			case "tool_result_observed":
+				this.#projectToolResult(sink, event);
 				return;
-			}
 			case "permission_requested":
 				void this.#handlePermissionRequest(sink, event);
 				return;
@@ -365,6 +350,64 @@ export class E4AgentStreamBridge {
 			default:
 				return;
 		}
+	}
+
+	#projectToolCall(sink: TurnSink, event: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>): void {
+		const toolCallId = String(event.payload.callId);
+		if (sink.projectedToolCallIds.has(toolCallId)) return;
+		sink.projectedToolCallIds.add(toolCallId);
+		sink.toolCallsByCallId.set(toolCallId, event);
+
+		const message = assistantToolCallMessage(sink.model, event);
+		this.#emitAgentEvent({ type: "message_start", message });
+		this.#emitAgentEvent({ type: "message_end", message });
+		this.#emitAgentEvent({
+			type: "tool_execution_start",
+			toolCallId,
+			toolName: event.payload.tool,
+			args: event.payload.arguments,
+			intent: event.payload.action ?? undefined,
+		});
+
+		const pendingResult = sink.pendingToolResultsByCallId.get(toolCallId);
+		if (pendingResult) this.#projectToolResult(sink, pendingResult);
+	}
+
+	#projectToolResult(
+		sink: TurnSink,
+		event: Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>,
+	): void {
+		const toolCallId = String(event.payload.callId);
+		if (sink.projectedToolResultIds.has(toolCallId)) return;
+		const toolCall = sink.toolCallsByCallId.get(toolCallId);
+		if (!toolCall) {
+			if (!sink.pendingToolResultsByCallId.has(toolCallId)) sink.pendingToolResultsByCallId.set(toolCallId, event);
+			return;
+		}
+
+		sink.projectedToolResultIds.add(toolCallId);
+		sink.pendingToolResultsByCallId.delete(toolCallId);
+		const toolName = event.payload.tool ?? toolCall.payload.tool;
+		const result = toolResult(event.payload.result, event.payload.artifactRef);
+		const isError = event.payload.error;
+		this.#emitAgentEvent({
+			type: "tool_execution_end",
+			toolCallId,
+			toolName,
+			result,
+			isError,
+		});
+		const message: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId,
+			toolName,
+			content: result.content,
+			details: result.details,
+			isError,
+			timestamp: Date.now(),
+		};
+		this.#emitAgentEvent({ type: "message_start", message });
+		this.#emitAgentEvent({ type: "message_end", message });
 	}
 
 	async #handlePermissionRequest(
@@ -461,8 +504,10 @@ export class E4AgentStreamBridge {
 
 	#removeSink(sink: TurnSink): void {
 		sink.permissionAbort.abort();
-		sink.toolNamesByCallId.clear();
-		sink.messageText = "";
+		sink.toolCallsByCallId.clear();
+		sink.pendingToolResultsByCallId.clear();
+		sink.projectedToolCallIds.clear();
+		sink.projectedToolResultIds.clear();
 		for (const [turnId, candidate] of this.#sinks) {
 			if (candidate !== sink) continue;
 			this.#sinks.delete(turnId);
@@ -527,6 +572,28 @@ function assistantMessage(
 		stopReason,
 		errorMessage,
 		timestamp: Date.now(),
+	};
+}
+
+function assistantToolCallMessage(
+	model: E4BackendModelAttribution,
+	event: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>,
+): AssistantMessage {
+	const toolCall: ToolCall = {
+		type: "toolCall",
+		id: String(event.payload.callId),
+		name: event.payload.tool,
+		arguments: event.payload.arguments as ToolCall["arguments"],
+	};
+	return {
+		role: "assistant",
+		content: [toolCall],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: ZERO_USAGE,
+		stopReason: "toolUse",
+		timestamp: event.occurredAtMs,
 	};
 }
 

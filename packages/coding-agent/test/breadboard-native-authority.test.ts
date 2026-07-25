@@ -6,7 +6,11 @@ import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { E4PermissionHandler } from "@oh-my-pi/pi-coding-agent/breadboard/e4-agent-stream";
-import { lifecycleFailure } from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-state";
+import {
+	LIFECYCLE_FAILURE_STATES,
+	type LifecycleState,
+	lifecycleFailure,
+} from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-state";
 import {
 	type LifecycleDispatchResult,
 	LifecycleSupervisor,
@@ -103,6 +107,43 @@ function nonReadyLifecycleResult(
 				{ readonly kind: "ready" }
 			>;
 	}
+}
+
+type LifecycleFailureResult = Extract<LifecycleDispatchResult, { readonly kind: "failure" }>;
+
+const RENEWAL_LOSS_FAILURES: ReadonlyArray<readonly [ActiveBreadboardMode, LifecycleFailureResult]> = [
+	[
+		"local-owned",
+		lifecycleFailure("local-owned", "owner-lease-expired", "owner_lease_expired") as LifecycleFailureResult,
+	],
+	[
+		"local-external",
+		lifecycleFailure("local-external", "registration-expired", "registration_expired") as LifecycleFailureResult,
+	],
+	["remote", lifecycleFailure("remote", "registration-expired", "registration_expired") as LifecycleFailureResult],
+];
+
+function lifecycleStateSignalHarness() {
+	let failure: LifecycleFailureResult["state"] | undefined;
+	const listeners = new Set<(state: LifecycleState) => void>();
+	return {
+		signal: {
+			failure: () => failure,
+			subscribe(listener: (state: LifecycleState) => void) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		},
+		emit(state: LifecycleState) {
+			for (const listener of listeners) listener(state);
+		},
+		emitFailure(result: LifecycleFailureResult) {
+			if (!LIFECYCLE_FAILURE_STATES.includes(result.state.name))
+				throw new Error("expected canonical lifecycle failure");
+			failure = result.state;
+			for (const listener of listeners) listener(result.state);
+		},
+	};
 }
 const PERMISSION_REQUEST = {
 	requestId: "permission-1",
@@ -667,6 +708,127 @@ describe("BreadBoard runtime preparation ownership", () => {
 		expect(prepared.model).toBe(BREADBOARD_MODEL);
 		expect(bridgeModel).toBe(BREADBOARD_MODEL);
 		expect(bridgeRequestPermission).toBe(TEST_RUNTIME_AUTHORITY.requestPermission);
+		expect(closeBridge).toHaveBeenCalledTimes(1);
+		expect(closeSupervisor).toHaveBeenCalledTimes(1);
+	});
+
+	test.each(RENEWAL_LOSS_FAILURES)(
+		"fails %s preparation when renewal authority is lost before bridge construction",
+		async (_mode, result) => {
+			const lifecycle = lifecycleStateSignalHarness();
+			const snapshotStarted = Promise.withResolvers<void>();
+			const releaseSnapshot = Promise.withResolvers<void>();
+			const closeSession = mock(async () => {});
+			const closeSupervisor = mock(async () => {});
+			const createBridge = mock(() => {
+				throw new Error("bridge must not be created after lifecycle authority loss");
+			});
+			const onLifecycleFailure = mock(() => {});
+
+			const preparation = prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
+				closeSupervisor,
+				openSession: async () =>
+					({
+						sessionId: "renewal-loss-before-bridge",
+						snapshot: async () => {
+							snapshotStarted.resolve();
+							await releaseSnapshot.promise;
+							return { headSequence: 0, model: BREADBOARD_MODEL_SELECTOR };
+						},
+						close: closeSession,
+					}) as never,
+				createBridge,
+				emitAgentEvent: () => {},
+				lifecycleStateSignal: lifecycle.signal,
+				onLifecycleFailure,
+			});
+			await snapshotStarted.promise;
+			lifecycle.emitFailure(result);
+			releaseSnapshot.resolve();
+
+			await expect(preparation).rejects.toMatchObject({
+				name: "BreadboardLifecycleStartupError",
+				result: { kind: "failure", state: { name: result.state.name, reason: result.state.reason } },
+			});
+			expect(createBridge).not.toHaveBeenCalled();
+			expect(onLifecycleFailure).toHaveBeenCalledTimes(1);
+			expect(closeSession).toHaveBeenCalledTimes(1);
+			expect(closeSupervisor).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	test.each(RENEWAL_LOSS_FAILURES)(
+		"invalidates the %s runtime when renewal authority is lost after ready",
+		async (_mode, result) => {
+			const lifecycle = lifecycleStateSignalHarness();
+			const cleanupFinished = Promise.withResolvers<void>();
+			const closeSupervisor = mock(async () => {
+				cleanupFinished.resolve();
+			});
+			const closeBridge = mock(async () => {});
+			const cancelCleanup = mock(() => {});
+			const onLifecycleFailure = mock(() => {});
+			const prepared = await prepareConnectedBreadboardRuntime({
+				...TEST_RUNTIME_AUTHORITY,
+				closeSupervisor,
+				openSession: async () =>
+					({
+						sessionId: "renewal-loss-after-ready",
+						snapshot: async () => ({ headSequence: 0, model: BREADBOARD_MODEL_SELECTOR }),
+					}) as never,
+				createBridge: () => ({
+					stream: () => new AssistantMessageEventStream(),
+					close: closeBridge,
+				}),
+				registerCleanup: () => cancelCleanup,
+				emitAgentEvent: () => {},
+				lifecycleStateSignal: lifecycle.signal,
+				onLifecycleFailure,
+			});
+
+			lifecycle.emitFailure(result);
+			await cleanupFinished.promise;
+			await prepared.close();
+
+			expect(onLifecycleFailure).toHaveBeenCalledTimes(1);
+			expect(cancelCleanup).toHaveBeenCalledTimes(1);
+			expect(closeBridge).toHaveBeenCalledTimes(1);
+			expect(closeSupervisor).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	test("normal lifecycle transitions do not invalidate the runtime before normal shutdown", async () => {
+		const lifecycle = lifecycleStateSignalHarness();
+		const closeSupervisor = mock(async () => {});
+		const closeBridge = mock(async () => {});
+		const onLifecycleFailure = mock(() => {});
+		const prepared = await prepareConnectedBreadboardRuntime({
+			...TEST_RUNTIME_AUTHORITY,
+			closeSupervisor,
+			openSession: async () =>
+				({
+					sessionId: "normal-shutdown",
+					snapshot: async () => ({ headSequence: 0, model: BREADBOARD_MODEL_SELECTOR }),
+				}) as never,
+			createBridge: () => ({
+				stream: () => new AssistantMessageEventStream(),
+				close: closeBridge,
+			}),
+			registerCleanup: () => () => {},
+			emitAgentEvent: () => {},
+			lifecycleStateSignal: lifecycle.signal,
+			onLifecycleFailure,
+		});
+
+		for (const name of ["connecting", "ready", "stopping", "detached"] as const) {
+			lifecycle.emit({ name, mode: "local-owned", attempt: 0 });
+		}
+		expect(closeBridge).not.toHaveBeenCalled();
+		expect(closeSupervisor).not.toHaveBeenCalled();
+		expect(onLifecycleFailure).not.toHaveBeenCalled();
+
+		await prepared.close();
 		expect(closeBridge).toHaveBeenCalledTimes(1);
 		expect(closeSupervisor).toHaveBeenCalledTimes(1);
 	});

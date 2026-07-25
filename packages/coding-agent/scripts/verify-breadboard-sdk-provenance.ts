@@ -332,7 +332,7 @@ async function inspectPinnedBackendGit(
 		"backend Git identity is malformed",
 	);
 	invariant((await realpath(inspectedRoot)) === (await realpath(root)), "backend Git root does not match");
-	const treeBytes = await runGit(executable, root, ["ls-tree", "-rz", "--full-tree", "-r", "HEAD"]);
+	const treeBytes = await runGit(executable, root, ["ls-tree", "-rz", "--full-tree", "-r", tree]);
 	const entries = parseHeadTree(treeBytes);
 	const objectIds = [...new Set(entries.map(entry => entry.objectId))];
 	const objectInput = new TextEncoder().encode(`${objectIds.join("\n")}\n`);
@@ -417,6 +417,18 @@ async function inspectPinnedBackendGit(
 	} finally {
 		await classificationSnapshot.close();
 	}
+	const finalIdentityOutput = new TextDecoder("utf-8", { fatal: true }).decode(
+		await runGit(executable, root, ["rev-parse", "--show-toplevel", "HEAD^{commit}", "HEAD^{tree}"]),
+	);
+	const [finalRoot, finalCommit, finalTree, ...finalExtra] = finalIdentityOutput.trim().split("\n");
+	invariant(
+		finalExtra.length === 0 && finalRoot !== undefined && finalCommit !== undefined && finalTree !== undefined,
+		"backend Git identity is malformed",
+	);
+	invariant(
+		(await realpath(finalRoot)) === (await realpath(root)) && finalCommit === commit && finalTree === tree,
+		"backend Git identity changed",
+	);
 	return {
 		identity: { root: inspectedRoot, commit, tree, status: "" },
 		verified,

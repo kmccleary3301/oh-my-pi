@@ -37,6 +37,7 @@ import {
 	type E4PermissionHandler,
 } from "./breadboard/e4-agent-stream";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
+import { LIFECYCLE_FAILURE_STATES, type LifecycleState } from "./breadboard/lifecycle/lifecycle-state";
 import { type LifecycleDispatchResult, LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
 import {
@@ -1097,6 +1098,13 @@ export class BreadboardLifecycleStartupError extends Error {
 	}
 }
 
+export type BreadboardLifecycleFailureResult = Extract<LifecycleDispatchResult, { readonly kind: "failure" }>;
+type BreadboardLifecycleFailureState = BreadboardLifecycleFailureResult["state"];
+
+function isBreadboardLifecycleFailureState(state: LifecycleState): state is BreadboardLifecycleFailureState {
+	return (LIFECYCLE_FAILURE_STATES as readonly LifecycleState["name"][]).includes(state.name);
+}
+
 function resolveEffectiveBreadboardRunConfig(
 	parsed: Pick<Args, "engineMode" | "engineUrl">,
 	activeSettings: Settings,
@@ -1213,12 +1221,46 @@ export interface BreadboardRuntimeAuthority {
 	readonly requestPermission: E4PermissionHandler;
 }
 
+export interface BreadboardLifecycleStateSignal {
+	failure(): BreadboardLifecycleFailureState | undefined;
+	subscribe(listener: (state: LifecycleState) => void): () => void;
+}
+
+function createBreadboardLifecycleStateMonitor(): {
+	readonly signal: BreadboardLifecycleStateSignal;
+	readonly stateChanged: (state: LifecycleState) => void;
+} {
+	let failure: BreadboardLifecycleFailureState | undefined;
+	const listeners = new Set<(state: LifecycleState) => void>();
+	return {
+		signal: {
+			failure: () => failure,
+			subscribe: listener => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		},
+		stateChanged: state => {
+			if (failure === undefined && isBreadboardLifecycleFailureState(state)) failure = state;
+			for (const listener of listeners) {
+				try {
+					listener(state);
+				} catch (error) {
+					logger.warn("BreadBoard lifecycle state listener failed", { error: String(error) });
+				}
+			}
+		},
+	};
+}
+
 export interface ConnectedBreadboardRuntimeOptions extends BreadboardRuntimeAuthority {
 	readonly closeSupervisor: () => Promise<void>;
 	readonly openSession: () => Promise<OpenedSessionRuntime>;
 	readonly emitAgentEvent: (event: AgentEvent) => void;
 	readonly createBridge?: (options: E4AgentStreamBridgeOptions) => BreadboardRuntimeBridge;
 	readonly registerCleanup?: (close: () => Promise<void>) => () => void;
+	readonly lifecycleStateSignal?: BreadboardLifecycleStateSignal;
+	readonly onLifecycleFailure?: (result: BreadboardLifecycleFailureResult) => void;
 }
 
 export type BreadboardModelAuthorityErrorCode =
@@ -1320,25 +1362,86 @@ export async function prepareConnectedBreadboardRuntime(
 ): Promise<PreparedBreadboardRuntime> {
 	let opened: OpenedSessionRuntime | undefined;
 	let bridge: BreadboardRuntimeBridge | undefined;
-	let supervisorClosed = false;
-	const closeSupervisor = async (): Promise<void> => {
-		if (supervisorClosed) return;
-		supervisorClosed = true;
-		await options.closeSupervisor();
+	let cancelCleanup: (() => void) | undefined;
+	let unsubscribeLifecycleState: (() => void) | undefined;
+	let openedClosePromise: Promise<void> | undefined;
+	let bridgeClosePromise: Promise<void> | undefined;
+	let supervisorClosePromise: Promise<void> | undefined;
+	let preparedClosePromise: Promise<void> | undefined;
+	let lifecycleFailure: BreadboardLifecycleFailureResult | undefined;
+
+	const closeSupervisor = (): Promise<void> => {
+		supervisorClosePromise ??= options.closeSupervisor();
+		return supervisorClosePromise;
 	};
-	const cleanupBeforeTransfer = async (): Promise<void> => {
+	const closeOpened = (): Promise<void> => {
+		if (!opened) return Promise.resolve();
+		openedClosePromise ??= (async () => {
+			await opened!.close();
+		})();
+		return openedClosePromise;
+	};
+	const closeBridge = (): Promise<void> => {
+		if (!bridge) return Promise.resolve();
+		bridgeClosePromise ??= (async () => {
+			await bridge!.close();
+		})();
+		return bridgeClosePromise;
+	};
+	const releaseRegistrations = (): void => {
+		const unsubscribe = unsubscribeLifecycleState;
+		unsubscribeLifecycleState = undefined;
+		unsubscribe?.();
+		const cancel = cancelCleanup;
+		cancelCleanup = undefined;
+		cancel?.();
+	};
+	const cleanupAvailableResources = async (): Promise<void> => {
 		try {
-			if (bridge) await bridge.close();
-			else await opened?.close();
+			releaseRegistrations();
 		} finally {
-			await closeSupervisor();
+			try {
+				if (bridge) await closeBridge();
+				else await closeOpened();
+			} finally {
+				await closeSupervisor();
+			}
 		}
+	};
+	const closePreparedRuntime = (): Promise<void> => {
+		preparedClosePromise ??= cleanupAvailableResources();
+		return preparedClosePromise;
+	};
+	const handleLifecycleState = (state: LifecycleState): void => {
+		if (lifecycleFailure || !isBreadboardLifecycleFailureState(state)) return;
+		lifecycleFailure = { kind: "failure", state };
+		const cleanup = bridge ? closePreparedRuntime() : cleanupAvailableResources();
+		void cleanup.catch(error => {
+			logger.warn("BreadBoard runtime invalidation cleanup failed", { error: String(error) });
+		});
+		try {
+			options.onLifecycleFailure?.(lifecycleFailure);
+		} catch (error) {
+			logger.warn("BreadBoard lifecycle failure presentation failed", { error: String(error) });
+		}
+	};
+	const throwIfLifecycleFailed = (): void => {
+		if (lifecycleFailure) throw new BreadboardLifecycleStartupError(lifecycleFailure);
 	};
 
 	try {
+		if (options.lifecycleStateSignal) {
+			unsubscribeLifecycleState = options.lifecycleStateSignal.subscribe(handleLifecycleState);
+			const failure = options.lifecycleStateSignal.failure();
+			if (failure) handleLifecycleState(failure);
+		}
+		throwIfLifecycleFailed();
 		opened = await options.openSession();
+		throwIfLifecycleFailed();
 		const snapshot = await opened.snapshot();
+		throwIfLifecycleFailed();
 		const model = resolveBreadboardBackendModel(snapshot.model, options.modelRegistry);
+		throwIfLifecycleFailed();
 		bridge = (options.createBridge ?? (bridgeOptions => new E4AgentStreamBridge(bridgeOptions)))({
 			session: opened,
 			replayHeadSequence: snapshot.headSequence,
@@ -1346,32 +1449,19 @@ export async function prepareConnectedBreadboardRuntime(
 			modelPolicy: { kind: "fixed", model },
 			requestPermission: options.requestPermission,
 		});
-		let closed = false;
-		let cancelCleanup: (() => void) | undefined;
-		const close = async (): Promise<void> => {
-			if (closed) return;
-			closed = true;
-			try {
-				cancelCleanup?.();
-			} finally {
-				try {
-					await bridge!.close();
-				} finally {
-					await closeSupervisor();
-				}
-			}
-		};
+		throwIfLifecycleFailed();
 		cancelCleanup = (options.registerCleanup ?? (cleanup => postmortem.register("breadboard-runtime", cleanup)))(
-			close,
+			closePreparedRuntime,
 		);
-		return { stream: bridge.stream, sessionId: String(opened.sessionId), model, close };
+		throwIfLifecycleFailed();
+		return { stream: bridge.stream, sessionId: String(opened.sessionId), model, close: closePreparedRuntime };
 	} catch (error) {
 		try {
-			await cleanupBeforeTransfer();
+			await cleanupAvailableResources();
 		} catch (cleanupError) {
 			logger.warn("BreadBoard runtime cleanup failed", { error: String(cleanupError) });
 		}
-		throw error;
+		throw lifecycleFailure ? new BreadboardLifecycleStartupError(lifecycleFailure) : error;
 	}
 }
 
@@ -1390,11 +1480,16 @@ export async function prepareBreadboardRuntime(
 		config.mode === "local-owned"
 			? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
 			: undefined;
-	const supervisor = new LifecycleSupervisor(config, { ...(store === undefined ? {} : { store }) });
+	const lifecycleState = createBreadboardLifecycleStateMonitor();
+	const supervisor = new LifecycleSupervisor(config, {
+		...(store === undefined ? {} : { store }),
+		stateChanged: lifecycleState.stateChanged,
+	});
 	const connected = await supervisor.connect();
 	const closeSupervisor = async (): Promise<void> => {
 		const outcome = await supervisor.close({ consumerClosed: true });
-		if (outcome.kind === "failure") process.exitCode = writeLifecyclePresentation(outcome).exitCode || 1;
+		if (outcome.kind === "failure" && lifecycleState.signal.failure() === undefined)
+			process.exitCode = writeLifecyclePresentation(outcome).exitCode || 1;
 	};
 	if (connected.kind !== "ready") {
 		process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
@@ -1415,6 +1510,11 @@ export async function prepareBreadboardRuntime(
 		emitAgentEvent,
 		modelRegistry: authority.modelRegistry,
 		requestPermission: authority.requestPermission,
+		lifecycleStateSignal: lifecycleState.signal,
+		onLifecycleFailure: failure => {
+			process.exitCode = 1;
+			process.exitCode = writeLifecyclePresentation(failure).exitCode || 1;
+		},
 	});
 }
 

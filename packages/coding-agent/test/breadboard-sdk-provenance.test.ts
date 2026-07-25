@@ -7,6 +7,7 @@ import {
 	type BackendGitInspection,
 	type BreadboardSdkProvenance,
 	openVerifiedBackendSnapshot,
+	type VerifiedBackendSnapshot,
 	verifyBackendIdentity,
 	verifyBreadboardSdkProvenance,
 	verifyPinnedReferences,
@@ -680,6 +681,86 @@ exit 1
 			await rm(parent, { recursive: true, force: true });
 		}
 	});
+	test.each([
+		["different tree", true, "backend worktree is dirty"],
+		["captured tree", false, "backend Git identity changed"],
+	] as const)(
+		"rejects HEAD advancing between identity capture and tree enumeration: %s",
+		async (_scenario, mutateTree, expectedRejection) => {
+			const root = await mkdtemp(resolve(tmpdir(), "breadboard-head-race-"));
+			const originalSpawn = Bun.spawn;
+			const git = (...args: string[]) => {
+				const result = Bun.spawnSync(["/usr/bin/git", "-C", root, ...args], {
+					env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+				return new TextDecoder().decode(result.stdout).trim();
+			};
+			let snapshot: VerifiedBackendSnapshot | undefined;
+			try {
+				git("init", "-q");
+				git("config", "user.name", "BreadBoard Test");
+				git("config", "user.email", "breadboard-test@example.invalid");
+				await writeFile(resolve(root, "tracked.txt"), "captured bytes\n");
+				git("add", "tracked.txt");
+				git("commit", "-qm", "captured");
+				const [capturedCommit, capturedTree] = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").split("\n") as [
+					string,
+					string,
+				];
+				if (mutateTree) {
+					await writeFile(resolve(root, "tracked.txt"), "advanced bytes\n");
+					git("commit", "-qam", "advanced");
+				} else {
+					git("commit", "--allow-empty", "-qm", "advanced");
+				}
+				const advancedCommit = git("rev-parse", "HEAD^{commit}");
+				const headRefPath = resolve(root, ".git", git("symbolic-ref", "HEAD"));
+				await writeFile(headRefPath, `${capturedCommit}\n`);
+
+				let advanced = false;
+				Bun.spawn = ((...args: unknown[]) => {
+					const child = Reflect.apply(originalSpawn, Bun, args);
+					const command = args[0];
+					if (
+						!advanced &&
+						Array.isArray(command) &&
+						command.includes("rev-parse") &&
+						command.includes("HEAD^{commit}") &&
+						command.includes("HEAD^{tree}")
+					) {
+						const exited = child.exited.then(async (exitCode: number) => {
+							advanced = true;
+							await writeFile(headRefPath, `${advancedCommit}\n`);
+							return exitCode;
+						});
+						Object.defineProperty(child, "exited", { value: exited });
+					}
+					return child;
+				}) as typeof Bun.spawn;
+
+				let rejection: unknown;
+				try {
+					snapshot = await openVerifiedBackendSnapshot(
+						{ backendCommit: capturedCommit, backendTree: capturedTree },
+						root,
+					);
+				} catch (error) {
+					rejection = error;
+				}
+				expect(advanced).toBe(true);
+				expect(snapshot).toBeUndefined();
+				expect(String(rejection)).toContain(expectedRejection);
+			} finally {
+				Bun.spawn = originalSpawn;
+				await snapshot?.close();
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	test("execution snapshot contains only tracked HEAD bytes and survives original mutation and replacement", async () => {
 		const parent = await mkdtemp(resolve(tmpdir(), "breadboard-execution-snapshot-"));
 		const root = resolve(parent, "backend");

@@ -14,7 +14,7 @@ import type {
 } from "@breadboard/sdk";
 import { LifecycleE4ClientError } from "@breadboard/sdk";
 import { presentLifecycle, writeLifecyclePresentation } from "./lifecycle-presenter";
-import { lifecycleFailure } from "./lifecycle-state";
+import { type LifecycleState, lifecycleFailure } from "./lifecycle-state";
 import * as lifecycleModule from "./lifecycle-supervisor";
 import {
 	dispatchLifecycleAction,
@@ -367,6 +367,66 @@ describe("LifecycleSupervisor mode authority", () => {
 		expect({ handshakes, calls }).toEqual({ handshakes: 1, calls: callsAfterReady });
 		expect((await supervisor.close({ consumerClosed: true })).kind).toBe("detached");
 	});
+
+	test.each(["local-external", "remote"] as const)(
+		"reports %s client-registration renewal loss after ready",
+		async mode => {
+			const originalSetInterval = globalThis.setInterval;
+			const originalClearInterval = globalThis.clearInterval;
+			let runRenewal: (() => void) | undefined;
+			let renewalActive = false;
+			try {
+				globalThis.setInterval = ((handler: Parameters<typeof setInterval>[0]) => {
+					renewalActive = true;
+					runRenewal = () => {
+						if (typeof handler === "function") handler();
+					};
+					return { unref: () => undefined } as unknown as NodeJS.Timeout;
+				}) as typeof setInterval;
+				globalThis.clearInterval = (() => {
+					renewalActive = false;
+				}) as typeof clearInterval;
+				const binding = bindingFor(321, "external_launch_abcdefghijklmnopqrstuvwxyz", {
+					endpoint: mode === "remote" ? "https://engine.example" : "http://127.0.0.1:7777",
+					launch: { launchId: "external_launch_abcdefghijklmnopqrstuvwxyz", source: "external_unmanaged" },
+				});
+				const base = boundClient(binding, []);
+				const renewalFailure = Promise.withResolvers<LifecycleState>();
+				const supervisor = new LifecycleSupervisor(resolved(mode), {
+					createClient: () => ({
+						handshake: async () => ({
+							...base,
+							renewClient: async () => {
+								throw new LifecycleE4ClientError({
+									kind: "registration-expired",
+									status: 410,
+									code: "registration_expired",
+									correlation: {},
+									body: "[redacted]",
+								});
+							},
+						}),
+					}),
+					stateChanged: state => {
+						if (state.name === "registration-expired") renewalFailure.resolve(state);
+					},
+				});
+
+				expect((await supervisor.connect()).kind).toBe("ready");
+				expect(renewalActive).toBe(true);
+				if (!runRenewal) throw new Error("lease renewal interval was not installed");
+				runRenewal();
+				await expect(renewalFailure.promise).resolves.toMatchObject({
+					name: "registration-expired",
+					reason: "registration_expired",
+				});
+				expect(renewalActive).toBe(false);
+			} finally {
+				globalThis.setInterval = originalSetInterval;
+				globalThis.clearInterval = originalClearInterval;
+			}
+		},
+	);
 
 	test("remote keychain and mTLS security bind to the endpoint-scoped client", async () => {
 		for (const auth of [
@@ -3100,6 +3160,63 @@ describe("LifecycleSupervisor local-owned authority", () => {
 		});
 	});
 
+	test("reports local-owned owner-lease renewal loss after ready", async () => {
+		const originalSetInterval = globalThis.setInterval;
+		const originalClearInterval = globalThis.clearInterval;
+		let runRenewal: (() => void) | undefined;
+		let renewalActive = false;
+		try {
+			globalThis.setInterval = ((handler: Parameters<typeof setInterval>[0]) => {
+				renewalActive = true;
+				runRenewal = () => {
+					if (typeof handler === "function") handler();
+				};
+				return { unref: () => undefined } as unknown as NodeJS.Timeout;
+			}) as typeof setInterval;
+			globalThis.clearInterval = (() => {
+				renewalActive = false;
+			}) as typeof clearInterval;
+			const process = processHarness();
+			const store = await temporaryStore();
+			const renewalFailure = Promise.withResolvers<LifecycleState>();
+			const supervisor = new LifecycleSupervisor(resolved("local-owned"), {
+				store,
+				process: process.adapter,
+				createClient: () => ({
+					handshake: async () => {
+						const current = process.current();
+						return {
+							...boundClient(bindingFor(current.pid, current.launchId), []),
+							renewOwner: async () => {
+								throw new LifecycleE4ClientError({
+									kind: "owner-expired",
+									status: 410,
+									code: "owner_expired",
+									correlation: {},
+									body: "[redacted]",
+								});
+							},
+						};
+					},
+				}),
+				stateChanged: state => {
+					if (state.name === "owner-lease-expired") renewalFailure.resolve(state);
+				},
+			});
+			expect((await supervisor.connect()).kind).toBe("ready");
+			expect(renewalActive).toBe(true);
+			if (!runRenewal) throw new Error("lease renewal interval was not installed");
+			runRenewal();
+			await expect(renewalFailure.promise).resolves.toMatchObject({
+				name: "owner-lease-expired",
+				reason: "owner_lease_expired",
+			});
+			expect(renewalActive).toBe(false);
+		} finally {
+			globalThis.setInterval = originalSetInterval;
+			globalThis.clearInterval = originalClearInterval;
+		}
+	});
 	test("detached close failure cancels lease renewal before detach and never renews afterward", async () => {
 		const originalSetInterval = globalThis.setInterval;
 		const originalClearInterval = globalThis.clearInterval;
