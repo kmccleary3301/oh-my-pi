@@ -42,15 +42,13 @@ export type E4PermissionHandler = (request: E4PermissionRequest, signal: AbortSi
 
 interface TurnSink {
 	readonly model: E4BackendModelAttribution;
-	readonly stream: AssistantMessageEventStream;
+	readonly stream: AssistantMessageEventStream | undefined;
+	readonly adopted: boolean;
 	readonly permissionAbort: AbortController;
 	readonly toolCallsByCallId: Map<string, Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>>;
-	readonly pendingToolResultsByCallId: Map<
-		string,
-		Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>
-	>;
 	readonly projectedToolCallIds: Set<string>;
 	readonly projectedToolResultIds: Set<string>;
+	readonly pendingProjectionKeys: string[];
 	turnId: TurnId | undefined;
 	cancelRequested: boolean;
 	text: string;
@@ -58,6 +56,7 @@ interface TurnSink {
 	started: boolean;
 	textStarted: boolean;
 	terminal: boolean;
+	pendingTextCompletion: Extract<LoggedSessionEvent, { readonly kind: "assistant_text_completed" }> | undefined;
 }
 
 interface PendingSubmit {
@@ -65,10 +64,33 @@ interface PendingSubmit {
 	readonly input: StructuredSubmit;
 }
 
+export interface E4DurableCursor {
+	readonly eventId: string;
+	readonly sequence: number;
+}
+
+export const E4_PROJECTION_RECEIPT_PREFIX = "breadboard:e4:";
+
+export function breadboardProjectionEventId(message: unknown): string | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	if ("responseId" in message && typeof message.responseId === "string") {
+		if (message.responseId.startsWith(E4_PROJECTION_RECEIPT_PREFIX)) {
+			return message.responseId.slice(E4_PROJECTION_RECEIPT_PREFIX.length) || undefined;
+		}
+	}
+	if (!("details" in message) || !message.details || typeof message.details !== "object") return undefined;
+	if (!("breadboardProjectionEventId" in message.details)) return undefined;
+	const eventId = message.details.breadboardProjectionEventId;
+	return typeof eventId === "string" && eventId ? eventId : undefined;
+}
+
 export interface E4AgentStreamBridgeOptions {
 	readonly session: OpenedSession;
-	readonly replayHeadSequence: number;
-	readonly emitAgentEvent: (event: AgentEvent) => void;
+	readonly durableCursor?: E4DurableCursor;
+	readonly projectionReceiptEventIds?: ReadonlySet<string>;
+	readonly emitAgentEvent: (event: AgentEvent, idempotencyKey: string) => Promise<void>;
+	readonly releaseAgentEvent: (idempotencyKey: string) => void;
+	readonly projectionCommitted: (cursor: E4DurableCursor) => Promise<void>;
 	readonly modelPolicy?: E4BackendModelPolicy;
 	readonly requestPermission?: E4PermissionHandler;
 }
@@ -84,76 +106,97 @@ export interface E4AgentStreamBridgeOptions {
  */
 export class E4AgentStreamBridge {
 	readonly stream: StreamFn;
-
 	readonly #session: OpenedSession;
-	readonly #emitAgentEvent: (event: AgentEvent) => void;
+	readonly #emitAgentEvent: E4AgentStreamBridgeOptions["emitAgentEvent"];
+	readonly #releaseAgentEvent: E4AgentStreamBridgeOptions["releaseAgentEvent"];
+	readonly #projectionCommitted: E4AgentStreamBridgeOptions["projectionCommitted"];
+	readonly #receipts: ReadonlySet<string>;
 	readonly #modelPolicy: E4BackendModelPolicy | undefined;
 	readonly #requestPermission: E4PermissionHandler | undefined;
+	readonly #initialCursor: E4DurableCursor | undefined;
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
 	readonly #submittingSinks = new Set<TurnSink>();
-	readonly #pendingEvents = new Map<string, LoggedSessionEvent[]>();
 	readonly #submittedTurnIds = new Set<string>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
+	readonly #undurableSinks = new Set<TurnSink>();
+	readonly #deferredProjectionKeys: string[] = [];
 	readonly #cancellationsInFlight = new Set<Promise<void>>();
-	#highestObservedSequence: number;
-	readonly #outOfOrderSequences = new Set<number>();
+	#started = false;
 	#closed = false;
 	#observeFailure: Error | undefined;
 	#pendingSubmit: PendingSubmit | undefined;
+	#terminalCursor: E4DurableCursor | undefined;
 	#closePromise: Promise<void> | undefined;
 
 	constructor(options: E4AgentStreamBridgeOptions) {
 		this.#session = options.session;
-		this.#highestObservedSequence = options.replayHeadSequence;
 		this.#emitAgentEvent = options.emitAgentEvent;
+		this.#releaseAgentEvent = options.releaseAgentEvent;
+		this.#projectionCommitted = options.projectionCommitted;
+		this.#receipts = options.projectionReceiptEventIds ?? new Set();
 		this.#modelPolicy = options.modelPolicy;
 		this.#requestPermission = options.requestPermission;
+		this.#initialCursor = options.durableCursor;
 		this.stream = (model, context, streamOptions) => {
 			const stream = new AssistantMessageEventStream();
+			if (!this.#started) {
+				this.#pushStandaloneError(stream, model, "BreadBoard E4 bridge is not started", "error");
+				return stream;
+			}
 			let admission!: Promise<void>;
-			admission = this.#startTurn(model, context, stream, streamOptions?.signal).then(
-				() => {
-					this.#submissionsInFlight.delete(admission);
-				},
-				() => {
-					this.#submissionsInFlight.delete(admission);
-				},
-			);
+			admission = this.#startTurn(model, context, stream, streamOptions?.signal).finally(() => {
+				this.#submissionsInFlight.delete(admission);
+			});
 			this.#submissionsInFlight.add(admission);
 			return stream;
 		};
+	}
+
+	start(): void {
+		if (this.#started || this.#closed) return;
+		this.#started = true;
 		void this.#observe();
 	}
 
 	close(): Promise<void> {
-		if (!this.#closePromise) this.#closePromise = this.#performClose();
+		this.#closePromise ??= this.#performClose();
 		return this.#closePromise;
 	}
 
 	async #performClose(): Promise<void> {
 		this.#closed = true;
 		this.#observeAbort.abort();
-
-		const admittedSinks = [...this.#sinks.values()];
-		for (const sink of admittedSinks) {
+		for (const sink of [...this.#sinks.values(), ...this.#submittingSinks]) {
 			this.#failSink(sink, "BreadBoard session closed", "aborted");
-		}
-		for (const sink of this.#submittingSinks) {
-			this.#failSink(sink, "BreadBoard session closed", "aborted");
-		}
-		for (const sink of admittedSinks) {
 			this.#cancelSink(sink, "user_requested");
 		}
-
 		await Promise.all([...this.#submissionsInFlight]);
 		await Promise.all([...this.#cancellationsInFlight]);
-
-		this.#submittingSinks.clear();
 		this.#sinks.clear();
-		this.#pendingEvents.clear();
-		this.#outOfOrderSequences.clear();
+		this.#submittingSinks.clear();
 		await this.#session.close();
+	}
+
+	#newSink(model: E4BackendModelAttribution, stream?: AssistantMessageEventStream): TurnSink {
+		return {
+			model,
+			stream,
+			adopted: !stream,
+			permissionAbort: new AbortController(),
+			toolCallsByCallId: new Map(),
+			projectedToolCallIds: new Set(),
+			projectedToolResultIds: new Set(),
+			pendingProjectionKeys: [],
+			turnId: undefined,
+			cancelRequested: false,
+			text: "",
+			messageText: "",
+			started: false,
+			textStarted: false,
+			terminal: false,
+			pendingTextCompletion: undefined,
+		};
 	}
 
 	async #startTurn(
@@ -162,16 +205,36 @@ export class E4AgentStreamBridge {
 		stream: AssistantMessageEventStream,
 		signal: AbortSignal | undefined,
 	): Promise<void> {
-		if (this.#closed) {
-			this.#pushStandaloneError(stream, model, "BreadBoard session is closed", "error");
+		if (this.#closed || this.#observeFailure) {
+			this.#pushStandaloneError(
+				stream,
+				model,
+				this.#observeFailure?.message ?? "BreadBoard session is closed",
+				"error",
+			);
 			return;
 		}
-		const initialObserveFailure = this.#observeFailure;
-		if (initialObserveFailure) {
-			this.#pushStandaloneError(stream, model, initialObserveFailure.message, "error");
-			return;
+		if (this.#terminalCursor) {
+			if (this.#undurableSinks.size > 0) {
+				this.#pushStandaloneError(
+					stream,
+					model,
+					"BreadBoard cannot admit a turn while replay projection is incomplete",
+					"error",
+				);
+				return;
+			}
+			try {
+				await this.#projectionCommitted(this.#terminalCursor);
+				for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
+				this.#terminalCursor = undefined;
+			} catch (error) {
+				const message = `BreadBoard projection cursor commit failed: ${safeErrorMessage(error)}`;
+				this.#invalidateBridge(message);
+				this.#pushStandaloneError(stream, model, message, "error");
+				return;
+			}
 		}
-
 		const backendModel = this.#modelPolicy?.model;
 		if (!backendModel) {
 			this.#pushStandaloneError(stream, model, "BreadBoard backend model attribution is not configured", "error");
@@ -186,126 +249,52 @@ export class E4AgentStreamBridge {
 			);
 			return;
 		}
-
-		const sink: TurnSink = {
-			model: backendModel,
-			stream,
-			permissionAbort: new AbortController(),
-			toolCallsByCallId: new Map(),
-			pendingToolResultsByCallId: new Map(),
-			projectedToolCallIds: new Set(),
-			projectedToolResultIds: new Set(),
-			turnId: undefined,
-			cancelRequested: false,
-			text: "",
-			messageText: "",
-			started: false,
-			textStarted: false,
-			terminal: false,
-		};
+		const sink = this.#newSink(backendModel, stream);
 		this.#submittingSinks.add(sink);
 		let attempt: PendingSubmit | undefined;
 		try {
-			const logicalInput = submitInputFromContext(context);
-			const canonicalDigest = await canonicalSubmitDigest(logicalInput);
-			const pending = this.#pendingSubmit;
-			if (pending && pending.canonicalDigest !== canonicalDigest) {
-				this.#submittingSinks.delete(sink);
-				this.#failSink(sink, "BreadBoard previous submission is unresolved; retry the unchanged input", "error");
-				return;
+			const input = submitInputFromContext(context);
+			const canonicalDigest = await canonicalSubmitDigest(input);
+			if (this.#pendingSubmit && this.#pendingSubmit.canonicalDigest !== canonicalDigest) {
+				throw new Error("BreadBoard previous submission is unresolved; retry the unchanged input");
 			}
-			attempt = pending ?? {
+			attempt = this.#pendingSubmit ?? {
 				canonicalDigest,
-				input: {
-					...logicalInput,
-					clientMessageId: crypto.randomUUID(),
-				},
+				input: { ...input, clientMessageId: crypto.randomUUID() },
 			};
-			const submission = this.#session.submit(attempt.input).then(receipt => {
-				if (!this.#closed && !this.#observeFailure) this.#submittedTurnIds.add(String(receipt.turnId));
-				return receipt;
-			});
-			const receipt = await submission;
+			const receipt = await this.#session.submit(attempt.input);
 			if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
-			this.#submittingSinks.delete(sink);
 			sink.turnId = receipt.turnId;
-			const turnKey = String(receipt.turnId);
-			if (this.#observeFailure) {
-				this.#submittedTurnIds.delete(turnKey);
-				this.#pendingEvents.delete(turnKey);
-				this.#failSink(sink, this.#observeFailure.message, "error");
-				this.#cancelSink(sink, "timeout");
+			const failure = this.#currentObserveFailure();
+			if (failure || this.#closed) {
+				this.#failSink(sink, failure ? failure.message : "BreadBoard session is closed", "error");
+				this.#cancelSink(sink, failure ? "timeout" : "user_requested");
 				return;
 			}
-			if (this.#closed) {
-				this.#failSink(sink, "BreadBoard session is closed", "error");
-				this.#cancelSink(sink, "user_requested");
-				return;
-			}
-			this.#sinks.set(turnKey, sink);
-			for (const event of this.#pendingEvents.get(turnKey) ?? []) {
-				this.#applyEvent(sink, event);
-			}
-			this.#pendingEvents.delete(turnKey);
-
+			this.#submittedTurnIds.add(String(receipt.turnId));
+			this.#sinks.set(String(receipt.turnId), sink);
 			const cancel = () => {
 				sink.permissionAbort.abort();
 				this.#cancelSink(sink, "user_requested");
 			};
-			if (signal?.aborted) {
-				cancel();
-				return;
-			}
-			signal?.addEventListener("abort", cancel, { once: true });
+			if (signal?.aborted) cancel();
+			else signal?.addEventListener("abort", cancel, { once: true });
 		} catch (error) {
-			this.#submittingSinks.delete(sink);
-			if (attempt) {
-				if (isAmbiguousSubmitFailure(error)) this.#pendingSubmit ??= attempt;
-				else if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
-			}
+			if (attempt && isAmbiguousSubmitFailure(error)) this.#pendingSubmit ??= attempt;
 			this.#failSink(sink, safeErrorMessage(error), "error");
+		} finally {
+			this.#submittingSinks.delete(sink);
 		}
-	}
-
-	async #cancel(turnId: TurnId, reason: "user_requested" | "timeout"): Promise<void> {
-		try {
-			await this.#session.cancel({ turnId, reason });
-		} catch (error) {
-			const sink = this.#sinks.get(String(turnId));
-			if (sink) this.#failSink(sink, safeErrorMessage(error), "error");
-		}
-	}
-
-	#cancelSink(sink: TurnSink, reason: "user_requested" | "timeout"): void {
-		if (sink.cancelRequested || sink.turnId === undefined) return;
-		sink.cancelRequested = true;
-		let cancellation!: Promise<void>;
-		cancellation = this.#cancel(sink.turnId, reason).then(
-			() => {
-				this.#cancellationsInFlight.delete(cancellation);
-			},
-			() => {
-				this.#cancellationsInFlight.delete(cancellation);
-			},
-		);
-		this.#cancellationsInFlight.add(cancellation);
 	}
 
 	async #observe(): Promise<void> {
-		let failure: unknown = new Error("BreadBoard event observer ended unexpectedly");
 		try {
-			for await (const event of this.#session.events({ signal: this.#observeAbort.signal })) {
-				if (event.sequence <= this.#highestObservedSequence || this.#outOfOrderSequences.has(event.sequence))
-					continue;
-				this.#outOfOrderSequences.add(event.sequence);
-				while (this.#outOfOrderSequences.delete(this.#highestObservedSequence + 1)) {
-					this.#highestObservedSequence += 1;
-				}
+			const after = this.#initialCursor && this.#initialCursor.sequence > 0 ? this.#initialCursor : undefined;
+			for await (const event of this.#session.events({ signal: this.#observeAbort.signal, after })) {
 				if (event.kind === "runtime_error_observed" && (event.scope === "session" || event.turnId === null)) {
-					this.#invalidateBridge(
+					throw new Error(
 						`BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`,
 					);
-					return;
 				}
 				if (event.turnId === null) {
 					switch (event.kind) {
@@ -315,105 +304,94 @@ export class E4AgentStreamBridge {
 						case "skills_catalog_observed":
 						case "skills_selection_observed":
 						case "ctree_snapshot_observed":
+							await this.#commit(event, []);
 							continue;
 						default:
-							this.#invalidateBridge("BreadBoard unsupported canonical runtime event family");
-							return;
+							throw new Error("BreadBoard unsupported canonical runtime event family");
 					}
 				}
 				const turnKey = String(event.turnId);
 				let sink = this.#sinks.get(turnKey);
-				if (!sink && !this.#submittedTurnIds.has(turnKey)) {
-					await this.#waitForSubmission(turnKey);
+				if (!sink && this.#submissionsInFlight.size) {
+					await Promise.race(this.#submissionsInFlight);
 					sink = this.#sinks.get(turnKey);
 				}
-				if (sink) {
-					this.#applyEvent(sink, event);
-				} else if (this.#submittedTurnIds.has(turnKey)) {
-					const pending = this.#pendingEvents.get(turnKey) ?? [];
-					pending.push(event);
-					this.#pendingEvents.set(turnKey, pending);
+				if (!sink) {
+					const backendModel = this.#modelPolicy?.model;
+					if (!backendModel) throw new Error("BreadBoard backend model attribution is not configured");
+					sink = this.#newSink(backendModel);
+					sink.turnId = event.turnId;
+					this.#sinks.set(turnKey, sink);
 				}
+				await this.#applyEvent(sink, event);
 			}
+			if (!this.#closed) throw new Error("BreadBoard event observer ended unexpectedly");
 		} catch (error) {
-			failure = error;
-		}
-		if (this.#closed || this.#observeAbort.signal.aborted) return;
-		this.#invalidateBridge(safeErrorMessage(failure));
-	}
-
-	#invalidateBridge(message: string): void {
-		if (this.#observeFailure) return;
-		this.#observeFailure = new Error(message);
-		this.#observeAbort.abort();
-		for (const sink of this.#submittingSinks) {
-			this.#failSink(sink, message, "error");
-		}
-		for (const sink of [...this.#sinks.values()]) {
-			this.#failSink(sink, message, "error");
-			this.#cancelSink(sink, "timeout");
-		}
-		this.#sinks.clear();
-		this.#submittedTurnIds.clear();
-		this.#pendingEvents.clear();
-	}
-
-	async #waitForSubmission(turnKey: string): Promise<void> {
-		while (!this.#submittedTurnIds.has(turnKey) && this.#submissionsInFlight.size > 0) {
-			await Promise.race(this.#submissionsInFlight);
+			if (!this.#closed && !this.#observeAbort.signal.aborted) this.#invalidateBridge(safeErrorMessage(error));
 		}
 	}
 
-	#applyEvent(sink: TurnSink, event: LoggedSessionEvent): void {
+	async #applyEvent(sink: TurnSink, event: LoggedSessionEvent): Promise<void> {
 		if (sink.terminal) return;
 		switch (event.kind) {
 			case "turn_started":
 				this.#ensureStarted(sink);
+				await this.#commit(event, []);
 				return;
 			case "assistant_message_started":
-				this.#flushAssistantText(sink);
+				await this.#flushAssistantText(sink);
 				this.#ensureStarted(sink);
+				await this.#commit(event, []);
 				return;
 			case "assistant_text_delta":
 				this.#appendText(sink, event.payload.text);
+				if (event.payload.text) this.#undurableSinks.add(sink);
 				return;
-			case "assistant_text_completed": {
-				const complete = event.payload.text;
-				if (complete === null || complete === sink.messageText) return;
-				if (!complete.startsWith(sink.messageText)) {
-					this.#failSink(sink, "BreadBoard assistant stream did not match its completion", "error");
-					return;
+			case "assistant_text_completed":
+				if (event.payload.text !== null && event.payload.text !== sink.messageText) {
+					if (!event.payload.text.startsWith(sink.messageText)) {
+						throw new Error("BreadBoard assistant stream did not match its completion");
+					}
+					this.#appendText(sink, event.payload.text.slice(sink.messageText.length));
 				}
-				this.#appendText(sink, complete.slice(sink.messageText.length));
+				sink.pendingTextCompletion = event;
 				return;
-			}
 			case "tool_called":
-				if (!sink.projectedToolCallIds.has(String(event.payload.callId))) this.#flushAssistantText(sink);
-				this.#projectToolCall(sink, event);
+				if (!sink.projectedToolCallIds.has(String(event.payload.callId))) {
+					await this.#flushAssistantText(sink);
+					await this.#projectToolCall(sink, event);
+				}
 				return;
 			case "tool_result_observed":
-				this.#projectToolResult(sink, event);
+				await this.#projectToolResult(sink, event);
 				return;
 			case "permission_requested":
-				void this.#handlePermissionRequest(sink, event);
+				await this.#handlePermissionRequest(sink, event);
+				if (!sink.messageText) await this.#commit(event, []);
 				return;
 			case "turn_completed":
-				this.#completeSink(sink);
+				await this.#completeSink(sink, event);
 				return;
 			case "turn_failed":
-				this.#failSink(sink, `BreadBoard turn failed [${event.payload.error.code}]`, "error");
+				await this.#terminalFailure(sink, event, `BreadBoard turn failed [${event.payload.error.code}]`, "error");
 				return;
 			case "turn_cancelled":
-				this.#failSink(sink, `BreadBoard turn cancelled [${event.payload.reason}]`, "aborted");
+				await this.#terminalFailure(sink, event, `BreadBoard turn cancelled [${event.payload.reason}]`, "aborted");
 				return;
-			case "runtime_error_observed":
-				this.#failSink(
-					sink,
-					`BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`,
-					"error",
-				);
+			case "runtime_error_observed": {
+				const message = `BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`;
+				if (sink.adopted) throw new Error(message);
+				sink.stream?.push({
+					type: "error",
+					reason: "error",
+					error: assistantMessage(sink.model, sink.text, "error", message, String(event.eventId)),
+				});
+				this.#terminalCursor = cursorFor(event);
+				sink.terminal = true;
 				this.#cancelSink(sink, "timeout");
+				this.#removeSink(sink);
 				return;
+			}
 			case "input_observed":
 			case "conversation_compaction_started":
 			case "conversation_compaction_completed":
@@ -438,70 +416,75 @@ export class E4AgentStreamBridge {
 			case "completion_observed":
 			case "log_linked":
 			case "run_finished":
+				if (!sink.messageText && sink.projectedToolCallIds.size === sink.projectedToolResultIds.size) {
+					await this.#commit(event, []);
+				}
 				return;
 			default:
-				this.#failSink(sink, "BreadBoard unsupported canonical runtime event family", "error");
-				this.#cancelSink(sink, "timeout");
-				return;
+				throw new Error("BreadBoard unsupported canonical runtime event family");
 		}
 	}
 
-	#projectToolCall(sink: TurnSink, event: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>): void {
+	async #projectToolCall(
+		sink: TurnSink,
+		event: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>,
+	): Promise<void> {
 		const toolCallId = String(event.payload.callId);
 		if (sink.projectedToolCallIds.has(toolCallId)) return;
+		this.#undurableSinks.add(sink);
 		sink.projectedToolCallIds.add(toolCallId);
 		sink.toolCallsByCallId.set(toolCallId, event);
-
+		if (this.#receipts.has(String(event.eventId))) return;
 		const message = assistantToolCallMessage(sink.model, event);
-		this.#emitAgentEvent({ type: "message_start", message });
-		this.#emitAgentEvent({ type: "message_end", message });
-		this.#emitAgentEvent({
-			type: "tool_execution_start",
-			toolCallId,
-			toolName: event.payload.tool,
-			args: event.payload.arguments,
-			intent: event.payload.action ?? undefined,
-		});
-
-		const pendingResult = sink.pendingToolResultsByCallId.get(toolCallId);
-		if (pendingResult) this.#projectToolResult(sink, pendingResult);
+		await this.#emit(event, "message_start", { type: "message_start", message }, sink);
+		await this.#emit(event, "message_end", { type: "message_end", message }, sink);
+		await this.#emit(
+			event,
+			"tool_execution_start",
+			{
+				type: "tool_execution_start",
+				toolCallId,
+				toolName: event.payload.tool,
+				args: event.payload.arguments,
+				intent: event.payload.action ?? undefined,
+			},
+			sink,
+		);
 	}
 
-	#projectToolResult(
+	async #projectToolResult(
 		sink: TurnSink,
 		event: Extract<LoggedSessionEvent, { readonly kind: "tool_result_observed" }>,
-	): void {
+	): Promise<void> {
 		const toolCallId = String(event.payload.callId);
 		if (sink.projectedToolResultIds.has(toolCallId)) return;
 		const toolCall = sink.toolCallsByCallId.get(toolCallId);
-		if (!toolCall) {
-			if (!sink.pendingToolResultsByCallId.has(toolCallId)) sink.pendingToolResultsByCallId.set(toolCallId, event);
-			return;
-		}
-
+		if (!toolCall) throw new Error("BreadBoard replay began mid-tool without the retained tool call");
 		sink.projectedToolResultIds.add(toolCallId);
-		sink.pendingToolResultsByCallId.delete(toolCallId);
-		const toolName = event.payload.tool ?? toolCall.payload.tool;
-		const result = toolResult(event.payload.result, event.payload.artifactRef);
-		const isError = event.payload.error;
-		this.#emitAgentEvent({
-			type: "tool_execution_end",
-			toolCallId,
-			toolName,
-			result,
-			isError,
-		});
-		const message: ToolResultMessage = {
-			role: "toolResult",
-			toolCallId,
-			toolName,
-			content: result.content,
-			details: result.details,
-			isError,
-			timestamp: Date.now(),
-		};
-		this.#emitAgentEvent({ type: "message_start", message });
-		this.#emitAgentEvent({ type: "message_end", message });
+		if (!this.#receipts.has(String(event.eventId))) {
+			const toolName = event.payload.tool ?? toolCall.payload.tool;
+			const result = toolResult(event.payload.result, event.payload.artifactRef, String(event.eventId));
+			await this.#emit(
+				event,
+				"tool_execution_end",
+				{ type: "tool_execution_end", toolCallId, toolName, result, isError: event.payload.error },
+				sink,
+			);
+			const message: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId,
+				toolName,
+				content: result.content,
+				details: result.details,
+				isError: event.payload.error,
+				timestamp: event.occurredAtMs,
+			};
+			await this.#emit(event, "message_start", { type: "message_start", message }, sink);
+			await this.#emit(event, "message_end", { type: "message_end", message }, sink);
+		}
+		this.#undurableSinks.delete(sink);
+		await this.#commit(event, sink.pendingProjectionKeys.splice(0));
+		sink.toolCallsByCallId.delete(toolCallId);
 	}
 
 	async #handlePermissionRequest(
@@ -510,41 +493,36 @@ export class E4AgentStreamBridge {
 	): Promise<void> {
 		const requestPermission = this.#requestPermission;
 		if (!requestPermission) {
-			this.#abortForPermission(sink, "BreadBoard permission request requires OMP permission UI wiring", "error");
+			this.#failSink(sink, "BreadBoard permission request requires OMP permission UI wiring", "error");
+			this.#cancelSink(sink, "user_requested");
 			return;
 		}
-
 		let decision: E4PermissionDecision;
 		try {
 			decision = await requestPermission(event.payload, sink.permissionAbort.signal);
 		} catch (error) {
-			if (sink.terminal || sink.permissionAbort.signal.aborted) return;
-			this.#abortForPermission(sink, safeErrorMessage(error), "error");
+			this.#failSink(sink, safeErrorMessage(error), "error");
+			this.#cancelSink(sink, "user_requested");
 			return;
 		}
 		if (sink.terminal || sink.permissionAbort.signal.aborted || this.#closed) return;
 		if (decision === "cancel") {
-			this.#abortForPermission(sink, "BreadBoard permission request cancelled in OMP", "aborted");
+			this.#failSink(sink, "BreadBoard permission request cancelled in OMP", "aborted");
+			this.#cancelSink(sink, "user_requested");
 			return;
 		}
-
 		try {
 			await this.#session.respondPermission({ requestId: event.payload.requestId, decision });
 		} catch (error) {
-			if (sink.terminal || this.#closed) return;
-			this.#abortForPermission(sink, safeErrorMessage(error), "error");
+			this.#failSink(sink, safeErrorMessage(error), "error");
+			this.#cancelSink(sink, "user_requested");
 		}
-	}
-
-	#abortForPermission(sink: TurnSink, message: string, reason: "error" | "aborted"): void {
-		this.#failSink(sink, message, reason);
-		this.#cancelSink(sink, "user_requested");
 	}
 
 	#ensureStarted(sink: TurnSink): void {
 		if (sink.started) return;
 		sink.started = true;
-		sink.stream.push({ type: "start", partial: assistantMessage(sink.model, sink.text, "stop") });
+		sink.stream?.push({ type: "start", partial: assistantMessage(sink.model, sink.text, "stop") });
 	}
 
 	#appendText(sink: TurnSink, delta: string): void {
@@ -552,7 +530,7 @@ export class E4AgentStreamBridge {
 		this.#ensureStarted(sink);
 		if (!sink.textStarted) {
 			sink.textStarted = true;
-			sink.stream.push({
+			sink.stream?.push({
 				type: "text_start",
 				contentIndex: 0,
 				partial: assistantMessage(sink.model, sink.text, "stop"),
@@ -560,7 +538,7 @@ export class E4AgentStreamBridge {
 		}
 		sink.text += delta;
 		sink.messageText += delta;
-		sink.stream.push({
+		sink.stream?.push({
 			type: "text_delta",
 			contentIndex: 0,
 			delta,
@@ -568,37 +546,148 @@ export class E4AgentStreamBridge {
 		});
 	}
 
-	#flushAssistantText(sink: TurnSink): void {
+	async #flushAssistantText(sink: TurnSink): Promise<void> {
 		if (!sink.messageText) return;
+		const completion = sink.pendingTextCompletion;
+		if (!completion) throw new Error("BreadBoard replay began mid-message without a completion boundary");
 		const text = sink.messageText;
-		const message = assistantMessage(sink.model, text, "stop");
-		if (sink.textStarted) {
-			sink.stream.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+		const message = assistantMessage(sink.model, text, "stop", undefined, String(completion.eventId));
+		if (sink.textStarted) sink.stream?.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+		if (!this.#receipts.has(String(completion.eventId))) {
+			await this.#emit(completion, "message_start", { type: "message_start", message }, sink);
+			await this.#emit(completion, "message_end", { type: "message_end", message }, sink);
 		}
-		this.#emitAgentEvent({ type: "message_start", message });
-		this.#emitAgentEvent({ type: "message_end", message });
+		this.#undurableSinks.delete(sink);
+		await this.#commit(completion, sink.pendingProjectionKeys.splice(0));
 		sink.text = "";
 		sink.messageText = "";
 		sink.textStarted = false;
-		sink.stream.push({ type: "start", partial: assistantMessage(sink.model, "", "stop") });
+		sink.pendingTextCompletion = undefined;
+		sink.stream?.push({ type: "start", partial: assistantMessage(sink.model, "", "stop") });
 	}
 
-	#completeSink(sink: TurnSink): void {
-		if (sink.terminal) return;
+	async #completeSink(
+		sink: TurnSink,
+		event: Extract<LoggedSessionEvent, { readonly kind: "turn_completed" }>,
+	): Promise<void> {
 		this.#ensureStarted(sink);
-		const message = assistantMessage(sink.model, sink.text, "stop");
-		if (sink.textStarted) {
-			sink.stream.push({ type: "text_end", contentIndex: 0, content: sink.text, partial: message });
+		if (sink.adopted) {
+			if (sink.messageText) {
+				if (!sink.pendingTextCompletion) {
+					throw new Error("BreadBoard replay ended mid-message without a completion boundary");
+				}
+				await this.#projectAdoptedTerminal(sink, event, "stop", undefined, sink.messageText);
+				this.#undurableSinks.delete(sink);
+			}
+			await this.#commit(event, sink.pendingProjectionKeys.splice(0));
+		} else {
+			const message = assistantMessage(sink.model, sink.text, "stop", undefined, String(event.eventId));
+			if (sink.textStarted) {
+				sink.stream?.push({ type: "text_end", contentIndex: 0, content: sink.text, partial: message });
+			}
+			sink.stream?.push({ type: "done", reason: "stop", message });
+			this.#undurableSinks.delete(sink);
+			this.#terminalCursor = cursorFor(event);
 		}
 		sink.terminal = true;
-		sink.stream.push({ type: "done", reason: "stop", message });
 		this.#removeSink(sink);
+	}
+
+	async #terminalFailure(
+		sink: TurnSink,
+		event: Extract<LoggedSessionEvent, { readonly kind: "turn_failed" | "turn_cancelled" }>,
+		message: string,
+		reason: "error" | "aborted",
+	): Promise<void> {
+		if (sink.adopted) {
+			if (sink.messageText && !sink.pendingTextCompletion) {
+				throw new Error("BreadBoard replay ended mid-message without a completion boundary");
+			}
+			await this.#projectAdoptedTerminal(sink, event, reason, message, sink.messageText);
+			this.#undurableSinks.delete(sink);
+			await this.#commit(event, sink.pendingProjectionKeys.splice(0));
+		} else {
+			sink.stream?.push({
+				type: "error",
+				reason,
+				error: assistantMessage(sink.model, sink.text, reason, message, String(event.eventId)),
+			});
+			this.#undurableSinks.delete(sink);
+			this.#terminalCursor = cursorFor(event);
+		}
+		sink.terminal = true;
+		this.#removeSink(sink);
+	}
+
+	async #projectAdoptedTerminal(
+		sink: TurnSink,
+		event: LoggedSessionEvent,
+		reason: AssistantMessage["stopReason"],
+		errorMessage?: string,
+		text = "",
+	): Promise<void> {
+		if ((!text && !errorMessage) || this.#receipts.has(String(event.eventId))) return;
+		const message = assistantMessage(sink.model, text, reason, errorMessage, String(event.eventId));
+		await this.#emit(event, "message_start", { type: "message_start", message }, sink);
+		await this.#emit(event, "message_end", { type: "message_end", message }, sink);
+	}
+
+	async #emit(event: LoggedSessionEvent, suffix: string, agentEvent: AgentEvent, sink: TurnSink): Promise<void> {
+		const key = `${String(event.eventId)}:${suffix}`;
+		await this.#emitAgentEvent(agentEvent, key);
+		sink.pendingProjectionKeys.push(key);
+	}
+
+	async #commit(event: LoggedSessionEvent, keys: string[]): Promise<void> {
+		this.#deferredProjectionKeys.push(...keys);
+		if (this.#undurableSinks.size > 0) return;
+		if (this.#terminalCursor) {
+			this.#terminalCursor = cursorFor(event);
+			return;
+		}
+		await this.#projectionCommitted(cursorFor(event));
+		for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
+	}
+
+	async #cancel(turnId: TurnId, reason: "user_requested" | "timeout"): Promise<void> {
+		try {
+			await this.#session.cancel({ turnId, reason });
+		} catch (error) {
+			const sink = this.#sinks.get(String(turnId));
+			if (sink) this.#failSink(sink, safeErrorMessage(error), "error");
+		}
+	}
+
+	#cancelSink(sink: TurnSink, reason: "user_requested" | "timeout"): void {
+		if (sink.cancelRequested || sink.turnId === undefined || sink.adopted) return;
+		sink.cancelRequested = true;
+		let cancellation!: Promise<void>;
+		cancellation = this.#cancel(sink.turnId, reason).finally(() => {
+			this.#cancellationsInFlight.delete(cancellation);
+		});
+		this.#cancellationsInFlight.add(cancellation);
+	}
+
+	#invalidateBridge(message: string): void {
+		if (this.#observeFailure) return;
+		this.#observeFailure = new Error(message);
+		this.#observeAbort.abort();
+		for (const sink of [...this.#sinks.values(), ...this.#submittingSinks]) {
+			this.#failSink(sink, message, "error");
+			this.#cancelSink(sink, "timeout");
+		}
+		this.#sinks.clear();
+		this.#submittedTurnIds.clear();
+	}
+
+	#currentObserveFailure(): Error | undefined {
+		return this.#observeFailure;
 	}
 
 	#failSink(sink: TurnSink, message: string, reason: "error" | "aborted"): void {
 		if (sink.terminal) return;
 		sink.terminal = true;
-		sink.stream.push({ type: "error", reason, error: assistantMessage(sink.model, sink.text, reason, message) });
+		sink.stream?.push({ type: "error", reason, error: assistantMessage(sink.model, sink.text, reason, message) });
 		this.#removeSink(sink);
 	}
 
@@ -613,17 +702,9 @@ export class E4AgentStreamBridge {
 
 	#removeSink(sink: TurnSink): void {
 		sink.permissionAbort.abort();
-		sink.toolCallsByCallId.clear();
-		sink.pendingToolResultsByCallId.clear();
-		sink.projectedToolCallIds.clear();
-		sink.projectedToolResultIds.clear();
-		for (const [turnId, candidate] of this.#sinks) {
-			if (candidate !== sink) continue;
-			this.#sinks.delete(turnId);
-			this.#submittedTurnIds.delete(turnId);
-			this.#pendingEvents.delete(turnId);
-			break;
-		}
+		if (sink.turnId === undefined) return;
+		this.#sinks.delete(String(sink.turnId));
+		this.#submittedTurnIds.delete(String(sink.turnId));
 	}
 }
 
@@ -717,6 +798,7 @@ function assistantMessage(
 	text: string,
 	stopReason: AssistantMessage["stopReason"],
 	errorMessage?: string,
+	projectionEventId?: string,
 ): AssistantMessage {
 	return {
 		role: "assistant",
@@ -727,6 +809,7 @@ function assistantMessage(
 		usage: ZERO_USAGE,
 		stopReason,
 		errorMessage,
+		responseId: projectionEventId ? `${E4_PROJECTION_RECEIPT_PREFIX}${projectionEventId}` : undefined,
 		timestamp: Date.now(),
 	};
 }
@@ -749,18 +832,23 @@ function assistantToolCallMessage(
 		model: model.id,
 		usage: ZERO_USAGE,
 		stopReason: "toolUse",
+		responseId: `${E4_PROJECTION_RECEIPT_PREFIX}${String(event.eventId)}`,
 		timestamp: event.occurredAtMs,
 	};
 }
 
-function toolResult(result: unknown, artifactRef: unknown): AgentToolResult<unknown> {
+function toolResult(result: unknown, artifactRef: unknown, projectionEventId: string): AgentToolResult<unknown> {
 	const content: string[] = [];
 	if (result !== null) content.push(canonicalText(result));
 	if (artifactRef !== null) content.push(`Artifact: ${canonicalText(artifactRef)}`);
 	return {
 		content: [{ type: "text", text: content.join("\n") || "Completed" }],
-		details: { result, artifactRef },
+		details: { result, artifactRef, breadboardProjectionEventId: projectionEventId },
 	};
+}
+
+function cursorFor(event: LoggedSessionEvent): E4DurableCursor {
+	return { eventId: String(event.eventId), sequence: event.sequence };
 }
 
 function canonicalText(value: unknown): string {

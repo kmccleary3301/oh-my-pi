@@ -12,7 +12,7 @@ import type {
 	SubmitReceipt,
 } from "@breadboard/sdk";
 import { decodeLoggedSessionEvent, LifecycleE4ClientError } from "@breadboard/sdk";
-import { Agent, type AgentEvent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentEvent, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -71,14 +71,22 @@ function openedSession(events: readonly LoggedSessionEvent[], submitted: SubmitI
 			throw new Error("permission response not expected");
 		},
 		async *events(request) {
+			let highestSequence = request?.after?.sequence ?? 0;
 			for (const event of events) {
+				if (event.sequence <= highestSequence) continue;
 				await Bun.sleep(0);
 				if (request?.signal?.aborted) return;
 				yield event;
+				highestSequence = event.sequence;
 			}
 		},
 		async close() {},
 	};
+}
+
+function startBridgeStream(bridge: E4AgentStreamBridge, ...args: Parameters<StreamFn>) {
+	bridge.start();
+	return bridge.stream(...args);
 }
 
 const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -180,12 +188,16 @@ describe("E4AgentStreamBridge", () => {
 		];
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession(events, submitted),
-			replayHeadSequence: 0,
-			emitAgentEvent: event => agentEvents.push(event),
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			emitAgentEvent: async event => {
+				agentEvents.push(event);
+			},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		const result = await stream.result();
 
 		expect(submitted).toHaveLength(1);
@@ -228,18 +240,20 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		try {
-			const firstStream = await bridge.stream(model, context);
+			const firstStream = await startBridgeStream(bridge, model, context);
 			const firstResult = await firstStream.result();
 			expect(firstResult.stopReason).toBe("error");
 			expect(submitted).toHaveLength(1);
 
-			const retryStream = await bridge.stream(model, context);
+			const retryStream = await startBridgeStream(bridge, model, context);
 			const retryResult = await retryStream.result();
 			expect(retryResult.stopReason).toBe("stop");
 			expect(submitted).toHaveLength(2);
@@ -268,8 +282,10 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 		const differentContext: Context = {
@@ -277,8 +293,8 @@ describe("E4AgentStreamBridge", () => {
 		};
 
 		try {
-			expect((await (await bridge.stream(model, context)).result()).stopReason).toBe("error");
-			const differentResult = await (await bridge.stream(model, differentContext)).result();
+			expect((await (await startBridgeStream(bridge, model, context)).result()).stopReason).toBe("error");
+			const differentResult = await (await startBridgeStream(bridge, model, differentContext)).result();
 
 			expect(differentResult.stopReason).toBe("error");
 			expect(differentResult.errorMessage).toContain("previous submission is unresolved");
@@ -326,8 +342,10 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 		const withImage = (data: string): Context => ({
@@ -347,12 +365,12 @@ describe("E4AgentStreamBridge", () => {
 		const equivalent = withImage(Buffer.from([0, 1, 2]).toString("base64"));
 
 		try {
-			expect((await (await bridge.stream(model, original)).result()).stopReason).toBe("error");
-			const differentResult = await (await bridge.stream(model, differentBytes)).result();
+			expect((await (await startBridgeStream(bridge, model, original)).result()).stopReason).toBe("error");
+			const differentResult = await (await startBridgeStream(bridge, model, differentBytes)).result();
 			expect(differentResult.errorMessage).toContain("previous submission is unresolved");
 			expect(submitted).toHaveLength(1);
 
-			expect((await (await bridge.stream(model, equivalent)).result()).stopReason).toBe("stop");
+			expect((await (await startBridgeStream(bridge, model, equivalent)).result()).stopReason).toBe("stop");
 			expect(submitted).toHaveLength(2);
 			expect(submitted[1]).toBe(submitted[0]);
 		} finally {
@@ -404,8 +422,10 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 		const secondContext: Context = {
@@ -413,8 +433,8 @@ describe("E4AgentStreamBridge", () => {
 		};
 
 		try {
-			const firstStream = await bridge.stream(model, context);
-			const secondStream = await bridge.stream(model, secondContext);
+			const firstStream = await startBridgeStream(bridge, model, context);
+			const secondStream = await startBridgeStream(bridge, model, secondContext);
 			const [firstResult, secondResult] = await Promise.all([firstStream.result(), secondStream.result()]);
 
 			expect(firstResult.stopReason).toBe("error");
@@ -484,8 +504,10 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 		const secondContext: Context = {
@@ -496,8 +518,8 @@ describe("E4AgentStreamBridge", () => {
 		};
 
 		try {
-			const activeStream = await bridge.stream(model, context);
-			const submittingStream = await bridge.stream(model, secondContext);
+			const activeStream = await startBridgeStream(bridge, model, context);
+			const submittingStream = await startBridgeStream(bridge, model, secondContext);
 			await runtimeErrorObserved.promise;
 			releaseSecondSubmit.resolve();
 			const [activeResult, submittingResult] = await Promise.all([activeStream.result(), submittingStream.result()]);
@@ -509,7 +531,7 @@ describe("E4AgentStreamBridge", () => {
 			expect(submittingResult.stopReason).toBe("error");
 			expect(submittingResult.errorMessage).toBe("BreadBoard runtime error [engine_crash]: [redacted]");
 
-			const laterResult = await (await bridge.stream(model, laterContext)).result();
+			const laterResult = await (await startBridgeStream(bridge, model, laterContext)).result();
 			expect(laterResult.stopReason).toBe("error");
 			expect(laterResult.errorMessage).toBe("BreadBoard runtime error [engine_crash]: [redacted]");
 			expect(submissionCount).toBe(2);
@@ -557,13 +579,15 @@ describe("E4AgentStreamBridge", () => {
 			};
 			const bridge = new E4AgentStreamBridge({
 				session,
-				replayHeadSequence: 0,
-				emitAgentEvent() {},
+				durableCursor: undefined,
+				releaseAgentEvent() {},
+				async projectionCommitted() {},
+				async emitAgentEvent() {},
 				modelPolicy: { kind: "fixed", model: model },
 			});
 
 			try {
-				const result = await (await bridge.stream(model, context)).result();
+				const result = await (await startBridgeStream(bridge, model, context)).result();
 				expect(result.stopReason).toBe("error");
 				expect(result.content).toEqual([{ type: "text", text: "partial" }]);
 				expect(result.errorMessage).toBe(runtimeFamily.expectedMessage);
@@ -579,7 +603,11 @@ describe("E4AgentStreamBridge", () => {
 		const agentEvents: AgentEvent[] = [];
 		const normalizedResult = {
 			content: [{ type: "text" as const, text: '{"output":"contents"}\nArtifact: artifact-1' }],
-			details: { result: { output: "contents" }, artifactRef: "artifact-1" },
+			details: {
+				result: { output: "contents" },
+				artifactRef: "artifact-1",
+				breadboardProjectionEventId: "event-4",
+			},
 		};
 		const events = [
 			wireEvent(1, "tool.result", {
@@ -612,12 +640,16 @@ describe("E4AgentStreamBridge", () => {
 		];
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession(events, submitted),
-			replayHeadSequence: 1,
-			emitAgentEvent: event => agentEvents.push(event),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			emitAgentEvent: async event => {
+				agentEvents.push(event);
+			},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		const result = await stream.result();
 
 		expect(result.content).toEqual([{ type: "text", text: "fresh" }]);
@@ -648,6 +680,7 @@ describe("E4AgentStreamBridge", () => {
 				totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
+			responseId: "breadboard:e4:event-3",
 			stopReason: "toolUse",
 			timestamp: 3,
 		});
@@ -752,12 +785,16 @@ describe("E4AgentStreamBridge", () => {
 		];
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession(events, submitted),
-			replayHeadSequence: 1,
-			emitAgentEvent: event => agentEvents.push(event),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			emitAgentEvent: async event => {
+				agentEvents.push(event);
+			},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		const result = await stream.result();
 
 		expect(result.content).toEqual([{ type: "text", text: "After." }]);
@@ -802,25 +839,28 @@ describe("E4AgentStreamBridge", () => {
 		const textCompleted = wireEvent(6, "assistant.message.end", { text: "fresh" });
 		const events = [
 			started,
-			toolResultEvent,
-			toolResultEvent,
 			toolCall,
 			toolCall,
-			textDelta,
-			textDelta,
 			toolResultEvent,
+			toolResultEvent,
+			textDelta,
+			textDelta,
 			textCompleted,
 			textCompleted,
 			wireEvent(7, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession(events, submitted),
-			replayHeadSequence: 1,
-			emitAgentEvent: event => agentEvents.push(event),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			emitAgentEvent: async event => {
+				agentEvents.push(event);
+			},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		const result = await stream.result();
 
 		expect(result.content).toEqual([{ type: "text", text: "fresh" }]);
@@ -899,10 +939,15 @@ describe("E4AgentStreamBridge", () => {
 		let agent!: Agent;
 		const bridge = new E4AgentStreamBridge({
 			session: runtime,
-			replayHeadSequence: 1,
-			emitAgentEvent: event => agent.emitExternalEvent(event),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			emitAgentEvent: async event => {
+				agent.emitExternalEvent(event);
+			},
 			modelPolicy: { kind: "fixed", model },
 		});
+		bridge.start();
 		agent = new Agent({
 			initialState: {
 				model,
@@ -1062,12 +1107,14 @@ describe("E4AgentStreamBridge", () => {
 					],
 					[],
 				),
-				replayHeadSequence: 0,
-				emitAgentEvent() {},
+				durableCursor: undefined,
+				releaseAgentEvent() {},
+				async projectionCommitted() {},
+				async emitAgentEvent() {},
 				modelPolicy: { kind: "fixed", model: model },
 			});
 
-			const stream = await bridge.stream(model, context);
+			const stream = await startBridgeStream(bridge, model, context);
 			const result = await stream.result();
 
 			expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
@@ -1086,12 +1133,14 @@ describe("E4AgentStreamBridge", () => {
 				],
 				[],
 			),
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		const result = await stream.result();
 
 		expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
@@ -1123,10 +1172,13 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
+		bridge.start();
 
 		try {
 			await observed.promise;
@@ -1157,12 +1209,14 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		const result = await stream.result();
 
 		expect(submitted).toHaveLength(1);
@@ -1201,12 +1255,14 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		await submitObserved.promise;
 		await drainMicrotasks();
 		await partialObserved.promise;
@@ -1267,15 +1323,17 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		const streams = await Promise.all([
-			bridge.stream(model, context),
-			bridge.stream(model, context),
-			bridge.stream(model, context),
+			startBridgeStream(bridge, model, context),
+			startBridgeStream(bridge, model, context),
+			startBridgeStream(bridge, model, context),
 		]);
 		await allSubmissionsObserved.promise;
 		const close = bridge.close();
@@ -1329,12 +1387,14 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
-		const stream = await bridge.stream(model, context);
+		const stream = await startBridgeStream(bridge, model, context);
 		await submitObserved.promise;
 		await drainMicrotasks();
 		await bridge.close();
@@ -1362,8 +1422,10 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
@@ -1426,13 +1488,15 @@ describe("E4AgentStreamBridge", () => {
 			};
 			const bridge = new E4AgentStreamBridge({
 				session,
-				replayHeadSequence: 0,
-				emitAgentEvent() {},
+				durableCursor: undefined,
+				releaseAgentEvent() {},
+				async projectionCommitted() {},
+				async emitAgentEvent() {},
 				modelPolicy: { kind: "fixed", model: model },
 			});
 
 			try {
-				const stream = await bridge.stream(model, context);
+				const stream = await startBridgeStream(bridge, model, context);
 				await observerExited.promise;
 				await drainMicrotasks();
 				expect(stream.resultSettled).toBeTrue();
@@ -1484,13 +1548,15 @@ describe("E4AgentStreamBridge", () => {
 			};
 			const bridge = new E4AgentStreamBridge({
 				session,
-				replayHeadSequence: 0,
-				emitAgentEvent() {},
+				durableCursor: undefined,
+				releaseAgentEvent() {},
+				async projectionCommitted() {},
+				async emitAgentEvent() {},
 				modelPolicy: { kind: "fixed", model: model },
 			});
 
 			try {
-				const stream = await bridge.stream(model, context);
+				const stream = await startBridgeStream(bridge, model, context);
 				await observerExited.promise;
 				await submitSettled.promise;
 				await drainMicrotasks();
@@ -1534,13 +1600,15 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		try {
-			const stream = await bridge.stream(model, context);
+			const stream = await startBridgeStream(bridge, model, context);
 			await observerExited.promise;
 			await drainMicrotasks();
 			expect(stream.resultSettled).toBeTrue();
@@ -1584,13 +1652,15 @@ describe("E4AgentStreamBridge", () => {
 		};
 		const bridge = new E4AgentStreamBridge({
 			session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		try {
-			const stream = await bridge.stream(model, context);
+			const stream = await startBridgeStream(bridge, model, context);
 			await observerExited.promise;
 			await drainMicrotasks();
 			expect(stream.resultSettled).toBeTrue();
@@ -1617,8 +1687,10 @@ describe("E4AgentStreamBridge", () => {
 			let promptCount = 0;
 			const bridge = new E4AgentStreamBridge({
 				session: permission.session,
-				replayHeadSequence: 0,
-				emitAgentEvent() {},
+				durableCursor: undefined,
+				releaseAgentEvent() {},
+				async projectionCommitted() {},
+				async emitAgentEvent() {},
 				modelPolicy: { kind: "fixed", model: model },
 				requestPermission: async request => {
 					promptCount += 1;
@@ -1629,7 +1701,7 @@ describe("E4AgentStreamBridge", () => {
 			});
 
 			try {
-				const stream = await bridge.stream(model, context);
+				const stream = await startBridgeStream(bridge, model, context);
 				await permission.permissionObserved;
 				expect(promptCount).toBe(1);
 				await permission.actionObserved;
@@ -1651,8 +1723,10 @@ describe("E4AgentStreamBridge", () => {
 		let promptCount = 0;
 		const bridge = new E4AgentStreamBridge({
 			session: permission.session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 			requestPermission: async () => {
 				promptCount += 1;
@@ -1661,7 +1735,7 @@ describe("E4AgentStreamBridge", () => {
 		});
 
 		try {
-			const stream = await bridge.stream(model, context);
+			const stream = await startBridgeStream(bridge, model, context);
 			await permission.permissionObserved;
 			expect(promptCount).toBe(1);
 			await permission.actionObserved;
@@ -1683,8 +1757,10 @@ describe("E4AgentStreamBridge", () => {
 		let promptCount = 0;
 		const bridge = new E4AgentStreamBridge({
 			session: permission.session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 			requestPermission: async () => {
 				promptCount += 1;
@@ -1693,7 +1769,7 @@ describe("E4AgentStreamBridge", () => {
 		});
 
 		try {
-			const stream = await bridge.stream(model, context);
+			const stream = await startBridgeStream(bridge, model, context);
 			await permission.permissionObserved;
 			expect(promptCount).toBe(1);
 			await permission.actionObserved;
@@ -1715,13 +1791,15 @@ describe("E4AgentStreamBridge", () => {
 		const permission = permissionSession(responded, cancelled);
 		const bridge = new E4AgentStreamBridge({
 			session: permission.session,
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		try {
-			const stream = await bridge.stream(model, context);
+			const stream = await startBridgeStream(bridge, model, context);
 			await permission.permissionObserved;
 			expect(stream.resultSettled).toBeTrue();
 			await permission.actionObserved;
@@ -1742,13 +1820,15 @@ describe("E4AgentStreamBridge", () => {
 		const selectedModel = { ...model, id: `${model.id}-selected` };
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession([started, wireEvent(3, "turn_completed", {})], submitted),
-			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
 		try {
-			const stream = await bridge.stream(selectedModel, context);
+			const stream = await startBridgeStream(bridge, selectedModel, context);
 			expect(stream.resultSettled).toBeTrue();
 			const result = await stream.result();
 
@@ -1758,5 +1838,222 @@ describe("E4AgentStreamBridge", () => {
 		} finally {
 			await bridge.close();
 		}
+	});
+	test("does not observe before explicit activation and forwards the durable SDK cursor once", async () => {
+		let observations = 0;
+		let observedAfter: { eventId: string; sequence: number } | undefined;
+		const observing = Promise.withResolvers<void>();
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async *events(request) {
+				observations += 1;
+				observedAfter = request?.after;
+				observing.resolve();
+				await new Promise<void>(resolve =>
+					request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: { eventId: "event-41", sequence: 41 },
+			async emitAgentEvent() {},
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		expect(observations).toBe(0);
+		bridge.start();
+		bridge.start();
+		await observing.promise;
+		expect(observations).toBe(1);
+		expect(observedAfter).toEqual({ eventId: "event-41", sequence: 41 });
+		await bridge.close();
+	});
+
+	test("omits SDK after for a sequence-zero cursor and fails StreamFn closed before activation", async () => {
+		let observedAfter: unknown = "not-observed";
+		const observing = Promise.withResolvers<void>();
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async *events(request) {
+				observedAfter = request?.after;
+				observing.resolve();
+				await new Promise<void>(resolve =>
+					request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: { eventId: "event-0", sequence: 0 },
+			async emitAgentEvent() {},
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		const result = await (await bridge.stream(model, context)).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("not started");
+		bridge.start();
+		await observing.promise;
+		expect(observedAfter).toBeUndefined();
+		await bridge.close();
+	});
+
+	test("adopts an uncommitted final response as one durable native assistant message", async () => {
+		const projected: AgentEvent[] = [];
+		const projectionKeys: string[] = [];
+		const releasedKeys: string[] = [];
+		const committed = Promise.withResolvers<void>();
+		const released = Promise.withResolvers<void>();
+		const events = [
+			started,
+			wireEvent(3, "assistant.message.delta", { text: "replayed" }),
+			wireEvent(4, "assistant.message.end", { text: "replayed" }),
+			wireEvent(5, "turn_completed", {}),
+		];
+		const bridge = new E4AgentStreamBridge({
+			session: openedSession(events, []),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			async emitAgentEvent(event, key) {
+				projected.push(event);
+				projectionKeys.push(key);
+			},
+			releaseAgentEvent(key) {
+				releasedKeys.push(key);
+				if (releasedKeys.length === 2) released.resolve();
+			},
+			async projectionCommitted(cursor) {
+				if (cursor.sequence === 5) committed.resolve();
+			},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		bridge.start();
+		await committed.promise;
+		await released.promise;
+		expect(projected.map(event => event.type)).toEqual(["message_start", "message_end"]);
+		const terminal = projected[1];
+		if (terminal?.type !== "message_end") throw new Error("expected adopted assistant message_end");
+		if (terminal.message.role !== "assistant") throw new Error("expected adopted assistant message");
+		expect(terminal.message.content).toEqual([{ type: "text", text: "replayed" }]);
+		expect(terminal.message.responseId).toBe("breadboard:e4:event-5");
+		expect(projectionKeys).toEqual(["event-5:message_start", "event-5:message_end"]);
+		expect(releasedKeys).toEqual(projectionKeys);
+		await bridge.close();
+	});
+
+	test("suppresses an adopted final response already proven by a durable projection receipt", async () => {
+		const projected: AgentEvent[] = [];
+		const releasedKeys: string[] = [];
+		const committed = Promise.withResolvers<void>();
+		const events = [
+			started,
+			wireEvent(3, "assistant.message.delta", { text: "already durable" }),
+			wireEvent(4, "assistant.message.end", { text: "already durable" }),
+			wireEvent(5, "turn_completed", {}),
+		];
+		const bridge = new E4AgentStreamBridge({
+			session: openedSession(events, []),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			projectionReceiptEventIds: new Set(["event-5"]),
+			async emitAgentEvent(event) {
+				projected.push(event);
+			},
+			releaseAgentEvent(key) {
+				releasedKeys.push(key);
+			},
+			async projectionCommitted(cursor) {
+				if (cursor.sequence === 5) committed.resolve();
+			},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		bridge.start();
+		await committed.promise;
+		expect(projected).toEqual([]);
+		expect(releasedKeys).toEqual([]);
+		await bridge.close();
+	});
+
+	test("holds the local terminal and later observed cursors until native persistence is proven by the next turn", async () => {
+		const submitted: SubmitInput[] = [];
+		const firstSubmitted = Promise.withResolvers<void>();
+		const secondSubmitted = Promise.withResolvers<void>();
+		const globalProcessed = Promise.withResolvers<void>();
+		const commits: Array<{ eventId: string; sequence: number }> = [];
+		const lifecycle: string[] = [];
+		const secondReceipt: SubmitReceipt = {
+			...receipt,
+			clientMessageId: "client-message-2" as ClientMessageId,
+			inputId: "input-2" as SubmitReceipt["inputId"],
+			turnId: "turn-2" as SubmitReceipt["turnId"],
+		};
+		const session: OpenedSessionRuntime = {
+			...openedSession([], submitted),
+			async submit(input) {
+				submitted.push(input);
+				if (submitted.length === 1) {
+					firstSubmitted.resolve();
+					return receipt;
+				}
+				lifecycle.push("submit:2");
+				secondSubmitted.resolve();
+				return secondReceipt;
+			},
+			async cancel() {
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				await firstSubmitted.promise;
+				yield started;
+				yield wireEvent(3, "assistant.message.delta", { text: "durable boundary" });
+				yield wireEvent(4, "assistant.message.end", { text: "durable boundary" });
+				yield wireEvent(5, "turn_completed", {});
+				yield wireEvent(
+					6,
+					"todo_event",
+					{
+						todo: {
+							op: "snapshot",
+							scope_label: "Verification",
+							items: [{ id: "task-1", title: "Hold the cursor", status: "done" }],
+						},
+					},
+					null,
+				);
+				globalProcessed.resolve();
+				await new Promise<void>(resolve =>
+					request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			async emitAgentEvent() {},
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				commits.push(cursor);
+				lifecycle.push(`commit:${cursor.sequence}`);
+			},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		const firstStream = await startBridgeStream(bridge, model, context);
+		expect((await firstStream.result()).stopReason).toBe("stop");
+		await globalProcessed.promise;
+		expect(commits).toEqual([{ eventId: "event-2", sequence: 2 }]);
+		const secondStream = await bridge.stream(model, context);
+		await secondSubmitted.promise;
+		expect(commits).toEqual([
+			{ eventId: "event-2", sequence: 2 },
+			{ eventId: "event-6", sequence: 6 },
+		]);
+		expect(lifecycle.slice(-2)).toEqual(["commit:6", "submit:2"]);
+		await bridge.close();
+		expect((await secondStream.result()).stopReason).toBe("aborted");
 	});
 });
