@@ -1,7 +1,7 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { PermissionRequestedPayload } from "@breadboard/sdk";
+import { computeSessionReplayDigest, type PermissionRequestedPayload, type SessionSnapshot } from "@breadboard/sdk";
 import type { AgentEvent, StreamFn } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -49,8 +49,9 @@ const TEST_RUNTIME_AUTHORITY = {
 	emitAgentEvent: async () => {},
 	releaseAgentEvent: () => {},
 };
-const BINDING_SCHEMA_VERSION = "breadboard.session-binding.v1" as const;
-const REPLAY_CONTRACT_DIGEST = "sha256:test-replay-contract";
+const BINDING_SCHEMA_VERSION = "breadboard.session-binding.v2" as const;
+const REPLAY_CONFIGURATION_DIGEST = "sha256:test-replay-configuration";
+const REPLAY_CONTRACT_DIGEST = "sha256:test-replay-snapshot";
 
 function sessionBinding(
 	sessionId: string,
@@ -60,7 +61,7 @@ function sessionBinding(
 	return {
 		schemaVersion: BINDING_SCHEMA_VERSION,
 		sessionId,
-		replayContractDigest: REPLAY_CONTRACT_DIGEST,
+		replayConfigurationDigest: REPLAY_CONFIGURATION_DIGEST,
 		cursor: { eventId, sequence },
 	};
 }
@@ -69,6 +70,11 @@ function runtimeSnapshot(sessionId: string, overrides: Record<string, unknown> =
 	return {
 		sessionId,
 		model: BREADBOARD_MODEL_SELECTOR,
+		replayRetention: {
+			maxEvents: 100_000,
+			maxAgeMs: 86_400_000,
+			configurationDigest: REPLAY_CONFIGURATION_DIGEST,
+		},
 		earliestRetainedSequence: null,
 		earliestRetainedEventId: null,
 		headSequence: 0,
@@ -221,6 +227,7 @@ describe("BreadBoard native interactive authority", () => {
 						sessionId: "session-1",
 						model: BREADBOARD_MODEL,
 						activate: async () => {},
+						start() {},
 						close: closeRuntime,
 					};
 				},
@@ -437,13 +444,16 @@ describe("BreadBoard native interactive authority", () => {
 		const select = mock(async () => "Allow");
 		const uiContext = { select } as never;
 		const setToolUIContext = mock(() => {});
+		const startRuntime = mock(() => {});
 		let transitionGuard: SessionTransitionGuard | undefined;
 		const setSessionTransitionGuard = mock((guard: SessionTransitionGuard | null) => {
 			transitionGuard = guard ?? undefined;
 		});
 		const runInteractiveMode = mock(async (...args: unknown[]) => {
 			const captureUIContext = args[6] as (uiContext: never, hasUI: boolean) => void;
+			expect(startRuntime).not.toHaveBeenCalled();
 			captureUIContext(uiContext, true);
+			expect(startRuntime).toHaveBeenCalledTimes(1);
 			permissionDecision = await requestPermission!(PERMISSION_REQUEST, new AbortController().signal);
 			await emitProjection!({ type: "done" } as never, "projection-key");
 			releaseProjection!("projection-key");
@@ -477,6 +487,7 @@ describe("BreadBoard native interactive authority", () => {
 							);
 							await sessionManager.flush();
 						},
+						start: startRuntime,
 						close: closeRuntime,
 					};
 				},
@@ -575,6 +586,7 @@ describe("BreadBoard native interactive authority", () => {
 						sessionId: "session-throw",
 						model: BREADBOARD_MODEL,
 						activate: async () => {},
+						start() {},
 						close: closeRuntime,
 					}),
 					createAgentSession: async () =>
@@ -625,6 +637,7 @@ describe("BreadBoard native interactive authority", () => {
 						sessionId: "session-create-failure",
 						model: BREADBOARD_MODEL,
 						activate: async () => {},
+						start() {},
 						close: closeRuntime,
 					}),
 					createAgentSession: async () => {
@@ -714,6 +727,7 @@ describe("BreadBoard native interactive authority", () => {
 						activate: async () => {
 							throw new Error("activation failed");
 						},
+						start() {},
 						close: closeRuntime,
 					}),
 					createAgentSession: async () =>
@@ -1025,6 +1039,9 @@ describe("BreadBoard durable session activation", () => {
 			expect(bridgeOptions?.durableCursor).toEqual({ eventId: "event-2", sequence: 2 });
 			await prepared.activate(manager);
 			await prepared.activate(manager);
+			expect(start).not.toHaveBeenCalled();
+			prepared.start();
+			prepared.start();
 			expect(start).toHaveBeenCalledTimes(1);
 			expect(bridgeOptions?.projectionReceiptEventIds?.has("event-2")).toBe(true);
 			const bindings = manager
@@ -1068,6 +1085,29 @@ describe("BreadBoard durable session activation", () => {
 		manager.appendCustomEntry(BREADBOARD_SESSION_BINDING_CUSTOM_TYPE, binding);
 		await manager.flush();
 		const start = mock(() => {});
+		const advancedReplayFacts: SessionSnapshot = runtimeSnapshot("resume-session", {
+			earliestRetainedSequence: 2,
+			earliestRetainedEventId: "event-2",
+			headSequence: 4,
+			headEventId: "event-4",
+			retainedHistory: "partial",
+		});
+		const advancedReplayContractDigest = await computeSessionReplayDigest({
+			replayRetention: advancedReplayFacts.replayRetention,
+			earliestRetainedSequence: advancedReplayFacts.earliestRetainedSequence,
+			earliestRetainedEventId: advancedReplayFacts.earliestRetainedEventId,
+			headSequence: advancedReplayFacts.headSequence,
+			headEventId: advancedReplayFacts.headEventId,
+			retainedHistory: advancedReplayFacts.retainedHistory,
+		});
+		const advancedSnapshot = runtimeSnapshot("resume-session", {
+			earliestRetainedSequence: 2,
+			earliestRetainedEventId: "event-2",
+			headSequence: 4,
+			headEventId: "event-4",
+			retainedHistory: "partial",
+			sessionReplayContractDigest: advancedReplayContractDigest,
+		});
 		let bridgeOptions: E4AgentStreamBridgeOptions | undefined;
 		const prepared = await prepareConnectedBreadboardRuntime({
 			...TEST_RUNTIME_AUTHORITY,
@@ -1076,14 +1116,7 @@ describe("BreadBoard durable session activation", () => {
 			openSession: async () =>
 				({
 					sessionId: "resume-session",
-					snapshot: async () =>
-						runtimeSnapshot("resume-session", {
-							earliestRetainedSequence: 2,
-							earliestRetainedEventId: "event-2",
-							headSequence: 4,
-							headEventId: "event-4",
-							retainedHistory: "partial",
-						}),
+					snapshot: async () => advancedSnapshot,
 				}) as never,
 			createBridge: options => {
 				bridgeOptions = options;
@@ -1100,6 +1133,8 @@ describe("BreadBoard durable session activation", () => {
 			expect(bridgeOptions?.durableCursor).toEqual({ eventId: "event-2", sequence: 2 });
 			expect(start).not.toHaveBeenCalled();
 			await prepared.activate(manager);
+			expect(start).not.toHaveBeenCalled();
+			prepared.start();
 			expect(start).toHaveBeenCalledTimes(1);
 			expect(
 				manager
@@ -1147,7 +1182,7 @@ describe("BreadBoard durable session activation", () => {
 			await manager.close();
 		}
 	});
-	test("closes the runtime once when bridge start fails during activation", async () => {
+	test("closes the runtime once when deferred bridge start fails", async () => {
 		using tempDir = TempDir.createSync("@breadboard-activation-start-failure-");
 		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 		const closeBridge = mock(async () => {});
@@ -1171,7 +1206,8 @@ describe("BreadBoard durable session activation", () => {
 		});
 
 		try {
-			await expect(prepared.activate(manager)).rejects.toThrow("bridge start failed");
+			await prepared.activate(manager);
+			expect(() => prepared.start()).toThrow("bridge start failed");
 			await prepared.close();
 			expect(closeBridge).toHaveBeenCalledTimes(1);
 			expect(closeSupervisor).toHaveBeenCalledTimes(1);
@@ -1204,7 +1240,7 @@ describe("BreadBoard durable binding rejection", () => {
 
 	test.each([
 		["session conflict", sessionBinding("other", 2, "event-2")],
-		["digest conflict", { ...sessionBinding("session", 2, "event-2"), replayContractDigest: "sha256:other" }],
+		["digest conflict", { ...sessionBinding("session", 2, "event-2"), replayConfigurationDigest: "sha256:other" }],
 		["cursor rollback", sessionBinding("session", 1, "event-1")],
 		["event conflict", sessionBinding("session", 2, "different-event")],
 	] as const)("rejects %s across active-branch bindings", async (_name, latest) => {

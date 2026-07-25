@@ -936,14 +936,28 @@ describe("E4AgentStreamBridge", () => {
 				}
 			},
 		};
+		const persistenceAtCommit: Array<{ sequence: number; roles: string[] }> = [];
+		const releasedProjectionKeys: string[] = [];
 		let agent!: Agent;
 		const bridge = new E4AgentStreamBridge({
 			session: runtime,
 			durableCursor: { eventId: "event-1", sequence: 1 },
-			releaseAgentEvent() {},
-			async projectionCommitted() {},
-			emitAgentEvent: async event => {
-				agent.emitExternalEvent(event);
+			releaseAgentEvent(key) {
+				agent.releaseExternalEvent(key);
+				releasedProjectionKeys.push(key);
+			},
+			async projectionCommitted(cursor) {
+				await sessionManager.flush();
+				persistenceAtCommit.push({
+					sequence: cursor.sequence,
+					roles: sessionManager
+						.getBranch()
+						.filter(entry => entry.type === "message")
+						.map(entry => (entry.type === "message" ? entry.message.role : "unreachable")),
+				});
+			},
+			emitAgentEvent: async (event, key) => {
+				await agent.emitExternalEventAndWait(event, key);
 			},
 			modelPolicy: { kind: "fixed", model },
 		});
@@ -978,6 +992,21 @@ describe("E4AgentStreamBridge", () => {
 			expect(submitted).toHaveLength(1);
 			expect(submitted[0]).toMatchObject({ text: "Inspect the README" });
 			expect(typeof (submitted[0] as StructuredSubmit).clientMessageId).toBe("string");
+			expect(persistenceAtCommit).toContainEqual({ sequence: 5, roles: ["user", "assistant"] });
+			expect(persistenceAtCommit).toContainEqual({
+				sequence: 7,
+				roles: ["user", "assistant", "assistant", "toolResult"],
+			});
+			expect(releasedProjectionKeys).toEqual([
+				"event-5:message_start",
+				"event-5:message_end",
+				"event-6:message_start",
+				"event-6:message_end",
+				"event-6:tool_execution_start",
+				"event-7:tool_execution_end",
+				"event-7:message_start",
+				"event-7:message_end",
+			]);
 			expect(agent.state.messages.map(message => message.role)).toEqual([
 				"user",
 				"assistant",
@@ -2055,5 +2084,160 @@ describe("E4AgentStreamBridge", () => {
 		expect(lifecycle.slice(-2)).toEqual(["commit:6", "submit:2"]);
 		await bridge.close();
 		expect((await secondStream.result()).stopReason).toBe("aborted");
+	});
+
+	test("settles a tool-owning permission cancellation before releasing keys or admitting the next turn", async () => {
+		const submitted: SubmitInput[] = [];
+		const firstSubmitted = Promise.withResolvers<void>();
+		const cancellationAccepted = Promise.withResolvers<void>();
+		const terminalProcessed = Promise.withResolvers<void>();
+		const secondSubmitted = Promise.withResolvers<void>();
+		const projectedKeys: string[] = [];
+		const releasedKeys: string[] = [];
+		const commits: Array<{ eventId: string; sequence: number }> = [];
+		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const secondReceipt: SubmitReceipt = {
+			...receipt,
+			clientMessageId: "client-message-2" as ClientMessageId,
+			inputId: "input-2" as SubmitReceipt["inputId"],
+			turnId: "turn-2" as SubmitReceipt["turnId"],
+		};
+		const session: OpenedSessionRuntime = {
+			...openedSession([], submitted),
+			async submit(input) {
+				submitted.push(input);
+				if (submitted.length === 1) {
+					firstSubmitted.resolve();
+					return receipt;
+				}
+				secondSubmitted.resolve();
+				return secondReceipt;
+			},
+			async cancel(request) {
+				cancelled.push(request);
+				if (String(request.turnId) === String(receipt.turnId)) cancellationAccepted.resolve();
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				await firstSubmitted.promise;
+				yield started;
+				yield wireEvent(3, "tool_call", {
+					call_id: "permission-tool",
+					tool: "edit",
+					arguments: { path: "README.md" },
+					action: "write",
+					diff_preview: null,
+					progress: null,
+				});
+				yield wireEvent(4, "permission_request", {
+					request_id: "permission-after-tool",
+					tool: "edit",
+					kind: "write",
+					summary: "Update README.md",
+					default_scope: null,
+					rewindable: true,
+				});
+				await cancellationAccepted.promise;
+				yield wireEvent(5, "turn_cancelled", { reason: "user_requested" });
+				terminalProcessed.resolve();
+				await new Promise<void>(resolve =>
+					request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			async emitAgentEvent(_event, key) {
+				projectedKeys.push(key);
+			},
+			releaseAgentEvent(key) {
+				releasedKeys.push(key);
+			},
+			async projectionCommitted(cursor) {
+				commits.push(cursor);
+			},
+			modelPolicy: { kind: "fixed", model },
+			requestPermission: async () => "cancel",
+		});
+
+		const firstStream = await startBridgeStream(bridge, model, context);
+		expect((await firstStream.result()).stopReason).toBe("aborted");
+		await terminalProcessed.promise;
+		expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "user_requested" }]);
+		expect(commits).toEqual([{ eventId: "event-2", sequence: 2 }]);
+		expect(releasedKeys).toEqual([]);
+		const secondStream = await bridge.stream(model, context);
+		await secondSubmitted.promise;
+		expect(commits).toEqual([
+			{ eventId: "event-2", sequence: 2 },
+			{ eventId: "event-5", sequence: 5 },
+		]);
+		expect(projectedKeys).toEqual(["event-3:message_start", "event-3:message_end", "event-3:tool_execution_start"]);
+		expect(releasedKeys).toEqual(projectedKeys);
+		await bridge.close();
+		expect((await secondStream.result()).stopReason).toBe("aborted");
+	});
+
+	test("answers one adopted replay permission before advancing its durable cursor", async () => {
+		const permissionAnswered = Promise.withResolvers<void>();
+		const terminalProcessed = Promise.withResolvers<void>();
+		const lifecycle: string[] = [];
+		const commits: Array<{ eventId: string; sequence: number }> = [];
+		const responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]> = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async respondPermission(request) {
+				lifecycle.push("respond");
+				responded.push(request);
+				permissionAnswered.resolve();
+				return {
+					requestId: request.requestId as PermissionDecisionReceipt["requestId"],
+					decision: request.decision,
+				};
+			},
+			async *events(request) {
+				yield started;
+				yield wireEvent(3, "permission_request", {
+					request_id: "adopted-permission",
+					tool: "read",
+					kind: "read",
+					summary: "Inspect README.md",
+					default_scope: null,
+					rewindable: true,
+				});
+				await permissionAnswered.promise;
+				yield wireEvent(4, "turn_completed", {});
+				terminalProcessed.resolve();
+				await new Promise<void>(resolve =>
+					request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			async emitAgentEvent() {},
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				commits.push(cursor);
+				lifecycle.push(`commit:${cursor.sequence}`);
+			},
+			modelPolicy: { kind: "fixed", model },
+			requestPermission: async () => {
+				lifecycle.push("prompt");
+				return "allow";
+			},
+		});
+
+		bridge.start();
+		await terminalProcessed.promise;
+		expect(responded).toEqual([{ requestId: "adopted-permission", decision: "allow" }]);
+		expect(commits).toEqual([
+			{ eventId: "event-2", sequence: 2 },
+			{ eventId: "event-3", sequence: 3 },
+			{ eventId: "event-4", sequence: 4 },
+		]);
+		expect(lifecycle).toEqual(["commit:2", "prompt", "respond", "commit:3", "commit:4"]);
+		await bridge.close();
 	});
 });

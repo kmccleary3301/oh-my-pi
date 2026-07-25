@@ -55,6 +55,7 @@ interface TurnSink {
 	messageText: string;
 	started: boolean;
 	textStarted: boolean;
+	failureDelivered: boolean;
 	terminal: boolean;
 	pendingTextCompletion: Extract<LoggedSessionEvent, { readonly kind: "assistant_text_completed" }> | undefined;
 }
@@ -121,7 +122,7 @@ export class E4AgentStreamBridge {
 	readonly #submissionsInFlight = new Set<Promise<void>>();
 	readonly #undurableSinks = new Set<TurnSink>();
 	readonly #deferredProjectionKeys: string[] = [];
-	readonly #cancellationsInFlight = new Set<Promise<void>>();
+	readonly #cancellationsInFlight = new Set<Promise<boolean>>();
 	#started = false;
 	#closed = false;
 	#observeFailure: Error | undefined;
@@ -194,6 +195,7 @@ export class E4AgentStreamBridge {
 			messageText: "",
 			started: false,
 			textStarted: false,
+			failureDelivered: false,
 			terminal: false,
 			pendingTextCompletion: undefined,
 		};
@@ -366,8 +368,9 @@ export class E4AgentStreamBridge {
 				await this.#projectToolResult(sink, event);
 				return;
 			case "permission_requested":
-				await this.#handlePermissionRequest(sink, event);
-				if (!sink.messageText) await this.#commit(event, []);
+				if ((await this.#handlePermissionRequest(sink, event)) && !sink.messageText) {
+					await this.#commit(event, []);
+				}
 				return;
 			case "turn_completed":
 				await this.#completeSink(sink, event);
@@ -381,14 +384,13 @@ export class E4AgentStreamBridge {
 			case "runtime_error_observed": {
 				const message = `BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`;
 				if (sink.adopted) throw new Error(message);
-				sink.stream?.push({
-					type: "error",
-					reason: "error",
-					error: assistantMessage(sink.model, sink.text, "error", message, String(event.eventId)),
-				});
+				this.#failSinkPendingTerminal(sink, message, "error");
+				const cancellation = this.#trackCancellation(sink, "timeout");
+				if (cancellation && !(await cancellation)) return;
+				this.#undurableSinks.delete(sink);
+				this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 				this.#terminalCursor = cursorFor(event);
 				sink.terminal = true;
-				this.#cancelSink(sink, "timeout");
 				this.#removeSink(sink);
 				return;
 			}
@@ -490,32 +492,34 @@ export class E4AgentStreamBridge {
 	async #handlePermissionRequest(
 		sink: TurnSink,
 		event: Extract<LoggedSessionEvent, { readonly kind: "permission_requested" }>,
-	): Promise<void> {
+	): Promise<boolean> {
 		const requestPermission = this.#requestPermission;
 		if (!requestPermission) {
-			this.#failSink(sink, "BreadBoard permission request requires OMP permission UI wiring", "error");
-			this.#cancelSink(sink, "user_requested");
-			return;
+			this.#failSinkPendingTerminal(
+				sink,
+				"BreadBoard permission request requires OMP permission UI wiring",
+				"error",
+			);
+			return this.#cancelAfterPermissionFailure(sink);
 		}
 		let decision: E4PermissionDecision;
 		try {
 			decision = await requestPermission(event.payload, sink.permissionAbort.signal);
 		} catch (error) {
-			this.#failSink(sink, safeErrorMessage(error), "error");
-			this.#cancelSink(sink, "user_requested");
-			return;
+			this.#failSinkPendingTerminal(sink, safeErrorMessage(error), "error");
+			return this.#cancelAfterPermissionFailure(sink);
 		}
-		if (sink.terminal || sink.permissionAbort.signal.aborted || this.#closed) return;
+		if (sink.terminal || sink.permissionAbort.signal.aborted || this.#closed) return false;
 		if (decision === "cancel") {
-			this.#failSink(sink, "BreadBoard permission request cancelled in OMP", "aborted");
-			this.#cancelSink(sink, "user_requested");
-			return;
+			this.#failSinkPendingTerminal(sink, "BreadBoard permission request cancelled in OMP", "aborted");
+			return this.#cancelAfterPermissionFailure(sink);
 		}
 		try {
 			await this.#session.respondPermission({ requestId: event.payload.requestId, decision });
+			return true;
 		} catch (error) {
-			this.#failSink(sink, safeErrorMessage(error), "error");
-			this.#cancelSink(sink, "user_requested");
+			this.#failSinkPendingTerminal(sink, safeErrorMessage(error), "error");
+			return this.#cancelAfterPermissionFailure(sink);
 		}
 	}
 
@@ -587,6 +591,7 @@ export class E4AgentStreamBridge {
 			}
 			sink.stream?.push({ type: "done", reason: "stop", message });
 			this.#undurableSinks.delete(sink);
+			this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 			this.#terminalCursor = cursorFor(event);
 		}
 		sink.terminal = true;
@@ -607,12 +612,15 @@ export class E4AgentStreamBridge {
 			this.#undurableSinks.delete(sink);
 			await this.#commit(event, sink.pendingProjectionKeys.splice(0));
 		} else {
-			sink.stream?.push({
-				type: "error",
-				reason,
-				error: assistantMessage(sink.model, sink.text, reason, message, String(event.eventId)),
-			});
+			if (!sink.failureDelivered) {
+				sink.stream?.push({
+					type: "error",
+					reason,
+					error: assistantMessage(sink.model, sink.text, reason, message, String(event.eventId)),
+				});
+			}
 			this.#undurableSinks.delete(sink);
+			this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 			this.#terminalCursor = cursorFor(event);
 		}
 		sink.terminal = true;
@@ -649,23 +657,43 @@ export class E4AgentStreamBridge {
 		for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
 	}
 
-	async #cancel(turnId: TurnId, reason: "user_requested" | "timeout"): Promise<void> {
+	async #cancel(turnId: TurnId, reason: "user_requested" | "timeout"): Promise<boolean> {
 		try {
 			await this.#session.cancel({ turnId, reason });
+			return true;
 		} catch (error) {
+			const message = safeErrorMessage(error);
 			const sink = this.#sinks.get(String(turnId));
-			if (sink) this.#failSink(sink, safeErrorMessage(error), "error");
+			if (sink) this.#failSinkPendingTerminal(sink, message, "error");
+			this.#invalidateBridge(`BreadBoard turn cancellation failed: ${message}`);
+			return false;
 		}
 	}
 
-	#cancelSink(sink: TurnSink, reason: "user_requested" | "timeout"): void {
-		if (sink.cancelRequested || sink.turnId === undefined || sink.adopted) return;
+	#trackCancellation(sink: TurnSink, reason: "user_requested" | "timeout"): Promise<boolean> | undefined {
+		if (sink.cancelRequested || sink.turnId === undefined) return undefined;
 		sink.cancelRequested = true;
-		let cancellation!: Promise<void>;
+		let cancellation!: Promise<boolean>;
 		cancellation = this.#cancel(sink.turnId, reason).finally(() => {
 			this.#cancellationsInFlight.delete(cancellation);
 		});
 		this.#cancellationsInFlight.add(cancellation);
+		return cancellation;
+	}
+
+	async #cancelAfterPermissionFailure(sink: TurnSink): Promise<boolean> {
+		const cancellation = this.#trackCancellation(sink, "user_requested");
+		if (!cancellation) return false;
+		if (!sink.adopted) {
+			void cancellation;
+			return false;
+		}
+		return cancellation;
+	}
+
+	#cancelSink(sink: TurnSink, reason: "user_requested" | "timeout"): void {
+		if (sink.adopted) return;
+		void this.#trackCancellation(sink, reason);
 	}
 
 	#invalidateBridge(message: string): void {
@@ -673,8 +701,8 @@ export class E4AgentStreamBridge {
 		this.#observeFailure = new Error(message);
 		this.#observeAbort.abort();
 		for (const sink of [...this.#sinks.values(), ...this.#submittingSinks]) {
-			this.#failSink(sink, message, "error");
 			this.#cancelSink(sink, "timeout");
+			this.#failSink(sink, message, "error");
 		}
 		this.#sinks.clear();
 		this.#submittedTurnIds.clear();
@@ -689,6 +717,12 @@ export class E4AgentStreamBridge {
 		sink.terminal = true;
 		sink.stream?.push({ type: "error", reason, error: assistantMessage(sink.model, sink.text, reason, message) });
 		this.#removeSink(sink);
+	}
+
+	#failSinkPendingTerminal(sink: TurnSink, message: string, reason: "error" | "aborted"): void {
+		if (sink.terminal || sink.failureDelivered) return;
+		sink.failureDelivered = true;
+		sink.stream?.push({ type: "error", reason, error: assistantMessage(sink.model, sink.text, reason, message) });
 	}
 
 	#pushStandaloneError(

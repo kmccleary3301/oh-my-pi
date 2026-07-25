@@ -1067,9 +1067,9 @@ const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 export const BREADBOARD_SESSION_BINDING_CUSTOM_TYPE = "breadboard.session-binding";
 
 export interface BreadboardSessionBindingData {
-	readonly schemaVersion: "breadboard.session-binding.v1";
+	readonly schemaVersion: "breadboard.session-binding.v2";
 	readonly sessionId: string;
-	readonly replayContractDigest: string;
+	readonly replayConfigurationDigest: string;
 	readonly cursor: {
 		readonly eventId: string | null;
 		readonly sequence: number;
@@ -1078,7 +1078,7 @@ export interface BreadboardSessionBindingData {
 
 type BreadboardSessionBindingManager = Pick<SessionManager, "getBranch">;
 
-const BREADBOARD_SESSION_BINDING_SCHEMA_VERSION = "breadboard.session-binding.v1";
+const BREADBOARD_SESSION_BINDING_SCHEMA_VERSION = "breadboard.session-binding.v2";
 
 function isExactSafeString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.trim() === value && !/[\p{Cc}]/u.test(value);
@@ -1096,7 +1096,7 @@ function parseBreadboardSessionBindingData(value: unknown): BreadboardSessionBin
 		Object.keys(data).length !== 4 ||
 		data.schemaVersion !== BREADBOARD_SESSION_BINDING_SCHEMA_VERSION ||
 		!isExactSafeString(data.sessionId) ||
-		!isExactSafeString(data.replayContractDigest) ||
+		!isExactSafeString(data.replayConfigurationDigest) ||
 		!data.cursor ||
 		typeof data.cursor !== "object" ||
 		Array.isArray(data.cursor)
@@ -1113,7 +1113,7 @@ function parseBreadboardSessionBindingData(value: unknown): BreadboardSessionBin
 	return {
 		schemaVersion: BREADBOARD_SESSION_BINDING_SCHEMA_VERSION,
 		sessionId: data.sessionId,
-		replayContractDigest: data.replayContractDigest,
+		replayConfigurationDigest: data.replayConfigurationDigest,
 		cursor: { eventId: cursor.eventId as string | null, sequence: cursor.sequence as number },
 	};
 }
@@ -1128,7 +1128,7 @@ function readBreadboardSessionBinding(
 		if (
 			binding &&
 			(candidate.sessionId !== binding.sessionId ||
-				candidate.replayContractDigest !== binding.replayContractDigest ||
+				candidate.replayConfigurationDigest !== binding.replayConfigurationDigest ||
 				candidate.cursor.sequence < binding.cursor.sequence ||
 				(candidate.cursor.sequence === binding.cursor.sequence &&
 					candidate.cursor.eventId !== binding.cursor.eventId))
@@ -1249,6 +1249,7 @@ export interface PreparedBreadboardRuntime {
 	readonly sessionId: string;
 	readonly model: Model;
 	activate(sessionManager: SessionManager): Promise<void>;
+	start(): void;
 	close(): Promise<void>;
 }
 
@@ -1411,7 +1412,7 @@ function validateBreadboardSnapshot(
 	resumeBinding: BreadboardSessionBindingData | undefined,
 ): BreadboardSessionBindingData {
 	const sessionId: unknown = snapshot.sessionId;
-	const replayContractDigest: unknown = snapshot.sessionReplayContractDigest;
+	const replayConfigurationDigest: unknown = snapshot.replayRetention.configurationDigest;
 	const headSequence = snapshot.headSequence;
 	const headEventId: unknown = snapshot.headEventId;
 	const earliestRetainedSequence = snapshot.earliestRetainedSequence;
@@ -1420,7 +1421,7 @@ function validateBreadboardSnapshot(
 		!isExactSafeString(openedSessionId) ||
 		!isExactSafeString(sessionId) ||
 		sessionId !== openedSessionId ||
-		!isExactSafeString(replayContractDigest) ||
+		!isExactSafeString(replayConfigurationDigest) ||
 		!Number.isSafeInteger(headSequence) ||
 		headSequence < 0 ||
 		(headSequence === 0 ? headEventId !== null : !isExactSafeString(headEventId)) ||
@@ -1447,13 +1448,13 @@ function validateBreadboardSnapshot(
 		return {
 			schemaVersion: BREADBOARD_SESSION_BINDING_SCHEMA_VERSION,
 			sessionId,
-			replayContractDigest,
+			replayConfigurationDigest,
 			cursor: { eventId: headEventId as string | null, sequence: headSequence },
 		};
 	}
 	if (
 		resumeBinding.sessionId !== sessionId ||
-		resumeBinding.replayContractDigest !== replayContractDigest ||
+		resumeBinding.replayConfigurationDigest !== replayConfigurationDigest ||
 		resumeBinding.cursor.sequence > headSequence ||
 		(resumeBinding.cursor.sequence === headSequence && resumeBinding.cursor.eventId !== headEventId) ||
 		(resumeBinding.cursor.sequence > 0 &&
@@ -1487,6 +1488,7 @@ export async function prepareConnectedBreadboardRuntime(
 	let activationPromise: Promise<void> | undefined;
 	let lifecycleFailure: BreadboardLifecycleFailureResult | undefined;
 	let activatedSessionManager: SessionManager | undefined;
+	let runtimeStarted = false;
 	const projectionReceiptEventIds = new Set<string>();
 
 	const closeSupervisor = (): Promise<void> => {
@@ -1567,7 +1569,7 @@ export async function prepareConnectedBreadboardRuntime(
 			if (
 				!current ||
 				current.sessionId !== initialBinding.sessionId ||
-				current.replayContractDigest !== initialBinding.replayContractDigest ||
+				current.replayConfigurationDigest !== initialBinding.replayConfigurationDigest ||
 				!isExactSafeString(cursor.eventId) ||
 				!Number.isSafeInteger(cursor.sequence) ||
 				cursor.sequence <= 0 ||
@@ -1607,7 +1609,7 @@ export async function prepareConnectedBreadboardRuntime(
 						if (
 							!existingBinding ||
 							existingBinding.sessionId !== initialBinding.sessionId ||
-							existingBinding.replayContractDigest !== initialBinding.replayContractDigest ||
+							existingBinding.replayConfigurationDigest !== initialBinding.replayConfigurationDigest ||
 							existingBinding.cursor.sequence !== initialBinding.cursor.sequence ||
 							existingBinding.cursor.eventId !== initialBinding.cursor.eventId
 						) {
@@ -1634,7 +1636,6 @@ export async function prepareConnectedBreadboardRuntime(
 					}
 					activatedSessionManager = sessionManager;
 					throwIfLifecycleFailed();
-					bridge!.start();
 				} catch (error) {
 					await closePreparedRuntime();
 					throw error;
@@ -1642,11 +1643,21 @@ export async function prepareConnectedBreadboardRuntime(
 			})();
 			return activationPromise;
 		};
+		const start = (): void => {
+			if (!activatedSessionManager) {
+				throw new Error("BreadBoard runtime cannot start before AgentSession activation");
+			}
+			if (runtimeStarted) return;
+			throwIfLifecycleFailed();
+			bridge!.start();
+			runtimeStarted = true;
+		};
 		return {
 			stream: bridge.stream,
 			sessionId: initialBinding.sessionId,
 			model,
 			activate,
+			start,
 			close: closePreparedRuntime,
 		};
 	} catch (error) {
@@ -2210,6 +2221,7 @@ export async function runRootCommand(
 			const setInteractiveToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean): void => {
 				breadboardUIContext = hasUI ? uiContext : undefined;
 				setToolUIContext(uiContext, hasUI);
+				if (hasUI) preparedBreadboardRuntime?.start();
 			};
 
 			// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
