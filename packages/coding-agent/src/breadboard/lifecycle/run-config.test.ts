@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import type { EngineArtifact } from "./run-config";
-import { BreadboardRunConfigError, loadSelectedBreadboardConfig, resolveBreadboardRunConfig } from "./run-config";
+import {
+	BreadboardRunConfigError,
+	loadSelectedBreadboardConfig,
+	parseSelectedBreadboardConfig,
+	resolveBreadboardRunConfig,
+} from "./run-config";
 
 const workspaceId: `workspace:v1:sha256:${string}` = `workspace:v1:sha256:${"a".repeat(64)}`;
 const artifact: EngineArtifact = {
@@ -27,6 +32,72 @@ function configError(run: () => unknown): BreadboardRunConfigError {
 	}
 	throw new Error("expected BreadboardRunConfigError");
 }
+
+describe("parseSelectedBreadboardConfig", () => {
+	test("preserves supported own enumerable settings", () => {
+		const selected = {
+			engineMode: "local-external",
+			baseUrl: "http://127.0.0.1:7777",
+			auth: { kind: "keychain-reference", reference: "breadboard-test" },
+			tls: { kind: "local-loopback" },
+			engineArtifact: artifact,
+			workspaceId,
+			startupTimeoutMs: 5000,
+			requestTimeoutMs: 9000,
+			ownerExitPolicy: "attached",
+			sessionConfigPath: "/tmp/session.yaml",
+		};
+
+		expect(parseSelectedBreadboardConfig(selected)).toEqual(selected);
+	});
+
+	test("rejects an unsupported own enumerable field before reading supported values", () => {
+		let engineModeRead = false;
+		const selected = {
+			get engineMode() {
+				engineModeRead = true;
+				return "off";
+			},
+			engineMod: "off",
+		};
+
+		const error = configError(() => parseSelectedBreadboardConfig(selected));
+		expect(error).toMatchObject({ code: "invalid_selected_config", field: "mode" });
+		expect(error.message).toContain('"engineMod"');
+		expect(engineModeRead).toBe(false);
+	});
+
+	test("ignores inherited fields rather than rejecting or promoting them", () => {
+		const selected = Object.assign(
+			Object.create({
+				engineMode: "remote",
+				engineMod: "remote",
+			}) as Record<string, unknown>,
+			{ baseUrl: "http://127.0.0.1:7777" },
+		);
+
+		expect(parseSelectedBreadboardConfig(selected)).toEqual({ baseUrl: "http://127.0.0.1:7777" });
+	});
+
+	test("rejects arrays and own enumerable symbol fields", () => {
+		expect(configError(() => parseSelectedBreadboardConfig([])).code).toBe("invalid_selected_config");
+
+		const unsupported = Symbol('engineMod"\n');
+		const error = configError(() => parseSelectedBreadboardConfig({ engineMode: "off", [unsupported]: true }));
+		expect(error.code).toBe("invalid_selected_config");
+		expect(error.message).toContain(JSON.stringify(String(unsupported)));
+	});
+
+	test("ignores non-enumerable fields", () => {
+		const selected = { engineMode: "off" };
+		Object.defineProperties(selected, {
+			engineMod: { enumerable: false, value: "remote" },
+			requestTimeoutMs: { enumerable: false, value: 9000 },
+		});
+
+		expect(parseSelectedBreadboardConfig(selected)).toEqual({ engineMode: "off" });
+	});
+});
 
 describe("resolveBreadboardRunConfig", () => {
 	test("applies independent CLI, environment, selected-config, and derived precedence", () => {

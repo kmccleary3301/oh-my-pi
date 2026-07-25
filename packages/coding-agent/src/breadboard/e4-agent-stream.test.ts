@@ -127,7 +127,8 @@ function permissionSession(
 			},
 			async *events(request) {
 				yield started;
-				yield wireEvent(3, "permission_request", {
+				yield wireEvent(3, "assistant.message.delta", { text: "partial output" });
+				yield wireEvent(4, "permission_request", {
 					request_id: "permission-1",
 					tool: "edit",
 					kind: "write",
@@ -143,8 +144,8 @@ function permissionSession(
 					),
 				]);
 				if (request?.signal?.aborted) return;
-				yield wireEvent(4, "assistant.message.delta", { text: "permission handled" });
-				yield wireEvent(5, "turn_completed", {});
+				yield wireEvent(5, "assistant.message.delta", { text: "permission handled" });
+				yield wireEvent(6, "turn_completed", {});
 			},
 		},
 	};
@@ -260,6 +261,83 @@ describe("E4AgentStreamBridge", () => {
 		expect(messageEnd.message).toEqual(messageStart.message);
 		await bridge.close();
 	});
+	test("projects multiple assistant messages around tools exactly once and correlates nullable tool names by call ID", async () => {
+		const submitted: SubmitInput[] = [];
+		const agentEvents: AgentEvent[] = [];
+		const firstCall = wireEvent(6, "tool_call", {
+			call_id: "call-1",
+			tool: "read",
+			arguments: { path: "README.md" },
+			action: null,
+			diff_preview: null,
+			progress: null,
+		});
+		const firstResult = wireEvent(8, "tool.result", {
+			call_id: "call-1",
+			tool: null,
+			status: "completed",
+			error: false,
+			result: "read result",
+			artifact_ref: null,
+		});
+		const secondCompletion = wireEvent(12, "assistant.message.end", { text: "After." });
+		const events = [
+			started,
+			wireEvent(3, "assistant.message.start", { message_id: "message-1" }),
+			wireEvent(4, "assistant.message.delta", { text: "Before." }),
+			wireEvent(5, "assistant.message.end", { text: "Before." }),
+			firstCall,
+			firstCall,
+			wireEvent(7, "tool_call", {
+				call_id: "call-2",
+				tool: "edit",
+				arguments: { path: "README.md" },
+				action: null,
+				diff_preview: null,
+				progress: null,
+			}),
+			firstResult,
+			firstResult,
+			wireEvent(9, "tool.result", {
+				call_id: "call-2",
+				tool: null,
+				status: "completed",
+				error: false,
+				result: "edit result",
+				artifact_ref: null,
+			}),
+			wireEvent(10, "assistant.message.start", { message_id: "message-2" }),
+			wireEvent(11, "assistant.message.delta", { text: "After." }),
+			secondCompletion,
+			secondCompletion,
+			wireEvent(13, "tool.result", {
+				call_id: "uncorrelated-call",
+				tool: null,
+				status: "completed",
+				error: false,
+				result: "unknown result",
+				artifact_ref: null,
+			}),
+			wireEvent(14, "turn_completed", {}),
+		];
+		const bridge = new E4AgentStreamBridge({
+			session: openedSession(events, submitted),
+			replayHeadSequence: 1,
+			emitAgentEvent: event => agentEvents.push(event),
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const stream = await bridge.stream(model, context);
+		const result = await stream.result();
+
+		expect(result.content).toEqual([{ type: "text", text: "Before.After." }]);
+		expect(agentEvents.filter(event => event.type === "tool_execution_start")).toHaveLength(2);
+		const ends = agentEvents.filter(event => event.type === "tool_execution_end");
+		expect(ends).toHaveLength(3);
+		expect(ends.map(event => event.toolName)).toEqual(["read", "edit", "tool"]);
+		expect(agentEvents.filter(event => event.type === "message_end")).toHaveLength(3);
+		await bridge.close();
+	});
 	test("ignores duplicate and out-of-order event sequences for exact-once SSE projection", async () => {
 		const submitted: SubmitInput[] = [];
 		const agentEvents: AgentEvent[] = [];
@@ -312,6 +390,67 @@ describe("E4AgentStreamBridge", () => {
 			"message_end",
 		]);
 		expect(agentEvents.filter(event => event.type === "message_end")).toHaveLength(1);
+		await bridge.close();
+	});
+	for (const terminal of [
+		{
+			label: "failure",
+			event: wireEvent(5, "turn_failed", {
+				error: { code: "turn_execution_failed", message: "[redacted]" },
+			}),
+			stopReason: "error",
+		},
+		{
+			label: "cancellation",
+			event: wireEvent(5, "turn_cancelled", { reason: "user_requested" }),
+			stopReason: "aborted",
+		},
+	] as const) {
+		test(`preserves partial assistant text on turn ${terminal.label}`, async () => {
+			const bridge = new E4AgentStreamBridge({
+				session: openedSession(
+					[
+						started,
+						wireEvent(3, "assistant.message.start", { message_id: "message-1" }),
+						wireEvent(4, "assistant.message.delta", { text: "partial output" }),
+						terminal.event,
+					],
+					[],
+				),
+				replayHeadSequence: 0,
+				emitAgentEvent() {},
+				modelPolicy: { kind: "fixed", model: model },
+			});
+
+			const stream = await bridge.stream(model, context);
+			const result = await stream.result();
+
+			expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
+			expect(result.stopReason).toBe(terminal.stopReason);
+			await bridge.close();
+		});
+	}
+
+	test("preserves partial assistant text when the event observer ends", async () => {
+		const bridge = new E4AgentStreamBridge({
+			session: openedSession(
+				[
+					started,
+					wireEvent(3, "assistant.message.start", { message_id: "message-1" }),
+					wireEvent(4, "assistant.message.delta", { text: "partial output" }),
+				],
+				[],
+			),
+			replayHeadSequence: 0,
+			emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		const stream = await bridge.stream(model, context);
+		const result = await stream.result();
+
+		expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
+		expect(result.stopReason).toBe("error");
 		await bridge.close();
 	});
 
@@ -385,8 +524,9 @@ describe("E4AgentStreamBridge", () => {
 		expect(result.content).toEqual([{ type: "text", text: "raced" }]);
 		await bridge.close();
 	});
-	test("fails and cancels an active admitted turn before closing the SDK session", async () => {
+	test("preserves partial text while failing and cancelling an active turn before closing the SDK session", async () => {
 		const submitObserved = Promise.withResolvers<void>();
+		const partialObserved = Promise.withResolvers<void>();
 		const lifecycle: string[] = [];
 		const session: OpenedSessionRuntime = {
 			...openedSession([], []),
@@ -399,6 +539,9 @@ describe("E4AgentStreamBridge", () => {
 				return {} as CancellationReceipt;
 			},
 			async *events(request) {
+				yield started;
+				yield wireEvent(3, "assistant.message.delta", { text: "partial output" });
+				partialObserved.resolve();
 				if (!request?.signal?.aborted) {
 					await new Promise<void>(resolve =>
 						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
@@ -419,10 +562,12 @@ describe("E4AgentStreamBridge", () => {
 		const stream = await bridge.stream(model, context);
 		await submitObserved.promise;
 		await drainMicrotasks();
+		await partialObserved.promise;
 		await bridge.close();
 
 		const result = await stream.result();
 		expect(result.stopReason).toBe("aborted");
+		expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
 		expect(lifecycle).toEqual([`cancel:${String(receipt.turnId)}`, "close"]);
 	});
 
@@ -843,7 +988,7 @@ describe("E4AgentStreamBridge", () => {
 				await permission.actionObserved;
 				const result = await stream.result();
 
-				expect(result.content).toEqual([{ type: "text", text: "permission handled" }]);
+				expect(result.content).toEqual([{ type: "text", text: "partial outputpermission handled" }]);
 				expect(responded).toEqual([{ requestId: "permission-1", decision }]);
 				expect(cancelled).toEqual([]);
 			} finally {
@@ -876,6 +1021,7 @@ describe("E4AgentStreamBridge", () => {
 			const result = await stream.result();
 
 			expect(result.stopReason).toBe("aborted");
+			expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
 			expect(responded).toEqual([]);
 			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "user_requested" }]);
 		} finally {
@@ -907,6 +1053,7 @@ describe("E4AgentStreamBridge", () => {
 			const result = await stream.result();
 
 			expect(result.stopReason).toBe("error");
+			expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
 			expect(result.errorMessage).toBe("permission UI failed");
 			expect(responded).toEqual([]);
 			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "user_requested" }]);
@@ -934,6 +1081,7 @@ describe("E4AgentStreamBridge", () => {
 			const result = await stream.result();
 
 			expect(result.stopReason).toBe("error");
+			expect(result.content).toEqual([{ type: "text", text: "partial output" }]);
 			expect(result.errorMessage).toContain("permission UI");
 			expect(responded).toEqual([]);
 			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "user_requested" }]);

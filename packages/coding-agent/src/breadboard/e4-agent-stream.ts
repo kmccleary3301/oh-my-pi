@@ -36,9 +36,11 @@ interface TurnSink {
 	readonly model: E4BackendModelAttribution;
 	readonly stream: AssistantMessageEventStream;
 	readonly permissionAbort: AbortController;
+	readonly toolNamesByCallId: Map<string, string>;
 	turnId: TurnId | undefined;
 	cancelRequested: boolean;
 	text: string;
+	messageText: string;
 	started: boolean;
 	textStarted: boolean;
 	terminal: boolean;
@@ -168,9 +170,11 @@ export class E4AgentStreamBridge {
 			model: backendModel,
 			stream,
 			permissionAbort: new AbortController(),
+			toolNamesByCallId: new Map(),
 			turnId: undefined,
 			cancelRequested: false,
 			text: "",
+			messageText: "",
 			started: false,
 			textStarted: false,
 			terminal: false,
@@ -291,7 +295,10 @@ export class E4AgentStreamBridge {
 		if (sink.terminal) return;
 		switch (event.kind) {
 			case "turn_started":
+				this.#ensureStarted(sink);
+				return;
 			case "assistant_message_started":
+				sink.messageText = "";
 				this.#ensureStarted(sink);
 				return;
 			case "assistant_text_delta":
@@ -299,15 +306,16 @@ export class E4AgentStreamBridge {
 				return;
 			case "assistant_text_completed": {
 				const complete = event.payload.text;
-				if (complete === null || complete === sink.text) return;
-				if (!complete.startsWith(sink.text)) {
+				if (complete === null || complete === sink.messageText) return;
+				if (!complete.startsWith(sink.messageText)) {
 					this.#failSink(sink, "BreadBoard assistant stream did not match its completion", "error");
 					return;
 				}
-				this.#appendText(sink, complete.slice(sink.text.length));
+				this.#appendText(sink, complete.slice(sink.messageText.length));
 				return;
 			}
 			case "tool_called":
+				sink.toolNamesByCallId.set(String(event.payload.callId), event.payload.tool);
 				this.#emitAgentEvent({
 					type: "tool_execution_start",
 					toolCallId: String(event.payload.callId),
@@ -318,7 +326,8 @@ export class E4AgentStreamBridge {
 				return;
 			case "tool_result_observed": {
 				const toolCallId = String(event.payload.callId);
-				const toolName = event.payload.tool ?? "tool";
+				const toolName = event.payload.tool ?? sink.toolNamesByCallId.get(toolCallId) ?? "tool";
+				sink.toolNamesByCallId.delete(toolCallId);
 				const result = toolResult(event.payload.result, event.payload.artifactRef);
 				const isError = event.payload.error;
 				this.#emitAgentEvent({
@@ -413,6 +422,7 @@ export class E4AgentStreamBridge {
 			});
 		}
 		sink.text += delta;
+		sink.messageText += delta;
 		sink.stream.push({
 			type: "text_delta",
 			contentIndex: 0,
@@ -436,7 +446,7 @@ export class E4AgentStreamBridge {
 	#failSink(sink: TurnSink, message: string, reason: "error" | "aborted"): void {
 		if (sink.terminal) return;
 		sink.terminal = true;
-		sink.stream.push({ type: "error", reason, error: assistantMessage(sink.model, "", reason, message) });
+		sink.stream.push({ type: "error", reason, error: assistantMessage(sink.model, sink.text, reason, message) });
 		this.#removeSink(sink);
 	}
 
@@ -451,6 +461,8 @@ export class E4AgentStreamBridge {
 
 	#removeSink(sink: TurnSink): void {
 		sink.permissionAbort.abort();
+		sink.toolNamesByCallId.clear();
+		sink.messageText = "";
 		for (const [turnId, candidate] of this.#sinks) {
 			if (candidate !== sink) continue;
 			this.#sinks.delete(turnId);

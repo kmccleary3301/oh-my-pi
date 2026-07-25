@@ -132,6 +132,10 @@ function hasOwn(value: object, key: PropertyKey): boolean {
 	return Object.hasOwn(value, key);
 }
 
+function isOwnEnumerable(value: object, key: PropertyKey): boolean {
+	return Object.prototype.propertyIsEnumerable.call(value, key);
+}
+
 function pick<T>(
 	cli: T | undefined,
 	environment: T | undefined,
@@ -570,17 +574,28 @@ export function parseSelectedBreadboardConfig(breadboard: unknown): SelectedBrea
 	if (typeof breadboard !== "object" || breadboard === null || Array.isArray(breadboard)) {
 		fail("invalid_selected_config", "mode", "selected OMP breadboard config must be an object");
 	}
+	for (const key of Reflect.ownKeys(breadboard)) {
+		if (!isOwnEnumerable(breadboard, key)) continue;
+		if (typeof key !== "string" || !SELECTED_CONFIG_FIELDS.has(key)) {
+			fail(
+				"invalid_selected_config",
+				"mode",
+				`selected OMP breadboard config contains unsupported field ${JSON.stringify(String(key))}`,
+			);
+		}
+	}
+	const selected = breadboard as Record<string, unknown>;
 	return {
-		...("engineMode" in breadboard ? { engineMode: breadboard.engineMode } : {}),
-		...("baseUrl" in breadboard ? { baseUrl: breadboard.baseUrl } : {}),
-		...("auth" in breadboard ? { auth: breadboard.auth } : {}),
-		...("tls" in breadboard ? { tls: breadboard.tls } : {}),
-		...("engineArtifact" in breadboard ? { engineArtifact: breadboard.engineArtifact } : {}),
-		...("workspaceId" in breadboard ? { workspaceId: breadboard.workspaceId } : {}),
-		...("startupTimeoutMs" in breadboard ? { startupTimeoutMs: breadboard.startupTimeoutMs } : {}),
-		...("requestTimeoutMs" in breadboard ? { requestTimeoutMs: breadboard.requestTimeoutMs } : {}),
-		...("ownerExitPolicy" in breadboard ? { ownerExitPolicy: breadboard.ownerExitPolicy } : {}),
-		...("sessionConfigPath" in breadboard ? { sessionConfigPath: breadboard.sessionConfigPath } : {}),
+		...(isOwnEnumerable(selected, "engineMode") ? { engineMode: selected.engineMode } : {}),
+		...(isOwnEnumerable(selected, "baseUrl") ? { baseUrl: selected.baseUrl } : {}),
+		...(isOwnEnumerable(selected, "auth") ? { auth: selected.auth } : {}),
+		...(isOwnEnumerable(selected, "tls") ? { tls: selected.tls } : {}),
+		...(isOwnEnumerable(selected, "engineArtifact") ? { engineArtifact: selected.engineArtifact } : {}),
+		...(isOwnEnumerable(selected, "workspaceId") ? { workspaceId: selected.workspaceId } : {}),
+		...(isOwnEnumerable(selected, "startupTimeoutMs") ? { startupTimeoutMs: selected.startupTimeoutMs } : {}),
+		...(isOwnEnumerable(selected, "requestTimeoutMs") ? { requestTimeoutMs: selected.requestTimeoutMs } : {}),
+		...(isOwnEnumerable(selected, "ownerExitPolicy") ? { ownerExitPolicy: selected.ownerExitPolicy } : {}),
+		...(isOwnEnumerable(selected, "sessionConfigPath") ? { sessionConfigPath: selected.sessionConfigPath } : {}),
 	};
 }
 

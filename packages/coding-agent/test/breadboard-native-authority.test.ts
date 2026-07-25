@@ -6,7 +6,11 @@ import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { E4PermissionHandler } from "@oh-my-pi/pi-coding-agent/breadboard/e4-agent-stream";
-import { LifecycleSupervisor } from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-supervisor";
+import { lifecycleFailure } from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-state";
+import {
+	type LifecycleDispatchResult,
+	LifecycleSupervisor,
+} from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-supervisor";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import Engine from "@oh-my-pi/pi-coding-agent/commands/engine";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -36,6 +40,70 @@ const TEST_RUNTIME_AUTHORITY = {
 	modelRegistry: { getAll: () => [BREADBOARD_MODEL] },
 	requestPermission: async () => "cancel" as const,
 };
+type ActiveBreadboardMode = "local-owned" | "local-external" | "remote";
+type NonReadyLifecycleKind = Exclude<LifecycleDispatchResult["kind"], "ready">;
+
+const ACTIVE_BREADBOARD_MODES: readonly ActiveBreadboardMode[] = ["local-owned", "local-external", "remote"];
+const NON_READY_LIFECYCLE_KINDS: readonly NonReadyLifecycleKind[] = [
+	"off",
+	"observed",
+	"detached",
+	"stopped",
+	"failure",
+];
+
+function activeLifecycleSettings(mode: ActiveBreadboardMode): Settings {
+	return Settings.isolated({
+		"breadboard.engineMode": mode,
+		"breadboard.sessionConfigPath": "/tmp/session.yml",
+		...(mode === "local-owned"
+			? {
+					"breadboard.engineArtifact": {
+						executablePath: "/usr/bin/false",
+						argv: [],
+						executableSha256: `sha256:${"a".repeat(64)}`,
+						engineSourceSha256: `sha256:${"b".repeat(64)}`,
+						servedBackendCommit: "c".repeat(40),
+					},
+				}
+			: {}),
+		...(mode === "local-external" ? { "breadboard.baseUrl": "http://127.0.0.1:7777" } : {}),
+		...(mode === "remote"
+			? {
+					"breadboard.baseUrl": "https://engine.example",
+					"breadboard.auth": { kind: "keychain-reference", reference: "breadboard/test-token" },
+				}
+			: {}),
+		"marketplace.autoUpdate": "off",
+		"startup.checkUpdate": false,
+		"startup.showSplash": false,
+	} as never);
+}
+
+function nonReadyLifecycleResult(
+	mode: ActiveBreadboardMode,
+	kind: NonReadyLifecycleKind,
+): Exclude<LifecycleDispatchResult, { readonly kind: "ready" }> {
+	switch (kind) {
+		case "off":
+			return { kind, state: { name: "off", mode: "off", attempt: 0, reason: "engine_mode_off" } };
+		case "observed":
+			return {
+				kind,
+				state: { name: "compatible-observed", mode, attempt: 0 },
+				handle: { mode, binding: { engineInstanceId: `engine-${mode}` } },
+			} as Exclude<LifecycleDispatchResult, { readonly kind: "ready" }>;
+		case "detached":
+			return { kind, state: { name: "detached", mode, attempt: 0 } };
+		case "stopped":
+			return { kind, state: { name: "stopped", mode, attempt: 0 } };
+		case "failure":
+			return lifecycleFailure(mode, "failed", "endpoint_unreachable") as Exclude<
+				LifecycleDispatchResult,
+				{ readonly kind: "ready" }
+			>;
+	}
+}
 const PERMISSION_REQUEST = {
 	requestId: "permission-1",
 	tool: "edit",
@@ -99,6 +167,74 @@ describe("BreadBoard native interactive authority", () => {
 		expect(closeRuntime).toHaveBeenCalledTimes(1);
 	});
 
+	for (const mode of ACTIVE_BREADBOARD_MODES) {
+		for (const outcomeKind of NON_READY_LIFECYCLE_KINDS) {
+			test(`terminates ${mode} interactive startup after a ${outcomeKind} lifecycle outcome`, async () => {
+				using tempDir = TempDir.createSync(`@breadboard-${mode}-${outcomeKind}-`);
+				const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+				const parsed = parseArgs(["--engine-mode", mode]);
+				parsed.noExtensions = true;
+				parsed.noSkills = true;
+				parsed.noRules = true;
+				parsed.noTools = true;
+				parsed.noLsp = true;
+				parsed.sessionDir = tempDir.join("sessions");
+				const manager = SessionManager.create(tempDir.path(), parsed.sessionDir);
+				const connect = spyOn(LifecycleSupervisor.prototype, "connect").mockImplementation(async () =>
+					nonReadyLifecycleResult(mode, outcomeKind),
+				);
+				const close = spyOn(LifecycleSupervisor.prototype, "close").mockImplementation(
+					async () =>
+						({
+							kind: "detached",
+							state: { name: "detached", mode, attempt: 0 },
+						}) as LifecycleDispatchResult,
+				);
+				const createAgentSession = mock(
+					async () =>
+						({
+							session: {
+								agent: { emitExternalEvent() {} },
+								sessionManager: manager,
+								setSessionTransitionGuard() {},
+							},
+							setToolUIContext() {},
+						}) as never,
+				);
+				const runInteractiveMode = mock(async () => {});
+				const originalStdoutWrite = process.stdout.write;
+				const previousExitCode = process.exitCode ?? 0;
+				let stdout = "";
+				process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+					stdout += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+					return true;
+				}) as typeof process.stdout.write;
+
+				try {
+					await runRootCommand(parsed, [], {
+						discoverAuthStorage: async () => authStorage,
+						settings: activeLifecycleSettings(mode),
+						createAgentSession: createAgentSession as never,
+						runInteractiveMode: runInteractiveMode as never,
+					});
+					expect(process.exitCode).toBe(1);
+					expect(stdout).toContain("BreadBoard engine:");
+					expect(connect).toHaveBeenCalledTimes(1);
+					expect(close).toHaveBeenCalledTimes(1);
+					expect(createAgentSession).not.toHaveBeenCalled();
+					expect(runInteractiveMode).not.toHaveBeenCalled();
+				} finally {
+					process.stdout.write = originalStdoutWrite;
+					process.exitCode = previousExitCode;
+					close.mockRestore();
+					connect.mockRestore();
+					await manager.close();
+					authStorage.close();
+				}
+			});
+		}
+	}
+
 	test("preserves native provider selection when the effective BreadBoard mode is off", async () => {
 		using tempDir = TempDir.createSync("@breadboard-off-native-provider-");
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
@@ -150,7 +286,7 @@ describe("BreadBoard native interactive authority", () => {
 		});
 	});
 
-	test("does not install a session transition guard when BreadBoard mode is off", async () => {
+	test("continues through the native AgentSession and InteractiveMode path when BreadBoard mode is off", async () => {
 		using tempDir = TempDir.createSync("@breadboard-off-transition-guard-");
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		const settings = Settings.isolated({
@@ -168,27 +304,33 @@ describe("BreadBoard native interactive authority", () => {
 		parsed.sessionDir = tempDir.join("sessions");
 		const manager = SessionManager.create(tempDir.path(), parsed.sessionDir);
 		const setSessionTransitionGuard = mock((_guard: SessionTransitionGuard | null) => {});
+		const createAgentSession = mock(
+			async () =>
+				({
+					session: {
+						agent: { emitExternalEvent() {} },
+						sessionManager: manager,
+						setSessionTransitionGuard,
+					},
+					setToolUIContext() {},
+				}) as never,
+		);
+		const runInteractiveMode = mock(async () => {});
 
 		try {
 			await runRootCommand(parsed, [], {
 				discoverAuthStorage: async () => authStorage,
 				settings,
-				createAgentSession: async () =>
-					({
-						session: {
-							agent: { emitExternalEvent() {} },
-							sessionManager: manager,
-							setSessionTransitionGuard,
-						},
-						setToolUIContext() {},
-					}) as never,
-				runInteractiveMode: mock(async () => {}) as never,
+				createAgentSession: createAgentSession as never,
+				runInteractiveMode: runInteractiveMode as never,
 			});
 		} finally {
 			await manager.close();
 			authStorage.close();
 		}
 
+		expect(createAgentSession).toHaveBeenCalledTimes(1);
+		expect(runInteractiveMode).toHaveBeenCalledTimes(1);
 		expect(setSessionTransitionGuard).not.toHaveBeenCalled();
 	});
 

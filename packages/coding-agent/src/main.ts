@@ -37,7 +37,7 @@ import {
 	type E4PermissionHandler,
 } from "./breadboard/e4-agent-stream";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
-import { LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
+import { type LifecycleDispatchResult, LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
 import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
 import {
 	BreadboardRunConfigError,
@@ -1088,6 +1088,15 @@ export class BreadboardSessionTransitionError extends Error {
 	}
 }
 
+type NonReadyLifecycleResult = Exclude<LifecycleDispatchResult, { readonly kind: "ready" }>;
+
+export class BreadboardLifecycleStartupError extends Error {
+	constructor(readonly result: NonReadyLifecycleResult) {
+		super(`BreadBoard lifecycle startup returned ${result.kind}`);
+		this.name = "BreadboardLifecycleStartupError";
+	}
+}
+
 function resolveEffectiveBreadboardRunConfig(
 	parsed: Pick<Args, "engineMode" | "engineUrl">,
 	activeSettings: Settings,
@@ -1390,7 +1399,7 @@ export async function prepareBreadboardRuntime(
 	if (connected.kind !== "ready") {
 		process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
 		await closeSupervisor();
-		return null;
+		throw new BreadboardLifecycleStartupError(connected);
 	}
 
 	return prepareConnectedBreadboardRuntime({
@@ -1838,6 +1847,12 @@ export async function runRootCommand(
 					sessionOptions.model = preparedBreadboardRuntime.model;
 				}
 			} catch (error) {
+				if (error instanceof BreadboardLifecycleStartupError) {
+					process.exitCode = 1;
+					stopStartupWatchdog();
+					stopThemeWatcher();
+					return;
+				}
 				const message =
 					error instanceof BreadboardRunConfigError
 						? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
