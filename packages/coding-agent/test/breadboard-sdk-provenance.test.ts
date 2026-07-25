@@ -40,8 +40,8 @@ describe("BreadBoard SDK provenance", () => {
 		try {
 			await expect(verifyBreadboardSdkProvenance(packageRoot, packageRoot, clean)).resolves.toMatchObject({
 				packageName: "@breadboard/sdk",
-				packageVersion: "0.2.3",
-				artifactSha256: "09c5fa395cfe372da364db9de57265db2f3a58586929ad6c8b7ef08fdd0891ed",
+				packageVersion: "0.2.4",
+				artifactSha256: "946a9d7fbf827ae82915b78c40a1423c38e92f65aa6c4c36355429d4970d979c",
 			});
 		} finally {
 			if (previous === undefined) delete process.env[environmentName];

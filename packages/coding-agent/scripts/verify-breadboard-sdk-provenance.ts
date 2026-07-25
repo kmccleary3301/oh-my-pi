@@ -581,7 +581,7 @@ export async function verifyBreadboardSdkProvenance(
 	const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as BreadboardSdkProvenance;
 	invariant(manifest.schemaVersion === "p30.breadboard-sdk-provenance.v1", "unexpected manifest schema");
 	invariant(manifest.packageName === "@breadboard/sdk", "unexpected package name");
-	invariant(manifest.packageVersion === "0.2.3", "unexpected package version");
+	invariant(manifest.packageVersion === "0.2.4", "unexpected package version");
 	invariant(/^([0-9a-f]{64})$/.test(manifest.artifactSha256), "invalid artifact SHA-256");
 	invariant(
 		manifest.backendRootEnvironmentVariable === "BREADBOARD_P30_BACKEND_ROOT",
