@@ -3,11 +3,17 @@ import type { BreadboardSessionPort, OpenedSession, OpenSession } from "./sessio
 
 type CanonicalSessionClient = Pick<CanonicalE4Client, "attach" | "create">;
 
+export interface CanonicalE4SessionPortOptions {
+	readonly onLateCloseError: (error: unknown) => void;
+}
+
 export class CanonicalE4SessionPort implements BreadboardSessionPort {
 	readonly #client: CanonicalSessionClient;
+	readonly #onLateCloseError: CanonicalE4SessionPortOptions["onLateCloseError"];
 
-	constructor(client: CanonicalSessionClient) {
+	constructor(client: CanonicalSessionClient, options: CanonicalE4SessionPortOptions) {
 		this.#client = client;
+		this.#onLateCloseError = options.onLateCloseError;
 	}
 
 	async open(target: OpenSession, signal?: AbortSignal): Promise<OpenedSession> {
@@ -30,7 +36,7 @@ export class CanonicalE4SessionPort implements BreadboardSessionPort {
 			runtime => {
 				signal.removeEventListener("abort", abort);
 				if (settled) {
-					void runtime.close().catch(() => {});
+					void runtime.close().catch(error => this.#onLateCloseError(error));
 					return;
 				}
 				settled = true;

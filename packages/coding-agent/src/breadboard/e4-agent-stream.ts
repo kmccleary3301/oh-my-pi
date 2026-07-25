@@ -1,5 +1,6 @@
 import {
 	CanonicalE4ClientError,
+	type CanonicalJsonObject,
 	deterministicSerialize,
 	LifecycleE4ClientError,
 	type StructuredSubmit,
@@ -849,6 +850,16 @@ function assistantMessage(
 	};
 }
 
+function isCanonicalJsonObject(value: unknown): value is CanonicalJsonObject {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function nativeToolArguments(value: unknown): Record<string, unknown> {
+	if (value === null) return {};
+	if (!isCanonicalJsonObject(value)) throw new Error("BreadBoard tool arguments must be an object or null");
+	return { ...value };
+}
+
 function assistantToolCallMessage(
 	model: E4BackendModelAttribution,
 	event: Extract<LoggedSessionEvent, { readonly kind: "tool_called" }>,
@@ -857,7 +868,7 @@ function assistantToolCallMessage(
 		type: "toolCall",
 		id: String(event.payload.callId),
 		name: event.payload.tool,
-		arguments: event.payload.arguments as ToolCall["arguments"],
+		arguments: nativeToolArguments(event.payload.arguments),
 	};
 	return {
 		role: "assistant",

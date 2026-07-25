@@ -1735,6 +1735,12 @@ export async function prepareBreadboardRuntime(
 					requestTimeoutMs: config.requestTimeoutMs,
 					fetch: connected.handle.requestFetch,
 				}),
+				{
+					onLateCloseError: () => {
+						process.stderr.write("BreadBoard session cleanup failed after caller abort.\n");
+						process.exitCode = 1;
+					},
+				},
 			).open(target),
 		emitAgentEvent: async (event, idempotencyKey) => {
 			await emitAgentEvent(event, idempotencyKey);

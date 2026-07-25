@@ -27,12 +27,14 @@ const runtimeFor = (
 	close,
 });
 
+const ignoreLateCloseError = (): void => {};
+
 describe("CanonicalE4SessionPort", () => {
 	test("forwards create requests without changing the canonical runtime", async () => {
 		const runtime = runtimeFor(asSessionId("session-create"));
 		const create = mock(async () => runtime);
 		const attach = mock(async () => runtime);
-		const port = new CanonicalE4SessionPort({ create, attach });
+		const port = new CanonicalE4SessionPort({ create, attach }, { onLateCloseError: ignoreLateCloseError });
 		const request = { configPath: "agent_configs/session.yaml" };
 
 		await expect(port.open({ kind: "create", request })).resolves.toBe(runtime);
@@ -46,7 +48,7 @@ describe("CanonicalE4SessionPort", () => {
 		const runtime = runtimeFor(sessionId);
 		const create = mock(async () => runtime);
 		const attach = mock(async () => runtime);
-		const port = new CanonicalE4SessionPort({ create, attach });
+		const port = new CanonicalE4SessionPort({ create, attach }, { onLateCloseError: ignoreLateCloseError });
 
 		await expect(port.open({ kind: "attach", sessionId })).resolves.toBe(runtime);
 		expect(attach).toHaveBeenCalledTimes(1);
@@ -58,7 +60,7 @@ describe("CanonicalE4SessionPort", () => {
 		const runtime = runtimeFor(asSessionId("session-aborted"));
 		const create = mock(async () => runtime);
 		const attach = mock(async () => runtime);
-		const port = new CanonicalE4SessionPort({ create, attach });
+		const port = new CanonicalE4SessionPort({ create, attach }, { onLateCloseError: ignoreLateCloseError });
 		const abort = new AbortController();
 		abort.abort();
 
@@ -79,7 +81,7 @@ describe("CanonicalE4SessionPort", () => {
 				}),
 		);
 		const attach = mock(async () => runtime);
-		const port = new CanonicalE4SessionPort({ create, attach });
+		const port = new CanonicalE4SessionPort({ create, attach }, { onLateCloseError: ignoreLateCloseError });
 		const abort = new AbortController();
 
 		const opening = port.open(
@@ -93,5 +95,34 @@ describe("CanonicalE4SessionPort", () => {
 		await Promise.resolve();
 
 		expect(close).toHaveBeenCalledTimes(1);
+	});
+	test("reports a runtime close failure after an aborted open", async () => {
+		const failure = new Error("late close failed");
+		const runtime = runtimeFor(asSessionId("session-late-close-failure"), async () => {
+			throw failure;
+		});
+		let resolveCreate: ((value: OpenedSessionRuntime) => void) | undefined;
+		const create = mock(
+			() =>
+				new Promise<OpenedSessionRuntime>(resolve => {
+					resolveCreate = resolve;
+				}),
+		);
+		const onLateCloseError = mock((_error: unknown) => {});
+		const port = new CanonicalE4SessionPort({ create, attach: mock(async () => runtime) }, { onLateCloseError });
+		const abort = new AbortController();
+
+		const opening = port.open(
+			{ kind: "create", request: { configPath: "agent_configs/session.yaml" } },
+			abort.signal,
+		);
+		abort.abort();
+		await expect(opening).rejects.toMatchObject({ failure: { kind: "caller-abort" } });
+		resolveCreate?.(runtime);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(onLateCloseError).toHaveBeenCalledWith(failure);
 	});
 });

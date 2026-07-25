@@ -6,8 +6,8 @@
   "artifactSha256": "946a9d7fbf827ae82915b78c40a1423c38e92f65aa6c4c36355429d4970d979c",
   "artifactSha512Base64": "+GKNlsAefw8G4t7fN5oMtAFGw1mpnK+mS76K/8dr4EvdV0FNFAw4V2BuWwGQYPETMRHF2YAnJk/qwAEPQySTzg==",
   "artifactSizeBytes": 47088,
-  "backendCommit": "c0aaa9e5aeeaf4d35ea1ee6038991ec0718bccd9",
-  "backendTree": "8135372dd272f06e77ef64e074f1fec5bcc764bd",
+  "backendCommit": "6b32c22e30c8b950bba1cf62813e47ad2d15e868",
+  "backendTree": "d3ce3c78391cdeaf2fac6d58d951adc0441023fb",
   "backendRootEnvironmentVariable": "BREADBOARD_P30_BACKEND_ROOT",
   "installedFilesSha256": {
     "README.md": "c4d29c00f093c78073627188584092b4f7c6c6d147581643047d7a329cdf8b7f",

@@ -668,6 +668,42 @@ describe("E4AgentStreamBridge", () => {
 		});
 	}
 
+	test("rejects non-object canonical tool arguments before native projection", async () => {
+		const agentEvents: AgentEvent[] = [];
+		const bridge = new E4AgentStreamBridge({
+			session: openedSession(
+				[
+					started,
+					wireEvent(3, "tool_call", {
+						call_id: "call-invalid-arguments",
+						tool: "read",
+						arguments: ["README.md"],
+						action: "inspect",
+						diff_preview: null,
+						progress: null,
+					}),
+				],
+				[],
+			),
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent(event) {
+				agentEvents.push(event);
+			},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+
+		try {
+			const result = await (await startBridgeStream(bridge, model, context)).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("BreadBoard tool arguments must be an object or null");
+			expect(agentEvents).toEqual([]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
 	test("drops replayed history and projects durable native tool result events in agent-loop order", async () => {
 		const submitted: SubmitInput[] = [];
 		const agentEvents: AgentEvent[] = [];
@@ -948,7 +984,7 @@ describe("E4AgentStreamBridge", () => {
 			throw new Error("Expected exact native assistant tool-call message");
 		}
 		expect(toolCallMessage.message.content as unknown).toEqual([
-			{ type: "toolCall", id: "call-1", name: "read", arguments: null },
+			{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
 		]);
 		expect(agentEvents[2]).toMatchObject({ type: "tool_execution_start", args: null });
 		await bridge.close();
