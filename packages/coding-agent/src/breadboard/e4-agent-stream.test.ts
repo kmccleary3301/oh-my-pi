@@ -170,6 +170,7 @@ function permissionSession(
 describe("E4AgentStreamBridge", () => {
 	test("submits the latest user turn and projects canonical text into the native stream", async () => {
 		const submitted: SubmitInput[] = [];
+		const agentEvents: AgentEvent[] = [];
 		const events = [
 			started,
 			wireEvent(3, "assistant.message.delta", { text: "hello " }),
@@ -180,7 +181,7 @@ describe("E4AgentStreamBridge", () => {
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession(events, submitted),
 			replayHeadSequence: 0,
-			emitAgentEvent() {},
+			emitAgentEvent: event => agentEvents.push(event),
 			modelPolicy: { kind: "fixed", model: model },
 		});
 
@@ -192,6 +193,7 @@ describe("E4AgentStreamBridge", () => {
 		expect(typeof (submitted[0] as StructuredSubmit).clientMessageId).toBe("string");
 		expect(result.content).toEqual([{ type: "text", text: "hello world" }]);
 		expect(result.provider).toBe(model.provider);
+		expect(agentEvents).toEqual([]);
 		await bridge.close();
 	});
 
@@ -758,12 +760,23 @@ describe("E4AgentStreamBridge", () => {
 		const stream = await bridge.stream(model, context);
 		const result = await stream.result();
 
-		expect(result.content).toEqual([{ type: "text", text: "Before.After." }]);
+		expect(result.content).toEqual([{ type: "text", text: "After." }]);
 		expect(agentEvents.filter(event => event.type === "tool_execution_start")).toHaveLength(2);
 		const ends = agentEvents.filter(event => event.type === "tool_execution_end");
 		expect(ends).toHaveLength(2);
 		expect(ends.map(event => event.toolName)).toEqual(["edit", "read"]);
-		expect(agentEvents.filter(event => event.type === "message_end")).toHaveLength(4);
+		const projectedMessages = agentEvents.filter(event => event.type === "message_end").map(event => event.message);
+		expect(projectedMessages.map(message => message.role)).toEqual([
+			"assistant",
+			"assistant",
+			"assistant",
+			"toolResult",
+			"toolResult",
+		]);
+		expect(projectedMessages[0]).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Before." }],
+		});
 		await bridge.close();
 	});
 	test("ignores duplicate and out-of-order event sequences for exact-once SSE projection", async () => {
@@ -844,7 +857,10 @@ describe("E4AgentStreamBridge", () => {
 		const admitted = Promise.withResolvers<void>();
 		const events = [
 			started,
-			wireEvent(3, "tool_call", {
+			wireEvent(3, "assistant.message.start", { message_id: "message-before-tool" }),
+			wireEvent(4, "assistant.message.delta", { text: "Before." }),
+			wireEvent(5, "assistant.message.end", { text: "Before." }),
+			wireEvent(6, "tool_call", {
 				call_id: "call-native-order",
 				tool: "read",
 				arguments: { path: "README.md", selectors: [1, 3] },
@@ -852,7 +868,7 @@ describe("E4AgentStreamBridge", () => {
 				diff_preview: null,
 				progress: null,
 			}),
-			wireEvent(4, "tool.result", {
+			wireEvent(7, "tool.result", {
 				call_id: "call-native-order",
 				tool: null,
 				status: "completed",
@@ -860,10 +876,10 @@ describe("E4AgentStreamBridge", () => {
 				result: { output: "contents" },
 				artifact_ref: null,
 			}),
-			wireEvent(5, "assistant.message.start", { message_id: "message-after-tool" }),
-			wireEvent(6, "assistant.message.delta", { text: "Finished." }),
-			wireEvent(7, "assistant.message.end", { text: "Finished." }),
-			wireEvent(8, "turn_completed", {}),
+			wireEvent(8, "assistant.message.start", { message_id: "message-after-tool" }),
+			wireEvent(9, "assistant.message.delta", { text: "Finished." }),
+			wireEvent(10, "assistant.message.end", { text: "Finished." }),
+			wireEvent(11, "turn_completed", {}),
 		];
 		const runtime: OpenedSessionRuntime = {
 			...openedSession([], submitted),
@@ -909,7 +925,7 @@ describe("E4AgentStreamBridge", () => {
 			await agentSession.waitForIdle();
 			for (let pass = 0; pass < 20; pass += 1) {
 				const persistedMessageCount = sessionManager.getBranch().filter(entry => entry.type === "message").length;
-				if (persistedMessageCount === 4) break;
+				if (persistedMessageCount === 5) break;
 				await Promise.resolve();
 			}
 			await sessionManager.flush();
@@ -920,16 +936,22 @@ describe("E4AgentStreamBridge", () => {
 			expect(agent.state.messages.map(message => message.role)).toEqual([
 				"user",
 				"assistant",
+				"assistant",
 				"toolResult",
 				"assistant",
 			]);
 			expect(convertToLlm(agent.state.messages).map(message => message.role)).toEqual([
 				"user",
 				"assistant",
+				"assistant",
 				"toolResult",
 				"assistant",
 			]);
 			expect(agent.state.messages[1]).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "Before." }],
+			});
+			expect(agent.state.messages[2]).toMatchObject({
 				role: "assistant",
 				content: [
 					{
@@ -951,15 +973,15 @@ describe("E4AgentStreamBridge", () => {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: "toolUse",
-				timestamp: 3,
+				timestamp: 6,
 			});
-			expect(agent.state.messages[2]).toMatchObject({
+			expect(agent.state.messages[3]).toMatchObject({
 				role: "toolResult",
 				toolCallId: "call-native-order",
 				toolName: "read",
 				isError: false,
 			});
-			expect(agent.state.messages[3]).toMatchObject({
+			expect(agent.state.messages[4]).toMatchObject({
 				role: "assistant",
 				content: [{ type: "text", text: "Finished." }],
 			});
@@ -970,13 +992,23 @@ describe("E4AgentStreamBridge", () => {
 				.readFileSync(sessionFile, "utf8")
 				.trimEnd()
 				.split("\n")
-				.map(line => JSON.parse(line) as { type?: string; message?: { role?: string } });
-			expect(jsonlEntries.filter(entry => entry.type === "message").map(entry => entry.message?.role)).toEqual([
+				.map(
+					line =>
+						JSON.parse(line) as {
+							type?: string;
+							message?: { role?: string; content?: unknown };
+						},
+				);
+			const persistedMessages = jsonlEntries.filter(entry => entry.type === "message").map(entry => entry.message);
+			expect(persistedMessages.map(message => message?.role)).toEqual([
 				"user",
+				"assistant",
 				"assistant",
 				"toolResult",
 				"assistant",
 			]);
+			expect(persistedMessages[1]?.content).toEqual([{ type: "text", text: "Before." }]);
+			expect(persistedMessages[4]?.content).toEqual([{ type: "text", text: "Finished." }]);
 
 			const reloaded = await SessionManager.open(sessionFile, tempDir.path());
 			try {
@@ -987,11 +1019,14 @@ describe("E4AgentStreamBridge", () => {
 				expect(reloadedMessages.map(message => message.role)).toEqual([
 					"user",
 					"assistant",
+					"assistant",
 					"toolResult",
 					"assistant",
 				]);
 				expect(reloadedMessages[1]).toEqual(agent.state.messages[1]);
 				expect(reloadedMessages[2]).toEqual(agent.state.messages[2]);
+				expect(reloadedMessages[3]).toEqual(agent.state.messages[3]);
+				expect(reloadedMessages[4]).toEqual(agent.state.messages[4]);
 				expect(collectPendingToolCalls(reloaded.getBranch())).toEqual([]);
 			} finally {
 				await reloaded.close();

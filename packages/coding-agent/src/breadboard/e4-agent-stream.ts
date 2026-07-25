@@ -371,7 +371,7 @@ export class E4AgentStreamBridge {
 				this.#ensureStarted(sink);
 				return;
 			case "assistant_message_started":
-				sink.messageText = "";
+				this.#flushAssistantText(sink);
 				this.#ensureStarted(sink);
 				return;
 			case "assistant_text_delta":
@@ -388,6 +388,7 @@ export class E4AgentStreamBridge {
 				return;
 			}
 			case "tool_called":
+				if (!sink.projectedToolCallIds.has(String(event.payload.callId))) this.#flushAssistantText(sink);
 				this.#projectToolCall(sink, event);
 				return;
 			case "tool_result_observed":
@@ -565,6 +566,21 @@ export class E4AgentStreamBridge {
 			delta,
 			partial: assistantMessage(sink.model, sink.text, "stop"),
 		});
+	}
+
+	#flushAssistantText(sink: TurnSink): void {
+		if (!sink.messageText) return;
+		const text = sink.messageText;
+		const message = assistantMessage(sink.model, text, "stop");
+		if (sink.textStarted) {
+			sink.stream.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+		}
+		this.#emitAgentEvent({ type: "message_start", message });
+		this.#emitAgentEvent({ type: "message_end", message });
+		sink.text = "";
+		sink.messageText = "";
+		sink.textStarted = false;
+		sink.stream.push({ type: "start", partial: assistantMessage(sink.model, "", "stop") });
 	}
 
 	#completeSink(sink: TurnSink): void {
