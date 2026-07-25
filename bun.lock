@@ -76,7 +76,7 @@
       "dependencies": {
         "@agentclientprotocol/sdk": "catalog:",
         "@babel/parser": "catalog:",
-        "@breadboard/sdk": "file:./vendor/breadboard-sdk-0.2.2.tgz",
+        "@breadboard/sdk": "file:./vendor/breadboard-sdk-0.2.3.tgz",
         "@mozilla/readability": "catalog:",
         "@oh-my-pi/hashline": "catalog:",
         "@oh-my-pi/omp-stats": "catalog:",
@@ -511,7 +511,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.4", "", { "os": "win32", "cpu": "x64" }, "sha512-U1jaluLw1qQc2Tx7/CeSoL9N5XcqIH+GWjpUAy1ouB5nVjSCMNO+NNHdY3RAs8zxNurLWAdj6pehQdCA2zyU+Q=="],
 
-    "@breadboard/sdk": ["@breadboard/sdk@./vendor/breadboard-sdk-0.2.2.tgz", { "dependencies": { "eventsource-parser": "^1.1.2" } }, "sha512-Ea+JmzWhwMWGPUQABKxpPi50FKa0m4pm8oyUJLEAQ7N9wqwJZCovKo7N6UiEgrAhI52mrxJLFvoKOWf6q4yJTQ=="],
+    "@breadboard/sdk": ["@breadboard/sdk@./vendor/breadboard-sdk-0.2.3.tgz", { "dependencies": { "eventsource-parser": "^1.1.2" } }, "sha512-S8J7dDcdLOq1yGukjrdBGEEDVOUiofpIKMTYYpUoQ2UgfFpRf0gFJBjlv/3cD0ottKBgN04gMMv7DzmIoglYRw=="],
 
     "@bufbuild/protobuf": ["@bufbuild/protobuf@2.12.1", "", {}, "sha512-BvAMfS6LrgZiryOAZ4pBYucu4wG/Ei/9o9DZ9akbREnMLbPJiom2i8b9C8IsKErQoiKqVhrerzt3kOT/RrzLHg=="],
 
