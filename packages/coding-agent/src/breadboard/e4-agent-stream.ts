@@ -856,8 +856,17 @@ function isCanonicalJsonObject(value: unknown): value is CanonicalJsonObject {
 
 function nativeToolArguments(value: unknown): Record<string, unknown> {
 	if (value === null) return {};
-	if (!isCanonicalJsonObject(value)) throw new Error("BreadBoard tool arguments must be an object or null");
-	return { ...value };
+	if (isCanonicalJsonObject(value)) return { ...value };
+	if (typeof value === "string") {
+		try {
+			const parsed: unknown = JSON.parse(value);
+			if (isCanonicalJsonObject(parsed)) return { ...parsed };
+			return { value: parsed };
+		} catch {
+			return { value };
+		}
+	}
+	return { value };
 }
 
 function assistantToolCallMessage(

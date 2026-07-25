@@ -668,19 +668,22 @@ describe("E4AgentStreamBridge", () => {
 		});
 	}
 
-	test("rejects non-object canonical tool arguments before native projection", async () => {
+	test("parses canonical JSON-string tool arguments before native projection", async () => {
 		const agentEvents: AgentEvent[] = [];
 		const bridge = new E4AgentStreamBridge({
 			session: openedSession(
 				[
 					started,
 					wireEvent(3, "tool_call", {
-						call_id: "call-invalid-arguments",
-						tool: "read",
-						arguments: ["README.md"],
-						action: "inspect",
+						call_id: "call-string-arguments",
+						tool: "todo.write_board",
+						arguments: '{"todos":[{"content":"Plan work","status":"completed"}]}',
+						action: "update",
 						diff_preview: null,
 						progress: null,
+					}),
+					wireEvent(4, "turn_failed", {
+						error: { code: "turn_execution_failed", message: "[redacted]" },
 					}),
 				],
 				[],
@@ -691,14 +694,27 @@ describe("E4AgentStreamBridge", () => {
 			async emitAgentEvent(event) {
 				agentEvents.push(event);
 			},
-			modelPolicy: { kind: "fixed", model: model },
+			modelPolicy: { kind: "fixed", model },
 		});
 
 		try {
 			const result = await (await startBridgeStream(bridge, model, context)).result();
 			expect(result.stopReason).toBe("error");
-			expect(result.errorMessage).toBe("BreadBoard tool arguments must be an object or null");
-			expect(agentEvents).toEqual([]);
+			const messageStart = agentEvents.find(event => event.type === "message_start");
+			expect(messageStart).toMatchObject({
+				type: "message_start",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "call-string-arguments",
+							name: "todo.write_board",
+							arguments: { todos: [{ content: "Plan work", status: "completed" }] },
+						},
+					],
+				},
+			});
 		} finally {
 			await bridge.close();
 		}
