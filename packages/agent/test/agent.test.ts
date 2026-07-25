@@ -17,6 +17,28 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("waits for async subscribers when applying an external event", async () => {
+		const agent = new Agent();
+		const release = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		let handled = false;
+		agent.subscribe(async () => {
+			entered.resolve();
+			await release.promise;
+			handled = true;
+		});
+		const message = createAssistantMessage([{ type: "text", text: "external" }]);
+
+		const pending = agent.emitExternalEventAndWait({ type: "message_end", message });
+		await entered.promise;
+
+		expect(agent.state.messages).toContain(message);
+		expect(handled).toBe(false);
+		release.resolve();
+		await pending;
+		expect(handled).toBe(true);
+	});
+
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
 		const mock = createMockModel({ responses: [{ content: ["Processed"] }] });
 		const agent = new Agent({ streamFn: mock.stream });

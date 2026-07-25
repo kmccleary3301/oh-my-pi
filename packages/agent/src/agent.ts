@@ -782,7 +782,22 @@ export class Agent {
 		this.#asideMessageProvider = fn;
 	}
 
-	emitExternalEvent(event: AgentEvent) {
+	emitExternalEvent(event: AgentEvent): void {
+		this.#applyExternalEvent(event);
+		this.#emit(event);
+	}
+
+	/**
+	 * Applies an externally-owned event and waits until every subscriber has
+	 * finished handling it. Durable adapters use this to acknowledge upstream
+	 * cursors only after AgentSession has persisted the corresponding message.
+	 */
+	async emitExternalEventAndWait(event: AgentEvent): Promise<void> {
+		this.#applyExternalEvent(event);
+		await this.#emitAndWait(event);
+	}
+
+	#applyExternalEvent(event: AgentEvent): void {
 		switch (event.type) {
 			case "message_start":
 			case "message_update":
@@ -799,8 +814,6 @@ export class Agent {
 				this.#state.pendingToolCalls.delete(event.toolCallId);
 				break;
 		}
-
-		this.#emit(event);
 	}
 
 	// State mutators
@@ -1396,10 +1409,10 @@ export class Agent {
 		}
 	}
 
-	#emit(e: AgentEvent) {
+	#emit(e: AgentEvent): void {
 		for (const listener of this.#listeners) {
 			try {
-				const result = listener(e) as unknown;
+				const result = listener(e);
 				if (isPromise(result)) {
 					result.catch(err => {
 						logger.warn("Agent listener rejected", {
@@ -1413,6 +1426,20 @@ export class Agent {
 				});
 			}
 		}
+	}
+
+	async #emitAndWait(e: AgentEvent): Promise<void> {
+		const pending: Promise<void>[] = [];
+		for (const listener of this.#listeners) {
+			try {
+				pending.push(Promise.resolve(listener(e)));
+			} catch (error) {
+				pending.push(Promise.reject(error));
+			}
+		}
+		const results = await Promise.allSettled(pending);
+		const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (failed) throw failed.reason;
 	}
 
 	/**
