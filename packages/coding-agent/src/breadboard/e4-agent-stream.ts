@@ -118,7 +118,6 @@ export class E4AgentStreamBridge {
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
 	readonly #submittingSinks = new Set<TurnSink>();
-	readonly #submittedTurnIds = new Set<string>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
 	readonly #undurableSinks = new Set<TurnSink>();
 	readonly #deferredProjectionKeys: string[] = [];
@@ -273,8 +272,12 @@ export class E4AgentStreamBridge {
 				this.#cancelSink(sink, failure ? "timeout" : "user_requested");
 				return;
 			}
-			this.#submittedTurnIds.add(String(receipt.turnId));
-			this.#sinks.set(String(receipt.turnId), sink);
+			const turnKey = String(receipt.turnId);
+			if (this.#sinks.has(turnKey)) {
+				this.#invalidateBridge(`BreadBoard submission receipt collided with observed turn ${turnKey}`);
+				return;
+			}
+			this.#sinks.set(turnKey, sink);
 			const cancel = () => {
 				sink.permissionAbort.abort();
 				this.#cancelSink(sink, "user_requested");
@@ -315,7 +318,7 @@ export class E4AgentStreamBridge {
 				const turnKey = String(event.turnId);
 				let sink = this.#sinks.get(turnKey);
 				if (!sink && this.#submissionsInFlight.size) {
-					await Promise.race(this.#submissionsInFlight);
+					await Promise.all([...this.#submissionsInFlight]);
 					sink = this.#sinks.get(turnKey);
 				}
 				if (!sink) {
@@ -705,7 +708,6 @@ export class E4AgentStreamBridge {
 			this.#failSink(sink, message, "error");
 		}
 		this.#sinks.clear();
-		this.#submittedTurnIds.clear();
 	}
 
 	#currentObserveFailure(): Error | undefined {
@@ -738,7 +740,6 @@ export class E4AgentStreamBridge {
 		sink.permissionAbort.abort();
 		if (sink.turnId === undefined) return;
 		this.#sinks.delete(String(sink.turnId));
-		this.#submittedTurnIds.delete(String(sink.turnId));
 	}
 }
 

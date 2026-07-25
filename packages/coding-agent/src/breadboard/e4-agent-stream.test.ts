@@ -449,6 +449,76 @@ describe("E4AgentStreamBridge", () => {
 		}
 	});
 
+	test("waits for every in-flight submission before adopting an observed turn", async () => {
+		const submissionsReady = Promise.withResolvers<void>();
+		const eventYielded = Promise.withResolvers<void>();
+		const firstReturned = Promise.withResolvers<void>();
+		const pending = [Promise.withResolvers<SubmitReceipt>(), Promise.withResolvers<SubmitReceipt>()];
+		const secondReceipt: SubmitReceipt = {
+			...receipt,
+			clientMessageId: "client-message-2" as ClientMessageId,
+			inputId: "input-2" as SubmitReceipt["inputId"],
+			turnId: "turn-2" as SubmitReceipt["turnId"],
+		};
+		let submissionCount = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				const index = submissionCount;
+				submissionCount += 1;
+				if (submissionCount === pending.length) submissionsReady.resolve();
+				const selected = await pending[index]!.promise;
+				if (index === 0) firstReturned.resolve();
+				return {
+					...selected,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async *events(request) {
+				await submissionsReady.promise;
+				if (request?.signal?.aborted) return;
+				eventYielded.resolve();
+				yield wireEvent(2, "turn_start", {}, "turn-2");
+				yield wireEvent(3, "assistant.message.delta", { text: "second" }, "turn-2");
+				yield wireEvent(4, "assistant.message.end", { text: "second" }, "turn-2");
+				yield wireEvent(5, "turn_completed", {}, "turn-2");
+				yield wireEvent(6, "turn_start", {});
+				yield wireEvent(7, "assistant.message.delta", { text: "first" });
+				yield wireEvent(8, "assistant.message.end", { text: "first" });
+				yield wireEvent(9, "turn_completed", {});
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model: model },
+		});
+		const secondContext: Context = {
+			messages: [{ role: "user", content: "second prompt", timestamp: 4 }],
+		};
+
+		try {
+			const firstStream = await startBridgeStream(bridge, model, context);
+			const secondStream = await startBridgeStream(bridge, model, secondContext);
+			await eventYielded.promise;
+			pending[0]!.resolve(receipt);
+			await firstReturned.promise;
+			await Bun.sleep(0);
+			pending[1]!.resolve(secondReceipt);
+
+			const [firstResult, secondResult] = await Promise.all([firstStream.result(), secondStream.result()]);
+			expect(firstResult.stopReason).toBe("stop");
+			expect(firstResult.content).toEqual([{ type: "text", text: "first" }]);
+			expect(secondResult.stopReason).toBe("stop");
+			expect(secondResult.content).toEqual([{ type: "text", text: "second" }]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
 	test("invalidates the bridge on a session-scoped runtime error", async () => {
 		const secondSubmitStarted = Promise.withResolvers<void>();
 		const releaseSecondSubmit = Promise.withResolvers<void>();

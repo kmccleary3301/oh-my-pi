@@ -751,6 +751,74 @@ describe("BreadBoard native interactive authority", () => {
 			authStorage.close();
 		}
 	});
+
+	test("presents a typed activation failure and returns without entering interactive mode", async () => {
+		using tempDir = TempDir.createSync("@breadboard-typed-activation-failure-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		const parsed = parseArgs([]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		parsed.sessionDir = tempDir.join("sessions");
+		const closeRuntime = mock(async () => {});
+		const runInteractiveMode = mock(async () => {});
+		const disposeSession = mock(async () => {});
+		const stderr: string[] = [];
+		const stderrWrite = spyOn(process.stderr, "write").mockImplementation(chunk => {
+			stderr.push(String(chunk));
+			return true;
+		});
+		const previousExitCode = process.exitCode;
+
+		try {
+			process.exitCode = undefined;
+			await runRootCommand(parsed, [], {
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({
+					"marketplace.autoUpdate": "off",
+					"startup.checkUpdate": false,
+					"startup.showSplash": false,
+				}),
+				prepareBreadboardRuntime: async () => ({
+					stream: () => new AssistantMessageEventStream(),
+					sessionId: "typed-activation-failure",
+					model: BREADBOARD_MODEL,
+					activate: async () => {
+						throw new BreadboardSessionTransitionError("activation binding conflict");
+					},
+					start() {},
+					close: closeRuntime,
+				}),
+				createAgentSession: async () =>
+					({
+						session: {
+							agent: { emitExternalEventAndWait: async () => {}, releaseExternalEvent() {} },
+							sessionManager: manager,
+							setSessionTransitionGuard() {},
+							dispose: disposeSession,
+						},
+						setToolUIContext() {},
+					}) as never,
+				runInteractiveMode: runInteractiveMode as never,
+			});
+
+			expect(Number(process.exitCode)).toBe(1);
+			expect(stderr.join("")).toContain(
+				"BreadBoard session transition error [unsupported_resume_transition]: activation binding conflict",
+			);
+			expect(closeRuntime).toHaveBeenCalledTimes(1);
+			expect(disposeSession).toHaveBeenCalledTimes(1);
+			expect(runInteractiveMode).not.toHaveBeenCalled();
+		} finally {
+			process.exitCode = previousExitCode;
+			stderrWrite.mockRestore();
+			await manager.close();
+			authStorage.close();
+		}
+	});
 });
 describe("BreadBoard runtime preparation ownership", () => {
 	test("closes the lifecycle supervisor once when opening the canonical session fails", async () => {
@@ -1010,6 +1078,7 @@ describe("BreadBoard durable session activation", () => {
 			details: { breadboardProjectionEventId: "event-2" },
 		} as never);
 		const flush = spyOn(manager, "flush");
+		const getBranch = spyOn(manager, "getBranch");
 		const start = mock(() => {});
 		const closeBridge = mock(async () => {});
 		let bridgeOptions: E4AgentStreamBridgeOptions | undefined;
@@ -1051,8 +1120,10 @@ describe("BreadBoard durable session activation", () => {
 			expect(bindings[0]?.type === "custom" ? bindings[0].data : undefined).toEqual(
 				sessionBinding("fresh-session", 2, "event-2"),
 			);
+			const branchScansBeforeProjection = getBranch.mock.calls.length;
 
 			await bridgeOptions?.projectionCommitted({ eventId: "event-3", sequence: 3 });
+			expect(getBranch).toHaveBeenCalledTimes(branchScansBeforeProjection);
 			const latest = manager
 				.getBranch()
 				.filter(entry => entry.type === "custom" && entry.customType === BREADBOARD_SESSION_BINDING_CUSTOM_TYPE)
@@ -1071,6 +1142,7 @@ describe("BreadBoard durable session activation", () => {
 				"cursor flush failed",
 			);
 			flush.mockRestore();
+			getBranch.mockRestore();
 			await expect(bridgeOptions?.projectionCommitted({ eventId: "event-4", sequence: 4 })).resolves.toBeUndefined();
 		} finally {
 			await prepared.close();
@@ -1261,10 +1333,20 @@ describe("BreadBoard durable binding rejection", () => {
 	test.each([
 		["session mismatch", sessionBinding("bound", 1, "event-1"), "opened", {}, "opened"],
 		[
-			"digest mismatch",
+			"configuration digest mismatch",
 			sessionBinding("bound", 1, "event-1"),
 			"bound",
-			{ sessionReplayContractDigest: "sha256:other" },
+			{
+				replayRetention: {
+					maxEvents: 100_000,
+					maxAgeMs: 86_400_000,
+					configurationDigest: "sha256:other",
+				},
+				earliestRetainedSequence: 1,
+				earliestRetainedEventId: "event-1",
+				headSequence: 1,
+				headEventId: "event-1",
+			},
 			"bound",
 		],
 		[

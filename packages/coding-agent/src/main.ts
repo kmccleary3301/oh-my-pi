@@ -1325,6 +1325,19 @@ export class BreadboardModelAuthorityError extends Error {
 	}
 }
 
+function formatBreadboardStartupError(error: unknown): string | undefined {
+	if (error instanceof BreadboardRunConfigError) {
+		return `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`;
+	}
+	if (error instanceof BreadboardSessionTransitionError) {
+		return `BreadBoard session transition error [${error.code}]: ${error.message}`;
+	}
+	if (error instanceof BreadboardModelAuthorityError) {
+		return `BreadBoard model authority error [${error.code}]: ${error.message}`;
+	}
+	return undefined;
+}
+
 export function resolveBreadboardBackendModel(
 	backendModel: string | null | undefined,
 	modelRegistry: BreadboardModelRegistry,
@@ -1488,6 +1501,7 @@ export async function prepareConnectedBreadboardRuntime(
 	let activationPromise: Promise<void> | undefined;
 	let lifecycleFailure: BreadboardLifecycleFailureResult | undefined;
 	let activatedSessionManager: SessionManager | undefined;
+	let durableBinding: BreadboardSessionBindingData | undefined;
 	let runtimeStarted = false;
 	const projectionReceiptEventIds = new Set<string>();
 
@@ -1565,7 +1579,7 @@ export async function prepareConnectedBreadboardRuntime(
 		const projectionCommitted = async (cursor: E4DurableCursor): Promise<void> => {
 			const sessionManager = activatedSessionManager;
 			if (!sessionManager) throw new Error("BreadBoard projection committed before runtime activation");
-			const current = readBreadboardSessionBinding(sessionManager);
+			const current = durableBinding;
 			if (
 				!current ||
 				current.sessionId !== initialBinding.sessionId ||
@@ -1580,11 +1594,13 @@ export async function prepareConnectedBreadboardRuntime(
 					"BreadBoard projection cursor conflicts with or rolls back the durable OMP session binding.",
 				);
 			}
-			sessionManager.appendCustomEntry(BREADBOARD_SESSION_BINDING_CUSTOM_TYPE, {
-				...initialBinding,
+			const nextBinding = {
+				...current,
 				cursor: { eventId: cursor.eventId, sequence: cursor.sequence },
-			} satisfies BreadboardSessionBindingData);
+			} satisfies BreadboardSessionBindingData;
+			sessionManager.appendCustomEntry(BREADBOARD_SESSION_BINDING_CUSTOM_TYPE, nextBinding);
 			await sessionManager.flush();
+			durableBinding = nextBinding;
 		};
 		bridge = (options.createBridge ?? (bridgeOptions => new E4AgentStreamBridge(bridgeOptions)))({
 			session: opened,
@@ -1629,6 +1645,7 @@ export async function prepareConnectedBreadboardRuntime(
 						);
 					}
 					await sessionManager.flush();
+					durableBinding = existingBinding ?? initialBinding;
 					for (const entry of sessionManager.getBranch()) {
 						if (entry.type !== "message") continue;
 						const eventId = breadboardProjectionEventId(entry.message);
@@ -2180,14 +2197,7 @@ export async function runRootCommand(
 					stopThemeWatcher();
 					return;
 				}
-				const message =
-					error instanceof BreadboardRunConfigError
-						? `BreadBoard configuration error [${error.code}/${error.field}]: ${error.message}`
-						: error instanceof BreadboardSessionTransitionError
-							? `BreadBoard session transition error [${error.code}]: ${error.message}`
-							: error instanceof BreadboardModelAuthorityError
-								? `BreadBoard model authority error [${error.code}]: ${error.message}`
-								: "BreadBoard lifecycle failed unexpectedly.";
+				const message = formatBreadboardStartupError(error) ?? "BreadBoard lifecycle failed unexpectedly.";
 				process.stderr.write(`${message}\n`);
 				process.exitCode = 1;
 				stopStartupWatchdog();
@@ -2214,6 +2224,14 @@ export async function runRootCommand(
 						logger.warn("AgentSession cleanup after BreadBoard activation failure failed", {
 							error: String(cleanupError),
 						});
+					}
+					const message = formatBreadboardStartupError(error);
+					if (error instanceof BreadboardLifecycleStartupError || message) {
+						if (message) process.stderr.write(`${message}\n`);
+						process.exitCode = 1;
+						stopStartupWatchdog();
+						stopThemeWatcher();
+						return;
 					}
 					throw error;
 				}
