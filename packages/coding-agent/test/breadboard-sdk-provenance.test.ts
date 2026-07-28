@@ -19,6 +19,7 @@ const manifest = JSON.parse(
 ) as BreadboardSdkProvenance;
 const packageJson = JSON.parse(await readFile(resolve(packageRoot, "package.json"), "utf8")) as {
 	dependencies: Record<string, string>;
+	scripts: Record<string, string>;
 };
 const workspaceRoot = resolve(packageRoot, "../..");
 const lockText = await readFile(resolve(workspaceRoot, "bun.lock"), "utf8");
@@ -47,6 +48,12 @@ describe("BreadBoard SDK provenance", () => {
 			if (previous === undefined) delete process.env[environmentName];
 			else process.env[environmentName] = previous;
 		}
+	});
+
+	test("runs SDK provenance and notice gates before build or publication", () => {
+		expect(packageJson.scripts["gate:distribution"]).toBe("bun run gate:breadboard-sdk && bun run gate:notices");
+		expect(packageJson.scripts.build).toStartWith("bun run gate:distribution && ");
+		expect(packageJson.scripts.prepack).toStartWith("bun run gate:distribution && ");
 	});
 
 	test("fails closed when package.json drifts from the pinned artifact", () => {

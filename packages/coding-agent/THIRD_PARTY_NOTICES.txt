@@ -2,7 +2,7 @@ BREADBOARD / OMP DISTRIBUTION NOTICE BUNDLE
 
 Generated deterministically by scripts/generate-third-party-notices.ts.
 The file sections below preserve every tracked LICENSE/NOTICE text in the source tree.
-The bundled BreadBoard SDK record is provenance-only because its archive contains no LICENSE/NOTICE member; this bundle makes no license assertion for that component.
+The bundled BreadBoard SDK archive contains no LICENSE/NOTICE member; this bundle makes no license assertion for that component.
 
 ===== BEGIN LICENSE =====
 SHA-256: 545636e19386d3d4e0ae6d77354527499999c3ebfbca61b9fa5aa4ead7c0b308
@@ -1323,6 +1323,6 @@ Artifact: packages/coding-agent/vendor/breadboard-sdk-0.2.5.tgz
 Artifact SHA-256: 10d0ad86df39c8a7972073efb274c15c24bc9aa86d2c663123e1deef91489782
 Provenance: packages/coding-agent/breadboard-sdk-provenance.json
 Provenance SHA-256: 1fd83fd872dadcc1f828f189bf4c203c2a9fbba4ec69fd6354344179a1c5deac
-License assertion: none; the bundled archive contains no LICENSE/NOTICE member.
+License assertion: none; archive inspection found no LICENSE/NOTICE member.
 ===== END BUNDLED COMPONENT PROVENANCE =====
 

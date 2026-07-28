@@ -42,4 +42,7 @@ async function main() {
 	console.log(`Updated ${INDEX_FILE} with ${jsonFiles.length} themes.`);
 }
 
-main().catch(console.error);
+main().catch(error => {
+	console.error(error);
+	process.exitCode = 1;
+});

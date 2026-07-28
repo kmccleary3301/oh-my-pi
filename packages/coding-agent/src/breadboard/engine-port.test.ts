@@ -22,6 +22,13 @@ const offConfig = {
 	configDigest: `sha256:${"0".repeat(64)}` as BreadboardRunConfig["configDigest"],
 } satisfies BreadboardRunConfig;
 
+const unavailableLocalConfig = {
+	...offConfig,
+	mode: "local-owned",
+	endpoint: "http://127.0.0.1:41739",
+	ownerExitPolicy: "attached",
+} satisfies BreadboardRunConfig;
+
 describe("connectCanonicalBreadboardEnginePort", () => {
 	test("connects through the lifecycle supervisor and reports non-ready ownership results", async () => {
 		const failures: string[] = [];
@@ -32,6 +39,18 @@ describe("connectCanonicalBreadboardEnginePort", () => {
 
 		expect(connection.kind).toBe("failure");
 		if (connection.kind === "failure") expect(connection.result.kind).toBe("off");
+		expect(failures).toEqual([]);
+	});
+
+	test("returns synchronous startup failures without invoking the late-failure callback", async () => {
+		const failures: string[] = [];
+		const connection = await connectCanonicalBreadboardEnginePort(unavailableLocalConfig, {
+			onLateSessionCloseError: () => {},
+			onLifecycleFailure: failure => failures.push(failure.state.name),
+		});
+
+		expect(connection.kind).toBe("failure");
+		if (connection.kind === "failure") expect(connection.result.kind).toBe("failure");
 		expect(failures).toEqual([]);
 	});
 });

@@ -147,8 +147,7 @@ export async function verifyUpstreamSync(options: VerifyUpstreamSyncOptions = {}
 			const conflictOutput = await run(["git", "diff", "--name-only", "--diff-filter=U", "-z"], worktree);
 			const conflictPaths = conflictOutput.stdout
 				.split("\0")
-				.map(value => value.trim())
-				.filter(Boolean)
+				.filter(value => value.length > 0)
 				.sort();
 			const conflicts = conflictPaths.map(filePath => ({
 				path: filePath,

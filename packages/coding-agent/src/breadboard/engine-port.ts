@@ -259,7 +259,6 @@ export async function connectCanonicalBreadboardEnginePort(
 	});
 	const connected = await supervisor.connect();
 	if (connected.kind !== "ready") {
-		monitor.stateChanged(connected.state);
 		await supervisor.close({ consumerClosed: true });
 		return { kind: "failure", result: connected };
 	}

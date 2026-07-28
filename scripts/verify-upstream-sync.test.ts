@@ -93,7 +93,7 @@ describe("verifyUpstreamSync", () => {
 	test("fails closed with classified conflict paths and runs no proofs", async () => {
 		const fixture = fixtureRunner({
 			rebaseExit: 1,
-			conflicts: "packages/coding-agent/src/breadboard/engine-port.ts\0unknown/future.txt\0",
+			conflicts: "packages/coding-agent/src/breadboard/engine-port.ts\0 unknown/future.txt \0",
 		});
 		const receipt = await verifyUpstreamSync({
 			repoRoot: "/repo",
@@ -108,10 +108,10 @@ describe("verifyUpstreamSync", () => {
 
 		expect(receipt.status).toBe("conflict");
 		expect(receipt.conflicts.map(item => [item.path, item.class, item.rule])).toEqual([
+			[" unknown/future.txt ", "manual-review", "manual-review-unknown"],
 			["packages/coding-agent/src/breadboard/engine-port.ts", "breadboard-owned", "known"],
-			["unknown/future.txt", "manual-review", "manual-review-unknown"],
 		]);
-		expect(receipt.unresolvedPaths).toEqual(["unknown/future.txt"]);
+		expect(receipt.unresolvedPaths).toEqual([" unknown/future.txt "]);
 		expect(receipt.proofReceipts).toEqual([]);
 		expect(fixture.calls).not.toContainEqual(["proof"]);
 	});
