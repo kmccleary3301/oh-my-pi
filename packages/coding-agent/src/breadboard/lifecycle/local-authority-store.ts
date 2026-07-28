@@ -431,6 +431,16 @@ function sameRecord(left: LocalAuthorityRecord, right: LocalAuthorityRecord): bo
 	return RECORD_KEYS.every(key => left[key] === right[key]);
 }
 
+function expectValidatedString(value: unknown): string {
+	if (typeof value !== "string") throw new Error("validated string invariant violated");
+	return value;
+}
+
+function expectValidatedNumber(value: unknown): number {
+	if (typeof value !== "number") throw new Error("validated number invariant violated");
+	return value;
+}
+
 function assertRecord(value: unknown, expectedKey: string): LocalAuthorityRecord {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new LocalAuthorityStoreError("authority_record_invalid", "authority record is not an object");
@@ -449,10 +459,12 @@ function assertRecord(value: unknown, expectedKey: string): LocalAuthorityRecord
 		!OPAQUE.test(record.engineBootId) ||
 		typeof record.launchId !== "string" ||
 		!OPAQUE.test(record.launchId) ||
+		typeof record.ownerGeneration !== "number" ||
 		!Number.isSafeInteger(record.ownerGeneration) ||
-		(record.ownerGeneration as number) < 1 ||
+		record.ownerGeneration < 1 ||
+		typeof record.pid !== "number" ||
 		!Number.isSafeInteger(record.pid) ||
-		(record.pid as number) < 1 ||
+		record.pid < 1 ||
 		typeof record.osProcessStartToken !== "string" ||
 		record.osProcessStartToken.length < 8 ||
 		typeof record.normalizedEndpoint !== "string" ||
@@ -479,7 +491,27 @@ function assertRecord(value: unknown, expectedKey: string): LocalAuthorityRecord
 	) {
 		throw new LocalAuthorityStoreError("authority_record_invalid", "authority record values are invalid");
 	}
-	return Object.freeze(record as unknown as LocalAuthorityRecord);
+	return Object.freeze({
+		schemaVersion: AUTHORITY_RECORD_SCHEMA_VERSION,
+		recordRevision: record.recordRevision,
+		engineInstanceId: record.engineInstanceId,
+		engineBootId: record.engineBootId,
+		launchId: record.launchId,
+		ownerGeneration: record.ownerGeneration,
+		pid: record.pid,
+		osProcessStartToken: record.osProcessStartToken,
+		normalizedEndpoint: record.normalizedEndpoint,
+		executableSha256: record.executableSha256,
+		executablePathSha256: record.executablePathSha256,
+		argvSha256: record.argvSha256,
+		engineArtifactSha256: record.engineArtifactSha256,
+		servedBackendCommit: record.servedBackendCommit,
+		ownerExitPolicy: record.ownerExitPolicy,
+		ownerCredentialRef: record.ownerCredentialRef,
+		ownerCredentialVerifier: record.ownerCredentialVerifier,
+		createdAt: record.createdAt,
+		lastVerifiedAt: record.lastVerifiedAt,
+	} satisfies LocalAuthorityRecord);
 }
 
 function assertStartClaim(value: unknown): LocalStartClaim {
@@ -504,8 +536,9 @@ function assertStartClaim(value: unknown): LocalStartClaim {
 		claim.schemaVersion !== "p30.local-start-claim.v4" ||
 		typeof claim.token !== "string" ||
 		!OPAQUE.test(claim.token) ||
+		typeof claim.pid !== "number" ||
 		!Number.isSafeInteger(claim.pid) ||
-		(claim.pid as number) < 1 ||
+		claim.pid < 1 ||
 		typeof claim.processStartToken !== "string" ||
 		claim.processStartToken.length < 3 ||
 		!Number.isSafeInteger(claim.createdAtUnix) ||
@@ -528,19 +561,43 @@ function assertStartClaim(value: unknown): LocalStartClaim {
 				typeof claim.pendingSecretVerifier !== "string" ||
 				!SHA256.test(claim.pendingSecretVerifier))) ||
 		(engineFields.some(field => field !== undefined) &&
-			(!Number.isSafeInteger(claim.enginePid) ||
-				(claim.enginePid as number) < 1 ||
+			(typeof claim.enginePid !== "number" ||
+				!Number.isSafeInteger(claim.enginePid) ||
+				claim.enginePid < 1 ||
 				typeof claim.engineProcessStartToken !== "string" ||
 				claim.engineProcessStartToken.length < 8)) ||
 		(ownerAttemptGeneration !== undefined &&
-			(!Number.isSafeInteger(ownerAttemptGeneration) ||
-				(ownerAttemptGeneration as number) < 1 ||
+			(typeof ownerAttemptGeneration !== "number" ||
+				!Number.isSafeInteger(ownerAttemptGeneration) ||
+				ownerAttemptGeneration < 1 ||
 				pendingCount !== pendingFields.length ||
 				engineFields.some(field => field === undefined)))
 	) {
 		throw new LocalAuthorityStoreError("start_claim_integrity", "start claim is invalid");
 	}
-	return Object.freeze(claim as unknown as LocalStartClaim);
+	const parsed: { -readonly [Key in keyof LocalStartClaim]: LocalStartClaim[Key] } = {
+		schemaVersion: "p30.local-start-claim.v4",
+		token: claim.token,
+		pid: claim.pid,
+		processStartToken: claim.processStartToken,
+		createdAtUnix: expectValidatedNumber(claim.createdAtUnix),
+	};
+	if (pendingCount > 0) {
+		parsed.launchId = expectValidatedString(claim.launchId);
+		parsed.executableSha256 = expectValidatedString(claim.executableSha256);
+		parsed.executablePathSha256 = expectValidatedString(claim.executablePathSha256);
+		parsed.argvSha256 = expectValidatedString(claim.argvSha256);
+		parsed.engineArtifactSha256 = expectValidatedString(claim.engineArtifactSha256);
+		parsed.servedBackendCommit = expectValidatedString(claim.servedBackendCommit);
+		parsed.pendingSecretRef = expectValidatedString(claim.pendingSecretRef);
+		parsed.pendingSecretVerifier = expectValidatedString(claim.pendingSecretVerifier);
+	}
+	if (claim.enginePid !== undefined) {
+		parsed.enginePid = expectValidatedNumber(claim.enginePid);
+		parsed.engineProcessStartToken = expectValidatedString(claim.engineProcessStartToken);
+	}
+	if (ownerAttemptGeneration !== undefined) parsed.ownerAttemptGeneration = ownerAttemptGeneration;
+	return Object.freeze(parsed);
 }
 
 function assertControlAttempt(value: unknown): LocalControlAttempt {
@@ -584,35 +641,61 @@ function assertControlAttempt(value: unknown): LocalControlAttempt {
 		!OPAQUE.test(attempt.engineBootId) ||
 		typeof attempt.launchId !== "string" ||
 		!OPAQUE.test(attempt.launchId) ||
+		typeof attempt.ownerGeneration !== "number" ||
 		!Number.isSafeInteger(attempt.ownerGeneration) ||
-		(attempt.ownerGeneration as number) < 1 ||
+		attempt.ownerGeneration < 1 ||
 		(attempt.operation !== "stop" && attempt.operation !== "restart") ||
 		typeof attempt.controlRequestId !== "string" ||
 		!OPAQUE.test(attempt.controlRequestId) ||
 		typeof attempt.registrationId !== "string" ||
 		!OPAQUE.test(attempt.registrationId) ||
+		typeof attempt.requesterRegistrationGeneration !== "number" ||
 		!Number.isSafeInteger(attempt.requesterRegistrationGeneration) ||
-		(attempt.requesterRegistrationGeneration as number) < 1 ||
+		attempt.requesterRegistrationGeneration < 1 ||
 		typeof attempt.requesterClientInstanceId !== "string" ||
 		!OPAQUE.test(attempt.requesterClientInstanceId) ||
 		typeof attempt.requesterCredentialRef !== "string" ||
 		!CONTROL_SECRET_REF.test(attempt.requesterCredentialRef) ||
 		typeof attempt.requesterCredentialVerifier !== "string" ||
 		!SHA256.test(attempt.requesterCredentialVerifier) ||
+		typeof attempt.expectedAdmissionEpoch !== "number" ||
 		!Number.isSafeInteger(attempt.expectedAdmissionEpoch) ||
-		(attempt.expectedAdmissionEpoch as number) < 0 ||
+		attempt.expectedAdmissionEpoch < 0 ||
 		(attempt.phase !== "begin-pending" &&
 			attempt.phase !== "draining" &&
 			attempt.phase !== "graceful-accepted" &&
 			attempt.phase !== "hard-signal-pending" &&
 			attempt.phase !== "hard-signal-commit-pending") ||
-		(hasDrain && (!Number.isSafeInteger(attempt.drainGeneration) || (attempt.drainGeneration as number) < 1)) ||
+		(hasDrain &&
+			(typeof attempt.drainGeneration !== "number" ||
+				!Number.isSafeInteger(attempt.drainGeneration) ||
+				attempt.drainGeneration < 1)) ||
+		typeof attempt.createdAtUnix !== "number" ||
 		!Number.isSafeInteger(attempt.createdAtUnix) ||
-		(attempt.createdAtUnix as number) < 0
+		attempt.createdAtUnix < 0
 	) {
 		throw new LocalAuthorityStoreError("control_attempt_integrity", "control attempt is invalid");
 	}
-	return Object.freeze(attempt as unknown as LocalControlAttempt);
+	const parsed: LocalControlAttempt = {
+		schemaVersion: "p30.local-control-attempt.v3",
+		recordRevision: attempt.recordRevision,
+		engineInstanceId: attempt.engineInstanceId,
+		engineBootId: attempt.engineBootId,
+		launchId: attempt.launchId,
+		ownerGeneration: attempt.ownerGeneration,
+		operation: attempt.operation,
+		controlRequestId: attempt.controlRequestId,
+		registrationId: attempt.registrationId,
+		requesterRegistrationGeneration: attempt.requesterRegistrationGeneration,
+		requesterClientInstanceId: attempt.requesterClientInstanceId,
+		requesterCredentialRef: attempt.requesterCredentialRef,
+		requesterCredentialVerifier: attempt.requesterCredentialVerifier,
+		expectedAdmissionEpoch: attempt.expectedAdmissionEpoch,
+		phase: attempt.phase,
+		createdAtUnix: attempt.createdAtUnix,
+		...(hasDrain ? { drainGeneration: expectValidatedNumber(attempt.drainGeneration) } : {}),
+	};
+	return Object.freeze(parsed);
 }
 
 export class LocalAuthorityStore {

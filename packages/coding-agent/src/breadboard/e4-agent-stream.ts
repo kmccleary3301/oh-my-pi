@@ -4,6 +4,7 @@ import {
 	deterministicSerialize,
 	LifecycleE4ClientError,
 	type StructuredSubmit,
+	type SubmitReceipt,
 	sha256Bytes,
 } from "@breadboard/sdk";
 import type { AgentEvent, AgentToolResult, StreamFn } from "@oh-my-pi/pi-agent-core";
@@ -65,6 +66,7 @@ interface PendingSubmit {
 	readonly canonicalDigest: string;
 	readonly input: StructuredSubmit;
 	recoveringAfterAbort: boolean;
+	turnId: TurnId | undefined;
 }
 
 export interface E4DurableCursor {
@@ -87,13 +89,24 @@ export function breadboardProjectionEventId(message: unknown): string | undefine
 	return typeof eventId === "string" && eventId ? eventId : undefined;
 }
 
+export interface E4OwnedSubmission {
+	readonly clientMessageId: string;
+	readonly inputId: string;
+	readonly turnId: string;
+}
+
 export interface E4AgentStreamBridgeOptions {
 	readonly session: OpenedSession;
 	readonly durableCursor?: E4DurableCursor;
 	readonly projectionReceiptEventIds?: ReadonlySet<string>;
+	readonly ownedSubmissions?: readonly E4OwnedSubmission[];
 	readonly emitAgentEvent: (event: AgentEvent, idempotencyKey: string) => Promise<void>;
 	readonly releaseAgentEvent: (idempotencyKey: string) => void;
-	readonly projectionCommitted: (cursor: E4DurableCursor) => Promise<void>;
+	readonly submissionOwned: (submission: E4OwnedSubmission) => Promise<void>;
+	readonly projectionCommitted: (
+		cursor: E4DurableCursor,
+		ownedSubmissions: readonly E4OwnedSubmission[],
+	) => Promise<void>;
 	readonly modelPolicy?: E4BackendModelPolicy;
 	readonly requestPermission?: E4PermissionHandler;
 }
@@ -113,6 +126,7 @@ export class E4AgentStreamBridge {
 	readonly #emitAgentEvent: E4AgentStreamBridgeOptions["emitAgentEvent"];
 	readonly #releaseAgentEvent: E4AgentStreamBridgeOptions["releaseAgentEvent"];
 	readonly #projectionCommitted: E4AgentStreamBridgeOptions["projectionCommitted"];
+	readonly #submissionOwned: E4AgentStreamBridgeOptions["submissionOwned"];
 	readonly #receipts: ReadonlySet<string>;
 	readonly #modelPolicy: E4BackendModelPolicy | undefined;
 	readonly #requestPermission: E4PermissionHandler | undefined;
@@ -120,12 +134,16 @@ export class E4AgentStreamBridge {
 	readonly #observeAbort = new AbortController();
 	readonly #sinks = new Map<string, TurnSink>();
 	readonly #adoptedTerminalTurnIds = new Set<string>();
+	readonly #ownedSubmissions = new Map<string, E4OwnedSubmission>();
 	readonly #observedSubmitAttempts = new Map<string, PendingSubmit>();
 	readonly #submittingSinks = new Set<TurnSink>();
 	readonly #submissionsInFlight = new Set<Promise<void>>();
+	readonly #lateSubmissionRecoveries = new Set<Promise<void>>();
 	readonly #undurableSinks = new Set<TurnSink>();
 	readonly #deferredProjectionKeys: string[] = [];
 	readonly #cancellationsInFlight = new Set<Promise<boolean>>();
+	readonly #eventApplicationsInFlight = new Set<Promise<void>>();
+	readonly #ownershipWaiters = new Set<() => void>();
 	#started = false;
 	#closed = false;
 	#observeFailure: Error | undefined;
@@ -138,10 +156,22 @@ export class E4AgentStreamBridge {
 		this.#emitAgentEvent = options.emitAgentEvent;
 		this.#releaseAgentEvent = options.releaseAgentEvent;
 		this.#projectionCommitted = options.projectionCommitted;
+		this.#submissionOwned = options.submissionOwned;
 		this.#receipts = options.projectionReceiptEventIds ?? new Set();
 		this.#modelPolicy = options.modelPolicy;
 		this.#requestPermission = options.requestPermission;
 		this.#initialCursor = options.durableCursor;
+		for (const submission of options.ownedSubmissions ?? []) {
+			const key = String(submission.turnId);
+			const previous = this.#ownedSubmissions.get(key);
+			if (
+				previous &&
+				(previous.inputId !== submission.inputId || previous.clientMessageId !== submission.clientMessageId)
+			) {
+				throw new Error(`BreadBoard owned submission ${key} has conflicting correlation`);
+			}
+			this.#ownedSubmissions.set(key, submission);
+		}
 		this.stream = (model, context, streamOptions) => {
 			const stream = new AssistantMessageEventStream();
 			if (!this.#started) {
@@ -171,12 +201,15 @@ export class E4AgentStreamBridge {
 	async #performClose(): Promise<void> {
 		this.#closed = true;
 		this.#observeAbort.abort();
+		this.#notifyOwnershipWaiters();
 		for (const sink of [...this.#sinks.values(), ...this.#submittingSinks]) {
 			this.#failSink(sink, "BreadBoard session closed", "aborted");
 			this.#cancelSink(sink, "user_requested");
 		}
 		await Promise.all([...this.#submissionsInFlight]);
+		await Promise.all([...this.#lateSubmissionRecoveries]);
 		await Promise.all([...this.#cancellationsInFlight]);
+		await Promise.all([...this.#eventApplicationsInFlight]);
 		this.#sinks.clear();
 		this.#adoptedTerminalTurnIds.clear();
 		this.#observedSubmitAttempts.clear();
@@ -207,7 +240,7 @@ export class E4AgentStreamBridge {
 		if (this.#undurableSinks.size > 0) {
 			throw new Error("BreadBoard cannot commit a terminal cursor while replay projection is incomplete");
 		}
-		await this.#projectionCommitted(cursor);
+		await this.#projectionCommitted(cursor, this.#ownedSubmissionSnapshot());
 		for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
 		this.#terminalCursor = undefined;
 	}
@@ -232,6 +265,61 @@ export class E4AgentStreamBridge {
 			terminal: false,
 			pendingTextCompletion: undefined,
 		};
+	}
+
+	#ownedSubmissionSnapshot(): readonly E4OwnedSubmission[] {
+		return [...this.#ownedSubmissions.values()].sort((left, right) => left.turnId.localeCompare(right.turnId));
+	}
+
+	#notifyOwnershipWaiters(): void {
+		for (const resolve of this.#ownershipWaiters) resolve();
+		this.#ownershipWaiters.clear();
+	}
+
+	#waitForOwnershipChange(): Promise<void> {
+		if (this.#closed) return Promise.resolve();
+		return new Promise(resolve => {
+			this.#ownershipWaiters.add(resolve);
+		});
+	}
+
+	async #recordOwnedCorrelation(submission: E4OwnedSubmission, turnId: TurnId, notifyWaiters = true): Promise<void> {
+		const previous = this.#ownedSubmissions.get(submission.turnId);
+		if (
+			previous &&
+			(previous.inputId !== submission.inputId || previous.clientMessageId !== submission.clientMessageId)
+		) {
+			throw new Error(`BreadBoard submission receipt collided with owned turn ${submission.turnId}`);
+		}
+		if (previous) return;
+		try {
+			await this.#submissionOwned(submission);
+			const persisted = this.#ownedSubmissions.get(submission.turnId);
+			if (
+				persisted &&
+				(persisted.inputId !== submission.inputId || persisted.clientMessageId !== submission.clientMessageId)
+			) {
+				throw new Error(`BreadBoard durable submission ownership collided for turn ${submission.turnId}`);
+			}
+			this.#ownedSubmissions.set(submission.turnId, persisted ?? submission);
+			if (notifyWaiters) this.#notifyOwnershipWaiters();
+		} catch (error) {
+			this.#invalidateBridge(`BreadBoard submission ownership persistence failed: ${safeErrorMessage(error)}`);
+			await this.#cancel(turnId, "user_requested");
+			throw error;
+		}
+	}
+
+	async #recordOwnedSubmission(receipt: SubmitReceipt, notifyWaiters = true): Promise<void> {
+		await this.#recordOwnedCorrelation(
+			{
+				clientMessageId: String(receipt.clientMessageId),
+				inputId: String(receipt.inputId),
+				turnId: String(receipt.turnId),
+			},
+			receipt.turnId,
+			notifyWaiters,
+		);
 	}
 
 	async #submitAttempt(
@@ -262,12 +350,42 @@ export class E4AgentStreamBridge {
 
 		attempt.recoveringAfterAbort = true;
 		this.#pendingSubmit ??= attempt;
-		void submission
-			.then(receipt => this.#session.cancel({ turnId: receipt.turnId, reason: "user_requested" }))
-			.catch(() => undefined)
-			.finally(() => {
-				if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
-			});
+		void submission.then(
+			receipt => {
+				let recovery!: Promise<void>;
+				recovery = (async () => {
+					const turnKey = String(receipt.turnId);
+					if (this.#adoptedTerminalTurnIds.has(turnKey)) {
+						attempt.turnId = receipt.turnId;
+						this.#rememberObservedSubmit(attempt);
+						if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
+						return;
+					}
+					if (!this.#closed) await this.#recordOwnedSubmission(receipt);
+					attempt.turnId = receipt.turnId;
+					if (this.#adoptedTerminalTurnIds.has(turnKey)) {
+						this.#rememberObservedSubmit(attempt);
+						if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
+						return;
+					}
+					await this.#cancel(receipt.turnId, "user_requested");
+				})()
+					.catch(error => {
+						if (!this.#closed) {
+							this.#invalidateBridge(
+								`BreadBoard aborted submission recovery failed: ${safeErrorMessage(error)}`,
+							);
+						}
+					})
+					.finally(() => {
+						this.#lateSubmissionRecoveries.delete(recovery);
+					});
+				this.#lateSubmissionRecoveries.add(recovery);
+			},
+			() => {
+				if (this.#pendingSubmit === attempt) attempt.recoveringAfterAbort = false;
+			},
+		);
 		this.#failSink(sink, "BreadBoard submission cancelled while admission was in progress", "aborted");
 		return undefined;
 	}
@@ -314,6 +432,7 @@ export class E4AgentStreamBridge {
 		const sink = this.#newSink(backendModel, stream);
 		this.#submittingSinks.add(sink);
 		let attempt: PendingSubmit | undefined;
+		let ownershipNotificationPending = false;
 		try {
 			const input = submitInputFromContext(context);
 			const canonicalDigest = await canonicalSubmitDigest(input);
@@ -328,21 +447,16 @@ export class E4AgentStreamBridge {
 					canonicalDigest,
 					input: { ...input, clientMessageId: crypto.randomUUID() },
 					recoveringAfterAbort: false,
+					turnId: undefined,
 				};
 			const receipt = await this.#submitAttempt(attempt, sink, signal);
 			if (!receipt) return;
-			if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
-			sink.turnId = receipt.turnId;
-			const failure = this.#currentObserveFailure();
-			if (failure || this.#closed) {
-				this.#failSink(sink, failure ? failure.message : "BreadBoard session is closed", "error");
-				this.#cancelSink(sink, failure ? "timeout" : "user_requested");
-				return;
-			}
+			attempt.turnId = receipt.turnId;
 			const turnKey = String(receipt.turnId);
 			const observedSink = this.#sinks.get(turnKey);
 			if (observedSink?.adopted || this.#adoptedTerminalTurnIds.has(turnKey)) {
 				this.#rememberObservedSubmit(attempt);
+				if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
 				this.#failSink(
 					sink,
 					"BreadBoard submission was already observed; its result is already in the transcript",
@@ -352,6 +466,16 @@ export class E4AgentStreamBridge {
 			}
 			if (observedSink) {
 				this.#invalidateBridge(`BreadBoard submission receipt collided with observed turn ${turnKey}`);
+				return;
+			}
+			await this.#recordOwnedSubmission(receipt, false);
+			ownershipNotificationPending = true;
+			if (this.#pendingSubmit === attempt) this.#pendingSubmit = undefined;
+			sink.turnId = receipt.turnId;
+			const failure = this.#currentObserveFailure();
+			if (failure || this.#closed) {
+				this.#failSink(sink, failure ? failure.message : "BreadBoard session is closed", "error");
+				this.#cancelSink(sink, failure ? "timeout" : "user_requested");
 				return;
 			}
 			this.#sinks.set(turnKey, sink);
@@ -365,7 +489,17 @@ export class E4AgentStreamBridge {
 			if (attempt && isAmbiguousSubmitFailure(error)) this.#pendingSubmit ??= attempt;
 			this.#failSink(sink, safeErrorMessage(error), "error");
 		} finally {
+			if (ownershipNotificationPending) this.#notifyOwnershipWaiters();
 			this.#submittingSinks.delete(sink);
+		}
+	}
+
+	async #trackEventApplication(application: Promise<void>): Promise<void> {
+		this.#eventApplicationsInFlight.add(application);
+		try {
+			await application;
+		} finally {
+			this.#eventApplicationsInFlight.delete(application);
 		}
 	}
 
@@ -373,6 +507,7 @@ export class E4AgentStreamBridge {
 		try {
 			const after = this.#initialCursor && this.#initialCursor.sequence > 0 ? this.#initialCursor : undefined;
 			for await (const event of this.#session.events({ signal: this.#observeAbort.signal, after })) {
+				if (this.#closed) break;
 				if (event.kind === "runtime_error_observed" && (event.scope === "session" || event.turnId === null)) {
 					throw new Error(
 						`BreadBoard runtime error [${event.payload.error.code}]: ${event.payload.error.message}`,
@@ -386,7 +521,7 @@ export class E4AgentStreamBridge {
 						case "skills_catalog_observed":
 						case "skills_selection_observed":
 						case "ctree_snapshot_observed":
-							await this.#commit(event, []);
+							await this.#trackEventApplication(this.#commit(event, []));
 							continue;
 						default:
 							throw new Error("BreadBoard unsupported canonical runtime event family");
@@ -397,6 +532,22 @@ export class E4AgentStreamBridge {
 				if (!sink && this.#submissionsInFlight.size) {
 					await Promise.all([...this.#submissionsInFlight]);
 					sink = this.#sinks.get(turnKey);
+					if (this.#closed || this.#observeFailure) break;
+				}
+				let ownership = this.#ownedSubmissions.get(turnKey);
+				const pendingAttempt = this.#pendingSubmit;
+				if (!sink && !ownership && pendingAttempt && pendingAttempt.turnId === undefined) {
+					await this.#waitForOwnershipChange();
+					if (this.#closed || this.#observeFailure) break;
+					sink = this.#sinks.get(turnKey);
+					ownership = this.#ownedSubmissions.get(turnKey);
+				}
+				if (!sink && !ownership) {
+					await this.#trackEventApplication(this.#commit(event, []));
+					continue;
+				}
+				if (ownership && ownership.inputId !== String(event.inputId)) {
+					throw new Error(`BreadBoard owned turn ${turnKey} changed input correlation`);
 				}
 				if (!sink) {
 					const backendModel = this.#modelPolicy?.model;
@@ -405,7 +556,7 @@ export class E4AgentStreamBridge {
 					sink.turnId = event.turnId;
 					this.#sinks.set(turnKey, sink);
 				}
-				await this.#applyEvent(sink, event);
+				await this.#trackEventApplication(this.#applyEvent(sink, event));
 			}
 			if (!this.#closed) throw new Error("BreadBoard event observer ended unexpectedly");
 		} catch (error) {
@@ -469,6 +620,7 @@ export class E4AgentStreamBridge {
 				if (cancellation && !(await cancellation)) return;
 				this.#undurableSinks.delete(sink);
 				this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
+				if (sink.turnId !== undefined) this.#ownedSubmissions.delete(String(sink.turnId));
 				this.#terminalCursor = cursorFor(event);
 				sink.terminal = true;
 				this.#removeSink(sink);
@@ -660,6 +812,13 @@ export class E4AgentStreamBridge {
 		}
 	}
 
+	#settlePendingSubmit(sink: TurnSink): void {
+		const attempt = this.#pendingSubmit;
+		if (!attempt || sink.turnId === undefined || attempt.turnId !== sink.turnId) return;
+		this.#rememberObservedSubmit(attempt);
+		this.#pendingSubmit = undefined;
+	}
+
 	#rememberAdoptedTerminal(sink: TurnSink): void {
 		if (sink.turnId === undefined) return;
 		this.#adoptedTerminalTurnIds.add(String(sink.turnId));
@@ -675,6 +834,7 @@ export class E4AgentStreamBridge {
 		event: Extract<LoggedSessionEvent, { readonly kind: "turn_completed" }>,
 	): Promise<void> {
 		this.#ensureStarted(sink);
+		if (sink.turnId !== undefined) this.#ownedSubmissions.delete(String(sink.turnId));
 		if (sink.adopted) {
 			if (sink.messageText) {
 				if (!sink.pendingTextCompletion) {
@@ -694,6 +854,7 @@ export class E4AgentStreamBridge {
 			this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 			this.#terminalCursor = cursorFor(event);
 		}
+		this.#settlePendingSubmit(sink);
 		if (sink.adopted) this.#rememberAdoptedTerminal(sink);
 		sink.terminal = true;
 		this.#removeSink(sink);
@@ -705,6 +866,7 @@ export class E4AgentStreamBridge {
 		message: string,
 		reason: "error" | "aborted",
 	): Promise<void> {
+		if (sink.turnId !== undefined) this.#ownedSubmissions.delete(String(sink.turnId));
 		if (sink.adopted) {
 			if (sink.messageText && !sink.pendingTextCompletion) {
 				throw new Error("BreadBoard replay ended mid-message without a completion boundary");
@@ -724,6 +886,7 @@ export class E4AgentStreamBridge {
 			this.#deferredProjectionKeys.push(...sink.pendingProjectionKeys.splice(0));
 			this.#terminalCursor = cursorFor(event);
 		}
+		this.#settlePendingSubmit(sink);
 		if (sink.adopted) this.#rememberAdoptedTerminal(sink);
 		sink.terminal = true;
 		this.#removeSink(sink);
@@ -755,7 +918,7 @@ export class E4AgentStreamBridge {
 			this.#terminalCursor = cursorFor(event);
 			return;
 		}
-		await this.#projectionCommitted(cursorFor(event));
+		await this.#projectionCommitted(cursorFor(event), this.#ownedSubmissionSnapshot());
 		for (const key of this.#deferredProjectionKeys.splice(0)) this.#releaseAgentEvent(key);
 	}
 
@@ -802,6 +965,7 @@ export class E4AgentStreamBridge {
 		if (this.#observeFailure) return;
 		this.#observeFailure = new Error(message);
 		this.#observeAbort.abort();
+		this.#notifyOwnershipWaiters();
 		for (const sink of [...this.#sinks.values(), ...this.#submittingSinks]) {
 			this.#cancelSink(sink, "timeout");
 			this.#failSink(sink, message, "error");

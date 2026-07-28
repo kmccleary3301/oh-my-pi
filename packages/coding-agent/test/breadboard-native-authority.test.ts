@@ -49,7 +49,7 @@ const TEST_RUNTIME_AUTHORITY = {
 	emitAgentEvent: async () => {},
 	releaseAgentEvent: () => {},
 };
-const BINDING_SCHEMA_VERSION = "breadboard.session-binding.v2" as const;
+const BINDING_SCHEMA_VERSION = "breadboard.session-binding.v3" as const;
 const REPLAY_CONFIGURATION_DIGEST = "sha256:test-replay-configuration";
 const REPLAY_CONTRACT_DIGEST = "sha256:test-replay-snapshot";
 
@@ -57,12 +57,18 @@ function sessionBinding(
 	sessionId: string,
 	sequence = 0,
 	eventId: string | null = sequence === 0 ? null : `event-${sequence}`,
+	ownedSubmissions: readonly {
+		readonly clientMessageId: string;
+		readonly inputId: string;
+		readonly turnId: string;
+	}[] = [],
 ) {
 	return {
 		schemaVersion: BINDING_SCHEMA_VERSION,
 		sessionId,
 		replayConfigurationDigest: REPLAY_CONFIGURATION_DIGEST,
 		cursor: { eventId, sequence },
+		ownedSubmissions,
 	};
 }
 
@@ -1120,30 +1126,52 @@ describe("BreadBoard durable session activation", () => {
 			expect(bindings[0]?.type === "custom" ? bindings[0].data : undefined).toEqual(
 				sessionBinding("fresh-session", 2, "event-2"),
 			);
+			const ownedSubmission = {
+				clientMessageId: "client-message-owned",
+				inputId: "input-owned",
+				turnId: "turn-owned",
+			};
+			await bridgeOptions?.submissionOwned(ownedSubmission);
+			const ownershipBinding = manager
+				.getBranch()
+				.filter(entry => entry.type === "custom" && entry.customType === BREADBOARD_SESSION_BINDING_CUSTOM_TYPE)
+				.at(-1);
+			expect(ownershipBinding?.type === "custom" ? ownershipBinding.data : undefined).toEqual(
+				sessionBinding("fresh-session", 2, "event-2", [ownedSubmission]),
+			);
 			const branchScansBeforeProjection = getBranch.mock.calls.length;
 
-			await bridgeOptions?.projectionCommitted({ eventId: "event-3", sequence: 3 });
+			await bridgeOptions?.projectionCommitted({ eventId: "event-3", sequence: 3 }, [ownedSubmission]);
 			expect(getBranch).toHaveBeenCalledTimes(branchScansBeforeProjection);
 			const latest = manager
 				.getBranch()
 				.filter(entry => entry.type === "custom" && entry.customType === BREADBOARD_SESSION_BINDING_CUSTOM_TYPE)
 				.at(-1);
 			expect(latest?.type === "custom" ? latest.data : undefined).toEqual(
-				sessionBinding("fresh-session", 3, "event-3"),
+				sessionBinding("fresh-session", 3, "event-3", [ownedSubmission]),
 			);
-			expect(flush).toHaveBeenCalledTimes(2);
-			await expect(bridgeOptions?.projectionCommitted({ eventId: "event-2", sequence: 2 })).rejects.toBeInstanceOf(
-				BreadboardSessionTransitionError,
-			);
+			expect(flush).toHaveBeenCalledTimes(3);
+			await expect(
+				bridgeOptions?.projectionCommitted({ eventId: "event-2", sequence: 2 }, [ownedSubmission]),
+			).rejects.toBeInstanceOf(BreadboardSessionTransitionError);
 			flush.mockImplementation(async () => {
 				throw new Error("cursor flush failed");
 			});
-			await expect(bridgeOptions?.projectionCommitted({ eventId: "event-4", sequence: 4 })).rejects.toThrow(
-				"cursor flush failed",
-			);
+			await expect(
+				bridgeOptions?.projectionCommitted({ eventId: "event-4", sequence: 4 }, [ownedSubmission]),
+			).rejects.toThrow("cursor flush failed");
 			flush.mockRestore();
 			getBranch.mockRestore();
-			await expect(bridgeOptions?.projectionCommitted({ eventId: "event-4", sequence: 4 })).resolves.toBeUndefined();
+			await expect(
+				bridgeOptions?.projectionCommitted({ eventId: "event-4", sequence: 4 }, []),
+			).resolves.toBeUndefined();
+			const finalBinding = manager
+				.getBranch()
+				.filter(entry => entry.type === "custom" && entry.customType === BREADBOARD_SESSION_BINDING_CUSTOM_TYPE)
+				.at(-1);
+			expect(finalBinding?.type === "custom" ? finalBinding.data : undefined).toEqual(
+				sessionBinding("fresh-session", 4, "event-4"),
+			);
 		} finally {
 			await prepared.close();
 			await manager.close();
@@ -1153,7 +1181,12 @@ describe("BreadBoard durable session activation", () => {
 	test("hands the full validated resume cursor to the inert bridge", async () => {
 		using tempDir = TempDir.createSync("@breadboard-durable-resume-");
 		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
-		const binding = sessionBinding("resume-session", 2, "event-2");
+		const ownedResumeSubmission = {
+			clientMessageId: "resume-client-message",
+			inputId: "resume-input",
+			turnId: "resume-turn",
+		};
+		const binding = sessionBinding("resume-session", 2, "event-2", [ownedResumeSubmission]);
 		manager.appendCustomEntry(BREADBOARD_SESSION_BINDING_CUSTOM_TYPE, binding);
 		await manager.flush();
 		const start = mock(() => {});
@@ -1203,6 +1236,7 @@ describe("BreadBoard durable session activation", () => {
 
 		try {
 			expect(bridgeOptions?.durableCursor).toEqual({ eventId: "event-2", sequence: 2 });
+			expect(bridgeOptions?.ownedSubmissions).toEqual([ownedResumeSubmission]);
 			expect(start).not.toHaveBeenCalled();
 			await prepared.activate(manager);
 			expect(start).not.toHaveBeenCalled();

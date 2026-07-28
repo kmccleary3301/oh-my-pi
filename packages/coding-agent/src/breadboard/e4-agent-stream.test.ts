@@ -36,7 +36,7 @@ const wireEvent = (
 		id: `event-${sequence}`,
 		seq: sequence,
 		session_id: "session-1",
-		input_id: turnId === null ? null : "input-1",
+		input_id: turnId === null ? null : turnId === "turn-1" ? "input-1" : `input-${turnId.replace(/^turn-/, "")}`,
 		turn_id: turnId,
 		timestamp_ms: sequence,
 		type,
@@ -52,6 +52,11 @@ const receipt: SubmitReceipt = {
 	turnId: started.turnId,
 	disposition: "started",
 	originalDisposition: "started",
+};
+const ownedReceipt = {
+	clientMessageId: String(receipt.clientMessageId),
+	inputId: String(receipt.inputId),
+	turnId: String(receipt.turnId),
 };
 
 function openedSession(events: readonly LoggedSessionEvent[], submitted: SubmitInput[]): OpenedSessionRuntime {
@@ -187,6 +192,7 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(6, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(events, submitted),
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -239,6 +245,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -264,10 +271,9 @@ describe("E4AgentStreamBridge", () => {
 		}
 	});
 
-	test("rejects an unchanged retry after its ambiguous submission was already observed to completion", async () => {
+	test("attaches an unchanged retry after ambiguous admission before replaying its completed turn", async () => {
 		const submitted: SubmitInput[] = [];
 		const firstFailed = Promise.withResolvers<void>();
-		const terminalProjected = Promise.withResolvers<void>();
 		let attempts = 0;
 		const session: OpenedSessionRuntime = {
 			...openedSession([], []),
@@ -295,12 +301,11 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
-			async projectionCommitted(cursor) {
-				if (cursor.sequence === 3) terminalProjected.resolve();
-			},
+			async projectionCommitted() {},
 			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
@@ -308,27 +313,21 @@ describe("E4AgentStreamBridge", () => {
 		try {
 			const firstResult = await (await startBridgeStream(bridge, model, context)).result();
 			expect(firstResult.stopReason).toBe("error");
-			await terminalProjected.promise;
 
 			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
-			expect(retryResult.stopReason).toBe("error");
-			expect(retryResult.errorMessage).toContain("result is already in the transcript");
+			expect(retryResult.stopReason).toBe("stop");
 			expect(submitted).toHaveLength(2);
 			expect(submitted[1]).toBe(submitted[0]);
-			const repeatedRetryResult = await (await startBridgeStream(bridge, model, context)).result();
-			expect(repeatedRetryResult.stopReason).toBe("error");
-			expect(repeatedRetryResult.errorMessage).toContain("result is already in the transcript");
-			expect(submitted).toHaveLength(3);
-			expect(submitted[2]).toBe(submitted[0]);
 		} finally {
 			await bridge.close();
 		}
 	});
 
-	test("rejects an unchanged retry while its ambiguously submitted turn is being observed", async () => {
+	test("attaches an unchanged retry while its ambiguously admitted turn is being observed", async () => {
 		const submitted: SubmitInput[] = [];
 		const firstFailed = Promise.withResolvers<void>();
 		const startedProjected = Promise.withResolvers<void>();
+		const finishObservedTurn = Promise.withResolvers<void>();
 		let attempts = 0;
 		const session: OpenedSessionRuntime = {
 			...openedSession([], []),
@@ -347,6 +346,8 @@ describe("E4AgentStreamBridge", () => {
 			async *events(request) {
 				await firstFailed.promise;
 				yield started;
+				await finishObservedTurn.promise;
+				yield wireEvent(3, "turn_completed", {});
 				if (!request?.signal?.aborted) {
 					await new Promise<void>(resolve =>
 						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
@@ -355,6 +356,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -368,14 +370,173 @@ describe("E4AgentStreamBridge", () => {
 		try {
 			const firstResult = await (await startBridgeStream(bridge, model, context)).result();
 			expect(firstResult.stopReason).toBe("error");
-			await startedProjected.promise;
 
-			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
-			expect(retryResult.stopReason).toBe("error");
-			expect(retryResult.errorMessage).toContain("result is already in the transcript");
+			const retryStream = await startBridgeStream(bridge, model, context);
+			await startedProjected.promise;
+			finishObservedTurn.resolve();
+			const retryResult = await retryStream.result();
+			expect(retryResult.stopReason).toBe("stop");
 			expect(submitted).toHaveLength(2);
 			expect(submitted[1]).toBe(submitted[0]);
 		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("does not claim a foreign turn while resolving an ambiguous local submission", async () => {
+		const submitted: SubmitInput[] = [];
+		const firstFailed = Promise.withResolvers<void>();
+		const commits: number[] = [];
+		let attempts = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				attempts += 1;
+				if (attempts === 1) {
+					firstFailed.resolve();
+					throw new LifecycleE4ClientError({ kind: "timeout" });
+				}
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async *events() {
+				await firstFailed.promise;
+				yield wireEvent(2, "turn_start", {}, "turn-2");
+				yield wireEvent(3, "turn_completed", {}, "turn-2");
+				yield wireEvent(4, "turn_start", {});
+				yield wireEvent(5, "turn_completed", {});
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				commits.push(cursor.sequence);
+			},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		try {
+			expect((await (await startBridgeStream(bridge, model, context)).result()).stopReason).toBe("error");
+			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(retryResult.stopReason).toBe("stop");
+			expect(commits).toEqual([2, 3, 4]);
+			expect(submitted).toHaveLength(2);
+			expect(submitted[1]).toBe(submitted[0]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
+	test("does not restore ownership when a retry receipt names an already adopted terminal turn", async () => {
+		const submission = Promise.withResolvers<SubmitReceipt>();
+		const lateRetry = Promise.withResolvers<SubmitReceipt>();
+		const submitStarted = Promise.withResolvers<void>();
+		const terminalCommitted = Promise.withResolvers<void>();
+		const lateRetryStarted = Promise.withResolvers<void>();
+		const ownershipStarted = Promise.withResolvers<void>();
+		const persistOwnership = Promise.withResolvers<void>();
+		const ownershipCalls: string[] = [];
+		const ownershipSnapshots: string[][] = [];
+		let attempts = 0;
+		let firstInput: StructuredSubmit | undefined;
+		let lateRetryInput: StructuredSubmit | undefined;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				firstInput ??= input as StructuredSubmit;
+				attempts += 1;
+				if (attempts === 1) {
+					submitStarted.resolve();
+					return submission.promise;
+				}
+				if (attempts === 3) {
+					lateRetryInput = input as StructuredSubmit;
+					lateRetryStarted.resolve();
+					return lateRetry.promise;
+				}
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async cancel(): Promise<CancellationReceipt> {
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				await submitStarted.promise;
+				yield started;
+				yield wireEvent(3, "turn_completed", {});
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			async submissionOwned(owned) {
+				ownershipCalls.push(owned.turnId);
+				ownershipStarted.resolve();
+				await persistOwnership.promise;
+			},
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor, owned) {
+				ownershipSnapshots.push(owned.map(item => item.turnId));
+				if (cursor.sequence === 3) terminalCommitted.resolve();
+			},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+		const controller = new AbortController();
+
+		try {
+			const firstStream = await startBridgeStream(bridge, model, context, { signal: controller.signal });
+			await submitStarted.promise;
+			controller.abort();
+			expect((await firstStream.result()).stopReason).toBe("aborted");
+			if (!firstInput) throw new Error("first submission missing");
+			submission.resolve({
+				...receipt,
+				clientMessageId: firstInput.clientMessageId as ClientMessageId,
+			});
+			await ownershipStarted.promise;
+			const prematureCommit = await Promise.race([
+				terminalCommitted.promise.then(() => true),
+				Bun.sleep(10).then(() => false),
+			]);
+			expect(prematureCommit).toBeFalse();
+			persistOwnership.resolve();
+			await terminalCommitted.promise;
+
+			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(retryResult.stopReason).toBe("error");
+			expect(retryResult.errorMessage).toContain("already in the transcript");
+			expect(ownershipCalls).toEqual([String(receipt.turnId)]);
+			expect(ownershipSnapshots.at(-1)).toEqual([]);
+
+			const lateAbort = new AbortController();
+			const lateStream = await startBridgeStream(bridge, model, context, { signal: lateAbort.signal });
+			await lateRetryStarted.promise;
+			lateAbort.abort();
+			expect((await lateStream.result()).stopReason).toBe("aborted");
+			if (!lateRetryInput) throw new Error("late retry submission missing");
+			lateRetry.resolve({
+				...receipt,
+				clientMessageId: lateRetryInput.clientMessageId as ClientMessageId,
+			});
+			await Bun.sleep(0);
+			expect(ownershipCalls).toEqual([String(receipt.turnId)]);
+		} finally {
+			persistOwnership.resolve();
 			await bridge.close();
 		}
 	});
@@ -405,6 +566,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -432,6 +594,171 @@ describe("E4AgentStreamBridge", () => {
 		expect(cancellationTurnIds).toEqual([String(receipt.turnId)]);
 	});
 
+	test("waits for started late ownership persistence before closing", async () => {
+		const submission = Promise.withResolvers<SubmitReceipt>();
+		const submitStarted = Promise.withResolvers<void>();
+		const ownershipStarted = Promise.withResolvers<void>();
+		const persistOwnership = Promise.withResolvers<void>();
+		let submitted: StructuredSubmit | undefined;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted = input as StructuredSubmit;
+				submitStarted.resolve();
+				return submission.promise;
+			},
+			async cancel(): Promise<CancellationReceipt> {
+				return {} as CancellationReceipt;
+			},
+			async *events(request) {
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {
+				ownershipStarted.resolve();
+				await persistOwnership.promise;
+			},
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+		const controller = new AbortController();
+
+		const stream = await startBridgeStream(bridge, model, context, { signal: controller.signal });
+		await submitStarted.promise;
+		controller.abort();
+		expect((await stream.result()).stopReason).toBe("aborted");
+		if (!submitted) throw new Error("submission missing");
+		submission.resolve({
+			...receipt,
+			clientMessageId: submitted.clientMessageId as ClientMessageId,
+		});
+		await ownershipStarted.promise;
+
+		const close = bridge.close();
+		expect(
+			await Promise.race([close.then(() => "closed" as const), Bun.sleep(10).then(() => "blocked" as const)]),
+		).toBe("blocked");
+		persistOwnership.resolve();
+		await close;
+	});
+
+	test("does not advance the cursor when ownership persistence fails during admission", async () => {
+		const ownershipStarted = Promise.withResolvers<void>();
+		const persistOwnership = Promise.withResolvers<void>();
+		const commits: number[] = [];
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async cancel(): Promise<CancellationReceipt> {
+				return {} as CancellationReceipt;
+			},
+			async *events() {
+				await ownershipStarted.promise;
+				yield started;
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {
+				ownershipStarted.resolve();
+				await persistOwnership.promise;
+			},
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				commits.push(cursor.sequence);
+			},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		try {
+			const stream = await startBridgeStream(bridge, model, context);
+			await ownershipStarted.promise;
+			persistOwnership.reject(new Error("binding flush failed"));
+			const result = await stream.result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("binding flush failed");
+			await Bun.sleep(0);
+			expect(commits).toEqual([]);
+		} finally {
+			persistOwnership.resolve();
+			await bridge.close();
+		}
+	});
+
+	test("retains ambiguous ownership after an aborted submit later rejects", async () => {
+		const firstSubmission = Promise.withResolvers<SubmitReceipt>();
+		const submitStarted = Promise.withResolvers<void>();
+		const submitted: SubmitInput[] = [];
+		let attempts = 0;
+		const session: OpenedSessionRuntime = {
+			...openedSession([], []),
+			async submit(input) {
+				submitted.push(input);
+				attempts += 1;
+				if (attempts === 1) {
+					submitStarted.resolve();
+					return firstSubmission.promise;
+				}
+				return {
+					...receipt,
+					clientMessageId: (input as StructuredSubmit).clientMessageId as ClientMessageId,
+				};
+			},
+			async *events(request) {
+				await submitStarted.promise;
+				yield started;
+				yield wireEvent(3, "turn_completed", {});
+				if (!request?.signal?.aborted) {
+					await new Promise<void>(resolve =>
+						request?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+					);
+				}
+			},
+		};
+		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
+			session,
+			durableCursor: undefined,
+			releaseAgentEvent() {},
+			async projectionCommitted() {},
+			async emitAgentEvent() {},
+			modelPolicy: { kind: "fixed", model },
+		});
+		const controller = new AbortController();
+
+		try {
+			const firstStream = await startBridgeStream(bridge, model, context, { signal: controller.signal });
+			await submitStarted.promise;
+			controller.abort();
+			expect((await firstStream.result()).stopReason).toBe("aborted");
+			firstSubmission.reject(new LifecycleE4ClientError({ kind: "timeout" }));
+			await Bun.sleep(0);
+
+			const retryResult = await (await startBridgeStream(bridge, model, context)).result();
+			expect(retryResult.stopReason).toBe("stop");
+			expect(submitted).toHaveLength(2);
+			expect(submitted[1]).toBe(submitted[0]);
+		} finally {
+			await bridge.close();
+		}
+	});
+
 	test("fails closed on a different prompt while an ambiguous submission is unresolved", async () => {
 		const submitted: SubmitInput[] = [];
 		const session: OpenedSessionRuntime = {
@@ -449,6 +776,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -509,6 +837,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -549,6 +878,7 @@ describe("E4AgentStreamBridge", () => {
 	test("fails and cancels only the sink correlated to a turn-owned runtime error", async () => {
 		const submissionsReady = Promise.withResolvers<void>();
 		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const ownershipSnapshots: string[][] = [];
 		const secondReceipt: SubmitReceipt = {
 			...receipt,
 			clientMessageId: "client-message-2" as ClientMessageId,
@@ -589,10 +919,13 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
-			async projectionCommitted() {},
+			async projectionCommitted(_cursor, owned) {
+				ownershipSnapshots.push(owned.map(item => item.turnId));
+			},
 			async emitAgentEvent() {},
 			modelPolicy: { kind: "fixed", model: model },
 		});
@@ -612,6 +945,8 @@ describe("E4AgentStreamBridge", () => {
 			expect(secondResult.stopReason).toBe("stop");
 			expect(secondResult.content).toEqual([{ type: "text", text: "healthy" }]);
 			expect(cancelled).toEqual([{ turnId: receipt.turnId, reason: "timeout" }]);
+			await bridge.close();
+			expect(ownershipSnapshots.at(-1)).toEqual([]);
 		} finally {
 			await bridge.close();
 		}
@@ -657,6 +992,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -741,6 +1077,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -816,6 +1153,7 @@ describe("E4AgentStreamBridge", () => {
 				},
 			};
 			const bridge = new E4AgentStreamBridge({
+				async submissionOwned() {},
 				session,
 				durableCursor: undefined,
 				releaseAgentEvent() {},
@@ -839,6 +1177,7 @@ describe("E4AgentStreamBridge", () => {
 	test("parses canonical JSON-string tool arguments before native projection", async () => {
 		const agentEvents: AgentEvent[] = [];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(
 				[
 					started,
@@ -929,6 +1268,7 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(6, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(events, submitted),
 			durableCursor: { eventId: "event-1", sequence: 1 },
 			releaseAgentEvent() {},
@@ -1074,6 +1414,7 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(15, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(events, submitted),
 			durableCursor: { eventId: "event-1", sequence: 1 },
 			releaseAgentEvent() {},
@@ -1140,6 +1481,7 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(7, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(events, submitted),
 			durableCursor: { eventId: "event-1", sequence: 1 },
 			releaseAgentEvent() {},
@@ -1230,6 +1572,7 @@ describe("E4AgentStreamBridge", () => {
 		const releasedProjectionKeys: string[] = [];
 		let agent!: Agent;
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: runtime,
 			durableCursor: { eventId: "event-1", sequence: 1 },
 			releaseAgentEvent(key) {
@@ -1417,6 +1760,7 @@ describe("E4AgentStreamBridge", () => {
 	] as const) {
 		test(`preserves partial assistant text on turn ${terminal.label}`, async () => {
 			const bridge = new E4AgentStreamBridge({
+				async submissionOwned() {},
 				session: openedSession(
 					[
 						started,
@@ -1444,6 +1788,7 @@ describe("E4AgentStreamBridge", () => {
 
 	test("preserves partial assistant text when the event observer ends", async () => {
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(
 				[
 					started,
@@ -1490,6 +1835,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1527,6 +1873,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1573,6 +1920,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1641,6 +1989,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1705,6 +2054,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1740,6 +2090,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1806,6 +2157,7 @@ describe("E4AgentStreamBridge", () => {
 				},
 			};
 			const bridge = new E4AgentStreamBridge({
+				async submissionOwned() {},
 				session,
 				durableCursor: undefined,
 				releaseAgentEvent() {},
@@ -1866,6 +2218,7 @@ describe("E4AgentStreamBridge", () => {
 				},
 			};
 			const bridge = new E4AgentStreamBridge({
+				async submissionOwned() {},
 				session,
 				durableCursor: undefined,
 				releaseAgentEvent() {},
@@ -1918,6 +2271,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -1970,6 +2324,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -2005,6 +2360,7 @@ describe("E4AgentStreamBridge", () => {
 			const permission = permissionSession(responded, cancelled);
 			let promptCount = 0;
 			const bridge = new E4AgentStreamBridge({
+				async submissionOwned() {},
 				session: permission.session,
 				durableCursor: undefined,
 				releaseAgentEvent() {},
@@ -2041,6 +2397,7 @@ describe("E4AgentStreamBridge", () => {
 		const permission = permissionSession(responded, cancelled);
 		let promptCount = 0;
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: permission.session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -2075,6 +2432,7 @@ describe("E4AgentStreamBridge", () => {
 		const permission = permissionSession(responded, cancelled);
 		let promptCount = 0;
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: permission.session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -2109,6 +2467,7 @@ describe("E4AgentStreamBridge", () => {
 		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
 		const permission = permissionSession(responded, cancelled);
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: permission.session,
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -2138,6 +2497,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitted: SubmitInput[] = [];
 		const selectedModel = { ...model, id: `${model.id}-selected` };
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession([started, wireEvent(3, "turn_completed", {})], submitted),
 			durableCursor: undefined,
 			releaseAgentEvent() {},
@@ -2174,6 +2534,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: { eventId: "event-41", sequence: 41 },
 			async emitAgentEvent() {},
@@ -2205,6 +2566,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: { eventId: "event-0", sequence: 0 },
 			async emitAgentEvent() {},
@@ -2235,8 +2597,10 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(5, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(events, []),
 			durableCursor: { eventId: "event-1", sequence: 1 },
+			ownedSubmissions: [ownedReceipt],
 			async emitAgentEvent(event, key) {
 				projected.push(event);
 				projectionKeys.push(key);
@@ -2276,9 +2640,11 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(5, "turn_completed", {}),
 		];
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session: openedSession(events, []),
 			durableCursor: { eventId: "event-1", sequence: 1 },
 			projectionReceiptEventIds: new Set(["event-5"]),
+			ownedSubmissions: [ownedReceipt],
 			async emitAgentEvent(event) {
 				projected.push(event);
 			},
@@ -2295,6 +2661,39 @@ describe("E4AgentStreamBridge", () => {
 		await committed.promise;
 		expect(projected).toEqual([]);
 		expect(releasedKeys).toEqual([]);
+		await bridge.close();
+	});
+
+	test("does not adopt another client's replayed turn from the same canonical session", async () => {
+		const projected: AgentEvent[] = [];
+		const commits: Array<{ eventId: string; sequence: number }> = [];
+		const committed = Promise.withResolvers<void>();
+		const events = [
+			wireEvent(2, "turn_start", {}, "turn-2"),
+			wireEvent(3, "assistant.message.delta", { text: "foreign" }, "turn-2"),
+			wireEvent(4, "assistant.message.end", { text: "foreign" }, "turn-2"),
+			wireEvent(5, "turn_completed", {}, "turn-2"),
+		];
+		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
+			session: openedSession(events, []),
+			durableCursor: { eventId: "event-1", sequence: 1 },
+			ownedSubmissions: [ownedReceipt],
+			async emitAgentEvent(event) {
+				projected.push(event);
+			},
+			releaseAgentEvent() {},
+			async projectionCommitted(cursor) {
+				commits.push(cursor);
+				if (cursor.sequence === 5) committed.resolve();
+			},
+			modelPolicy: { kind: "fixed", model },
+		});
+
+		bridge.start();
+		await committed.promise;
+		expect(projected).toEqual([]);
+		expect(commits.map(cursor => cursor.sequence)).toEqual([2, 3, 4, 5]);
 		await bridge.close();
 	});
 
@@ -2351,6 +2750,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			async emitAgentEvent() {},
 			releaseAgentEvent() {},
@@ -2413,6 +2813,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			async emitAgentEvent() {},
 			releaseAgentEvent() {},
@@ -2494,6 +2895,7 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			async emitAgentEvent(_event, key) {
 				projectedKeys.push(key);
@@ -2562,8 +2964,10 @@ describe("E4AgentStreamBridge", () => {
 			},
 		};
 		const bridge = new E4AgentStreamBridge({
+			async submissionOwned() {},
 			session,
 			durableCursor: { eventId: "event-1", sequence: 1 },
+			ownedSubmissions: [ownedReceipt],
 			async emitAgentEvent() {},
 			releaseAgentEvent() {},
 			async projectionCommitted(cursor) {
