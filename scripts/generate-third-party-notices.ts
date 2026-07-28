@@ -143,7 +143,7 @@ export function readTarNoticeMembers(archiveBytes: Uint8Array): ArchiveNoticeMem
 		if (seen.has(member.path)) throw new Error(`duplicate bundled SDK license/notice member: ${member.path}`);
 		seen.add(member.path);
 	}
-	return members.sort((left, right) => left.path.localeCompare(right.path));
+	return members.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
 async function trackedNoticePaths(): Promise<string[]> {

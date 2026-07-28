@@ -58,6 +58,16 @@ describe("bundled archive notice inspection", () => {
 			},
 		]);
 	});
+
+	test("sorts archive members by locale-independent code units", () => {
+		const members = readTarNoticeMembers(
+			tarGzip([
+				{ path: "package/NOTICE-ä", content: "umlaut\n" },
+				{ path: "package/NOTICE-z", content: "ascii\n" },
+			]),
+		);
+		expect(members.map(member => member.path)).toEqual(["package/NOTICE-z", "package/NOTICE-ä"]);
+	});
 });
 
 describe("distribution notice bundle", () => {
