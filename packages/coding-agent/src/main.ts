@@ -6,20 +6,13 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
-import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import {
-	detectSensitiveValues,
-	type OpenedSessionRuntime,
-	REDACTED_VALUE,
-	type SessionSnapshot,
-} from "@breadboard/sdk";
+import { detectSensitiveValues, REDACTED_VALUE, type SessionSnapshot } from "@breadboard/sdk";
 import { type AgentEvent, EventLoopKeepalive, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryExists,
-	getAgentDir,
 	getLogPath,
 	getProjectDir,
 	logger,
@@ -38,18 +31,20 @@ import {
 	type E4OwnedSubmission,
 	type E4PermissionHandler,
 } from "./breadboard/e4-agent-stream";
-import { createCanonicalBreadboardEnginePort } from "./breadboard/engine-port";
+import {
+	type BreadboardEngineConnectionFailure,
+	type BreadboardEnginePort,
+	connectCanonicalBreadboardEnginePort,
+	type BreadboardLifecycleFailureResult as EngineLifecycleFailureResult,
+} from "./breadboard/engine-port";
 import { writeLifecyclePresentation } from "./breadboard/lifecycle/lifecycle-presenter";
-import { LIFECYCLE_FAILURE_STATES, type LifecycleState } from "./breadboard/lifecycle/lifecycle-state";
-import { type LifecycleDispatchResult, LifecycleSupervisor } from "./breadboard/lifecycle/lifecycle-supervisor";
-import { LocalAuthorityStore } from "./breadboard/lifecycle/local-authority-store";
 import {
 	BreadboardRunConfigError,
 	parseSelectedBreadboardConfig,
 	resolveBreadboardRunConfig,
 } from "./breadboard/lifecycle/run-config";
 import { resolveNativeLaunchPolicy } from "./breadboard/native-launch-policy";
-import type { OpenSession } from "./breadboard/session-port";
+import type { OpenedSession, OpenSession } from "./breadboard/session-port";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -1206,7 +1201,7 @@ export class BreadboardSessionTransitionError extends Error {
 	}
 }
 
-type NonReadyLifecycleResult = Exclude<LifecycleDispatchResult, { readonly kind: "ready" }>;
+type NonReadyLifecycleResult = BreadboardEngineConnectionFailure;
 
 export class BreadboardLifecycleStartupError extends Error {
 	constructor(readonly result: NonReadyLifecycleResult) {
@@ -1215,12 +1210,7 @@ export class BreadboardLifecycleStartupError extends Error {
 	}
 }
 
-export type BreadboardLifecycleFailureResult = Extract<LifecycleDispatchResult, { readonly kind: "failure" }>;
-type BreadboardLifecycleFailureState = BreadboardLifecycleFailureResult["state"];
-
-function isBreadboardLifecycleFailureState(state: LifecycleState): state is BreadboardLifecycleFailureState {
-	return (LIFECYCLE_FAILURE_STATES as readonly LifecycleState["name"][]).includes(state.name);
-}
+export type BreadboardLifecycleFailureResult = EngineLifecycleFailureResult;
 
 function resolveEffectiveBreadboardRunConfig(
 	parsed: Pick<Args, "engineMode" | "engineUrl">,
@@ -1233,6 +1223,39 @@ function resolveEffectiveBreadboardRunConfig(
 		selectedConfig,
 		workspacePath,
 	});
+}
+
+function resolveNativeSurfaceEngineSelection(
+	parsed: Pick<Args, "engineMode" | "engineUrl">,
+	activeSettings: Settings,
+	workspacePath: string,
+): Pick<Args, "engineMode" | "engineUrl"> {
+	const selected = parseSelectedBreadboardConfig(activeSettings.getRaw("breadboard"));
+	const selectedExplicit = ["engineMode", "baseUrl", "auth", "tls", "engineArtifact"].some(key =>
+		Object.hasOwn(selected, key),
+	);
+	const environmentExplicit = [
+		process.env.BREADBOARD_ENGINE_MODE,
+		process.env.BREADBOARD_API_URL,
+		process.env.BREADBOARD_API_TOKEN,
+		process.env.BREADBOARD_API_TOKEN_REF,
+		process.env.BREADBOARD_MTLS_IDENTITY_REF,
+		process.env.BREADBOARD_TLS_SPKI_PIN,
+		process.env.BREADBOARD_ENGINE_EXECUTABLE,
+		process.env.BREADBOARD_ENGINE_ARGV_JSON,
+		process.env.BREADBOARD_ENGINE_EXECUTABLE_SHA256,
+		process.env.BREADBOARD_ENGINE_SOURCE_SHA256,
+		process.env.BREADBOARD_ENGINE_BACKEND_COMMIT,
+	].some(value => value !== undefined);
+	if (parsed.engineMode === undefined && parsed.engineUrl === undefined && !selectedExplicit && !environmentExplicit) {
+		return parsed;
+	}
+	const effective = resolveBreadboardRunConfig({
+		cli: { engineMode: parsed.engineMode, engineUrl: parsed.engineUrl },
+		selectedConfig: selected,
+		workspacePath,
+	});
+	return { engineMode: effective.mode, engineUrl: effective.endpoint };
 }
 
 export function createBreadboardStartupForkPolicy(
@@ -1321,48 +1344,14 @@ export interface BreadboardRuntimeAuthority {
 	readonly requestPermission: E4PermissionHandler;
 }
 
-export interface BreadboardLifecycleStateSignal {
-	failure(): BreadboardLifecycleFailureState | undefined;
-	subscribe(listener: (state: LifecycleState) => void): () => void;
-}
-
-function createBreadboardLifecycleStateMonitor(): {
-	readonly signal: BreadboardLifecycleStateSignal;
-	readonly stateChanged: (state: LifecycleState) => void;
-} {
-	let failure: BreadboardLifecycleFailureState | undefined;
-	const listeners = new Set<(state: LifecycleState) => void>();
-	return {
-		signal: {
-			failure: () => failure,
-			subscribe: listener => {
-				listeners.add(listener);
-				return () => listeners.delete(listener);
-			},
-		},
-		stateChanged: state => {
-			if (failure === undefined && isBreadboardLifecycleFailureState(state)) failure = state;
-			for (const listener of listeners) {
-				try {
-					listener(state);
-				} catch (error) {
-					logger.warn("BreadBoard lifecycle state listener failed", { error: String(error) });
-				}
-			}
-		},
-	};
-}
-
 export interface ConnectedBreadboardRuntimeOptions extends BreadboardRuntimeAuthority {
-	readonly closeSupervisor: () => Promise<void>;
-	readonly openSession: () => Promise<OpenedSessionRuntime>;
+	readonly engine: BreadboardEnginePort;
+	readonly sessionTarget: OpenSession;
 	readonly emitAgentEvent: (event: AgentEvent, idempotencyKey: string) => Promise<void>;
 	readonly releaseAgentEvent: (idempotencyKey: string) => void;
 	readonly sessionBinding?: BreadboardSessionBindingData;
 	readonly createBridge?: (options: E4AgentStreamBridgeOptions) => BreadboardRuntimeBridge;
 	readonly registerCleanup?: (close: () => Promise<void>) => () => void;
-	readonly lifecycleStateSignal?: BreadboardLifecycleStateSignal;
-	readonly onLifecycleFailure?: (result: BreadboardLifecycleFailureResult) => void;
 }
 
 export type BreadboardModelAuthorityErrorCode =
@@ -1546,13 +1535,12 @@ function durableBridgeCursor(binding: BreadboardSessionBindingData): E4DurableCu
 export async function prepareConnectedBreadboardRuntime(
 	options: ConnectedBreadboardRuntimeOptions,
 ): Promise<PreparedBreadboardRuntime> {
-	let opened: OpenedSessionRuntime | undefined;
+	let opened: OpenedSession | undefined;
 	let bridge: BreadboardRuntimeBridge | undefined;
 	let cancelCleanup: (() => void) | undefined;
 	let unsubscribeLifecycleState: (() => void) | undefined;
 	let openedClosePromise: Promise<void> | undefined;
 	let bridgeClosePromise: Promise<void> | undefined;
-	let supervisorClosePromise: Promise<void> | undefined;
 	let preparedClosePromise: Promise<void> | undefined;
 	let activationPromise: Promise<void> | undefined;
 	let lifecycleFailure: BreadboardLifecycleFailureResult | undefined;
@@ -1562,10 +1550,6 @@ export async function prepareConnectedBreadboardRuntime(
 	let runtimeStarted = false;
 	const projectionReceiptEventIds = new Set<string>();
 
-	const closeSupervisor = (): Promise<void> => {
-		supervisorClosePromise ??= options.closeSupervisor();
-		return supervisorClosePromise;
-	};
 	const closeOpened = (): Promise<void> => {
 		if (!opened) return Promise.resolve();
 		openedClosePromise ??= opened.close();
@@ -1592,7 +1576,7 @@ export async function prepareConnectedBreadboardRuntime(
 				if (bridge) await closeBridge();
 				else await closeOpened();
 			} finally {
-				await closeSupervisor();
+				await options.engine.close();
 			}
 		}
 	};
@@ -1600,31 +1584,24 @@ export async function prepareConnectedBreadboardRuntime(
 		preparedClosePromise ??= cleanupAvailableResources();
 		return preparedClosePromise;
 	};
-	const handleLifecycleState = (state: LifecycleState): void => {
-		if (lifecycleFailure || !isBreadboardLifecycleFailureState(state)) return;
-		lifecycleFailure = { kind: "failure", state };
+	const handleLifecycleState = (): void => {
+		const failure = options.engine.lifecycleFailure.failure();
+		if (lifecycleFailure || !failure) return;
+		lifecycleFailure = failure;
 		const cleanup = bridge ? closePreparedRuntime() : cleanupAvailableResources();
 		void cleanup.catch(error => {
 			logger.warn("BreadBoard runtime invalidation cleanup failed", { error: String(error) });
 		});
-		try {
-			options.onLifecycleFailure?.(lifecycleFailure);
-		} catch (error) {
-			logger.warn("BreadBoard lifecycle failure presentation failed", { error: String(error) });
-		}
 	};
 	const throwIfLifecycleFailed = (): void => {
 		if (lifecycleFailure) throw new BreadboardLifecycleStartupError(lifecycleFailure);
 	};
 
 	try {
-		if (options.lifecycleStateSignal) {
-			unsubscribeLifecycleState = options.lifecycleStateSignal.subscribe(handleLifecycleState);
-			const failure = options.lifecycleStateSignal.failure();
-			if (failure) handleLifecycleState(failure);
-		}
+		unsubscribeLifecycleState = options.engine.lifecycleFailure.subscribe(handleLifecycleState);
+		handleLifecycleState();
 		throwIfLifecycleFailed();
-		opened = await options.openSession();
+		opened = await options.engine.openSession(options.sessionTarget);
 		throwIfLifecycleFailed();
 		const snapshot = await opened.snapshot();
 		throwIfLifecycleFailed();
@@ -1802,37 +1779,23 @@ export async function prepareBreadboardRuntime(
 			: undefined;
 	const target = resolveBreadboardSessionTarget(parsed, sessionManager, config.sessionConfigPath);
 
-	const store =
-		config.mode === "local-owned"
-			? new LocalAuthorityStore(join(getAgentDir(), "breadboard", "lifecycle"))
-			: undefined;
-	const lifecycleState = createBreadboardLifecycleStateMonitor();
-	const supervisor = new LifecycleSupervisor(config, {
-		...(store === undefined ? {} : { store }),
-		stateChanged: lifecycleState.stateChanged,
-	});
-	const connected = await supervisor.connect();
-	const closeSupervisor = async (): Promise<void> => {
-		const outcome = await supervisor.close({ consumerClosed: true });
-		if (outcome.kind === "failure" && lifecycleState.signal.failure() === undefined)
-			process.exitCode = writeLifecyclePresentation(outcome).exitCode || 1;
-	};
-	if (connected.kind !== "ready") {
-		process.exitCode = writeLifecyclePresentation(connected).exitCode || 1;
-		await closeSupervisor();
-		throw new BreadboardLifecycleStartupError(connected);
-	}
-
-	const enginePort = createCanonicalBreadboardEnginePort(connected.handle, {
-		requestTimeoutMs: config.requestTimeoutMs,
+	const connected = await connectCanonicalBreadboardEnginePort(config, {
 		onLateSessionCloseError: () => {
 			process.stderr.write("BreadBoard session cleanup failed after caller abort.\n");
 			process.exitCode = 1;
 		},
+		onLifecycleFailure: failure => {
+			process.exitCode = writeLifecyclePresentation(failure).exitCode || 1;
+		},
 	});
+	if (connected.kind !== "ready") {
+		process.exitCode = writeLifecyclePresentation(connected.result).exitCode || 1;
+		throw new BreadboardLifecycleStartupError(connected.result);
+	}
+	const enginePort = connected.port;
 	return prepareConnectedBreadboardRuntime({
-		closeSupervisor,
-		openSession: () => enginePort.openSession(target),
+		engine: enginePort,
+		sessionTarget: target,
 		emitAgentEvent: async (event, idempotencyKey) => {
 			await emitAgentEvent(event, idempotencyKey);
 		},
@@ -1840,11 +1803,6 @@ export async function prepareBreadboardRuntime(
 		sessionBinding,
 		modelRegistry: authority.modelRegistry,
 		requestPermission: authority.requestPermission,
-		lifecycleStateSignal: lifecycleState.signal,
-		onLifecycleFailure: failure => {
-			process.exitCode = 1;
-			process.exitCode = writeLifecyclePresentation(failure).exitCode || 1;
-		},
 	});
 }
 
@@ -1897,16 +1855,6 @@ export async function runRootCommand(
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 	const nativeSurface = mode === "rpc" || mode === "rpc-ui" || mode === "acp" ? mode : "print";
-	if (!isInteractive) {
-		const nativePolicy = resolveNativeLaunchPolicy(parsedArgs, nativeSurface);
-		if (nativePolicy.kind === "unavailable") {
-			process.stderr.write(`${nativePolicy.message}\n`);
-			process.exitCode = nativePolicy.exitCode;
-			stopStartupWatchdog();
-			stopThemeWatcher();
-			return;
-		}
-	}
 
 	let cwd = getProjectDir();
 	const settingsInstance =
@@ -1924,6 +1872,19 @@ export async function runRootCommand(
 		applyRpcDefaultSettingOverrides(settingsInstance);
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
+	}
+	if (!isInteractive) {
+		const nativePolicy = resolveNativeLaunchPolicy(
+			resolveNativeSurfaceEngineSelection(parsedArgs, settingsInstance, getProjectDir()),
+			nativeSurface,
+		);
+		if (nativePolicy.kind === "unavailable") {
+			process.stderr.write(`${nativePolicy.message}\n`);
+			process.exitCode = nativePolicy.exitCode;
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			return;
+		}
 	}
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";

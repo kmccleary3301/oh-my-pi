@@ -82,6 +82,7 @@
         "**/*.generated.*",
         "**/*.gen.*",
         "**/*.manifest.json",
+        "docs/conformance/**",
         "docs/conformance/**/*.json",
         "**/*.tsv",
         "dist/**",

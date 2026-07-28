@@ -2,10 +2,10 @@ import { describe, expect, it } from "bun:test";
 import {
 	classifyPath,
 	DEFAULT_UPSTREAM_REF,
-	inspectUpstreamSync,
-	loadSyncPolicy,
 	type GitResult,
 	type GitRunner,
+	inspectUpstreamSync,
+	loadSyncPolicy,
 	type SyncPolicy,
 } from "./inspect-upstream-sync";
 
@@ -42,13 +42,12 @@ function fixtureGit(policy: SyncPolicy): FixtureGit {
 			}
 			return {
 				exitCode: 0,
-				stdout:
-					[
-						"packages/coding-agent/src/generated/compiled.generated.ts",
-						"unknown/future-boundary.txt",
-						"packages/coding-agent/src/breadboard/session-port.ts",
-						"unknown/future-boundary.txt",
-					].join("\0"),
+				stdout: [
+					"packages/coding-agent/src/generated/compiled.generated.ts",
+					"unknown/future-boundary.txt",
+					"packages/coding-agent/src/breadboard/session-port.ts",
+					"unknown/future-boundary.txt",
+				].join("\0"),
 				stderr: "",
 			} satisfies GitResult;
 		}
@@ -74,6 +73,10 @@ describe("upstream sync policy", () => {
 			rule: "generated-artifacts",
 		});
 		expect(classifyPath("build/output.js", policy)).toEqual({
+			class: "generated",
+			rule: "generated-artifacts",
+		});
+		expect(classifyPath("docs/conformance/p31/e4-canonical-tui-evidence.md", policy)).toEqual({
 			class: "generated",
 			rule: "generated-artifacts",
 		});

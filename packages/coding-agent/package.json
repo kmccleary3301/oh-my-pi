@@ -31,7 +31,7 @@
     "omp": "src/cli.ts"
   },
   "scripts": {
-    "build": "bun scripts/build-binary.ts",
+    "build": "bun run gate:notices && bun scripts/build-binary.ts",
     "check": "biome check . && bun run check:types",
     "check:types": "tsgo -p tsconfig.json --noEmit",
     "lint": "biome lint .",
@@ -45,9 +45,10 @@
     "gen:mupdf:reset": "bun scripts/embed-mupdf-wasm.ts --reset",
     "gen:native": "bun --cwd=../natives run gen:native",
     "gen:native:reset": "bun --cwd=../natives run gen:native:reset",
-    "prepack": "bun run gen:tool-views && bun run gen:bundle",
+    "prepack": "bun run gate:notices && bun run gen:tool-views && bun run gen:bundle",
     "bench:guard": "bun scripts/bench-guard.ts",
-    "gate:breadboard-sdk": "bun scripts/verify-breadboard-sdk-provenance.ts"
+    "gate:breadboard-sdk": "bun scripts/verify-breadboard-sdk-provenance.ts",
+    "gate:notices": "bun ../../scripts/generate-third-party-notices.ts --check"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",
@@ -110,6 +111,11 @@
     "dist/cli.js",
     "dist/*.node",
     "scripts",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.txt",
+    "THIRD_PARTY_NOTICES.manifest.json",
+    "breadboard-sdk-provenance.json",
+    "vendor/breadboard-sdk-0.2.5.tgz",
     "examples",
     "README.md",
     "CHANGELOG.md"

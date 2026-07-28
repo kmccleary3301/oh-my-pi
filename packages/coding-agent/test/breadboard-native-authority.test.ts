@@ -1,7 +1,12 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { computeSessionReplayDigest, type PermissionRequestedPayload, type SessionSnapshot } from "@breadboard/sdk";
+import {
+	computeSessionReplayDigest,
+	type LifecycleEngineBinding,
+	type PermissionRequestedPayload,
+	type SessionSnapshot,
+} from "@breadboard/sdk";
 import type { AgentEvent, StreamFn } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -9,6 +14,10 @@ import type {
 	E4AgentStreamBridgeOptions,
 	E4PermissionHandler,
 } from "@oh-my-pi/pi-coding-agent/breadboard/e4-agent-stream";
+import type {
+	BreadboardEnginePort,
+	BreadboardLifecycleFailureSignal,
+} from "@oh-my-pi/pi-coding-agent/breadboard/engine-port";
 import {
 	LIFECYCLE_FAILURE_STATES,
 	type LifecycleState,
@@ -18,6 +27,7 @@ import {
 	type LifecycleDispatchResult,
 	LifecycleSupervisor,
 } from "@oh-my-pi/pi-coding-agent/breadboard/lifecycle/lifecycle-supervisor";
+import type { OpenedSession } from "@oh-my-pi/pi-coding-agent/breadboard/session-port";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import Engine from "@oh-my-pi/pi-coding-agent/commands/engine";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -25,9 +35,10 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import {
 	BREADBOARD_SESSION_BINDING_CUSTOM_TYPE,
 	BreadboardSessionTransitionError,
+	type ConnectedBreadboardRuntimeOptions,
 	createBreadboardPermissionHandler,
 	prepareBreadboardRuntime,
-	prepareConnectedBreadboardRuntime,
+	prepareConnectedBreadboardRuntime as prepareConnectedBreadboardRuntimeImpl,
 	resolveBreadboardBackendModel,
 	resolveBreadboardSessionTarget,
 	runRootCommand,
@@ -190,6 +201,96 @@ function lifecycleStateSignalHarness() {
 			for (const listener of listeners) listener(result.state);
 		},
 	};
+}
+type ConnectedRuntimeTestOptions = Omit<ConnectedBreadboardRuntimeOptions, "engine" | "sessionTarget"> & {
+	readonly closeSupervisor: () => Promise<unknown>;
+	readonly openSession: () => Promise<unknown>;
+	readonly lifecycleStateSignal?: ReturnType<typeof lifecycleStateSignalHarness>["signal"];
+	readonly onLifecycleFailure?: (result: LifecycleFailureResult) => void;
+};
+
+function prepareConnectedBreadboardRuntime(options: ConnectedRuntimeTestOptions) {
+	let closePromise: Promise<void> | undefined;
+	let failureReported = false;
+	const reportFailure = (state: LifecycleFailureResult["state"]): void => {
+		if (failureReported) return;
+		failureReported = true;
+		options.onLifecycleFailure?.({ kind: "failure", state });
+	};
+	const lifecycleFailureSignal: BreadboardLifecycleFailureSignal = {
+		failure: () => {
+			const state = options.lifecycleStateSignal?.failure();
+			if (state) reportFailure(state);
+			return state ? { kind: "failure", state } : undefined;
+		},
+		subscribe: listener =>
+			options.lifecycleStateSignal?.subscribe(state => {
+				if ((LIFECYCLE_FAILURE_STATES as readonly string[]).includes(state.name))
+					reportFailure(state as LifecycleFailureResult["state"]);
+				listener(state);
+			}) ?? (() => {}),
+	};
+	const engine: BreadboardEnginePort = {
+		authority: {
+			mode: "local-external",
+			binding: {
+				endpoint: "http://127.0.0.1:7777",
+				engineInstanceId: "test-engine",
+				engineBootId: "test-boot",
+				launchId: "test-launch",
+				protocolVersion: "1.0",
+				sessionContractId: "p30-e4-session-v1",
+				sessionSchemaSha256: "sha256:5757652c22d6aa2eb7a1cc8be1a40021d3f6a15df18d69ca22dc1916a400dbd4",
+				sessionReplayContractDigest: {} as LifecycleEngineBinding["sessionReplayContractDigest"],
+				liveness: { status: "live" },
+				process: {
+					engineInstanceId: "test-engine",
+					engineBootId: "test-boot",
+					startedAt: "2026-07-27T00:00:00.000Z",
+					startedAtUnix: 1,
+					pid: 1,
+					osProcessStartToken: "test-process-start",
+				},
+				launch: { launchId: "test-launch", source: "supervisor" },
+				artifactRevision: {
+					engineArtifactSha256: `sha256:${"2".repeat(64)}`,
+					servedBackendCommit: "test-backend-commit",
+					servedBackendDirty: false,
+				},
+				protocol: { protocolVersion: "1.0" },
+				sessionContract: {
+					contractId: "p30-e4-session-v1",
+					schemaSha256: "sha256:5757652c22d6aa2eb7a1cc8be1a40021d3f6a15df18d69ca22dc1916a400dbd4",
+					compatibility: "compatible",
+					sessionReplayContractDigest: {} as LifecycleEngineBinding["sessionReplayContractDigest"],
+				},
+				sessionReadiness: { ready: true, reason: "ready" },
+			},
+			registration: {
+				id: "test-registration",
+				generation: 1,
+				clientInstanceId: "test-client",
+				admissionEpoch: 1,
+				expiresAtUnix: 0,
+			},
+		},
+		lifecycleFailure: lifecycleFailureSignal,
+		openSession: () => options.openSession() as unknown as Promise<OpenedSession>,
+		getFeatures: async () => ({}) as never,
+		getModelCatalog: async () => ({}) as never,
+		getProviderAuthStatus: async () => ({}) as never,
+		attachProviderAuth: async () => ({}) as never,
+		detachProviderAuth: async () => ({}) as never,
+		close: () => {
+			closePromise ??= Promise.resolve(options.closeSupervisor()).then(() => undefined);
+			return closePromise;
+		},
+	};
+	return prepareConnectedBreadboardRuntimeImpl({
+		...options,
+		engine,
+		sessionTarget: { kind: "attach", sessionId: "test-session" } as never,
+	});
 }
 const PERMISSION_REQUEST = {
 	requestId: "permission-1",

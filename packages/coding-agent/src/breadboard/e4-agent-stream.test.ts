@@ -5,7 +5,6 @@ import type {
 	CancellationReceipt,
 	ClientMessageId,
 	LoggedSessionEvent,
-	OpenedSessionRuntime,
 	PermissionDecisionReceipt,
 	StructuredSubmit,
 	SubmitInput,
@@ -24,6 +23,7 @@ import { collectPendingToolCalls } from "../session/exit-diagnostics";
 import { convertToLlm } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { E4AgentStreamBridge } from "./e4-agent-stream";
+import type { OpenedSession } from "./session-port";
 
 const wireEvent = (
 	sequence: number,
@@ -59,7 +59,7 @@ const ownedReceipt = {
 	turnId: String(receipt.turnId),
 };
 
-function openedSession(events: readonly LoggedSessionEvent[], submitted: SubmitInput[]): OpenedSessionRuntime {
+function openedSession(events: readonly LoggedSessionEvent[], submitted: SubmitInput[]): OpenedSession {
 	return {
 		sessionId: started.sessionId,
 		async snapshot() {
@@ -122,11 +122,11 @@ const context: Context = {
 };
 
 function permissionSession(
-	responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]>,
-	cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]>,
+	responded: Array<Parameters<OpenedSession["respondPermission"]>[0]>,
+	cancelled: Array<Parameters<OpenedSession["cancel"]>[0]>,
 	respondError?: Error,
 ): {
-	readonly session: OpenedSessionRuntime;
+	readonly session: OpenedSession;
 	readonly permissionObserved: Promise<void>;
 	readonly actionObserved: Promise<void>;
 } {
@@ -219,7 +219,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitted: SubmitInput[] = [];
 		const retryStarted = Promise.withResolvers<void>();
 		let attempts = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -275,7 +275,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitted: SubmitInput[] = [];
 		const firstFailed = Promise.withResolvers<void>();
 		let attempts = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -329,7 +329,7 @@ describe("E4AgentStreamBridge", () => {
 		const startedProjected = Promise.withResolvers<void>();
 		const finishObservedTurn = Promise.withResolvers<void>();
 		let attempts = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -388,7 +388,7 @@ describe("E4AgentStreamBridge", () => {
 		const firstFailed = Promise.withResolvers<void>();
 		const commits: number[] = [];
 		let attempts = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -447,7 +447,7 @@ describe("E4AgentStreamBridge", () => {
 		let attempts = 0;
 		let firstInput: StructuredSubmit | undefined;
 		let lateRetryInput: StructuredSubmit | undefined;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				firstInput ??= input as StructuredSubmit;
@@ -546,7 +546,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitStarted = Promise.withResolvers<void>();
 		const cancellationObserved = Promise.withResolvers<void>();
 		const cancellationTurnIds: string[] = [];
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit() {
 				submitStarted.resolve();
@@ -600,7 +600,7 @@ describe("E4AgentStreamBridge", () => {
 		const ownershipStarted = Promise.withResolvers<void>();
 		const persistOwnership = Promise.withResolvers<void>();
 		let submitted: StructuredSubmit | undefined;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted = input as StructuredSubmit;
@@ -655,7 +655,7 @@ describe("E4AgentStreamBridge", () => {
 		const ownershipStarted = Promise.withResolvers<void>();
 		const persistOwnership = Promise.withResolvers<void>();
 		const commits: number[] = [];
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				return {
@@ -706,7 +706,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitStarted = Promise.withResolvers<void>();
 		const submitted: SubmitInput[] = [];
 		let attempts = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -761,7 +761,7 @@ describe("E4AgentStreamBridge", () => {
 
 	test("fails closed on a different prompt while an ambiguous submission is unresolved", async () => {
 		const submitted: SubmitInput[] = [];
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -804,7 +804,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitted: SubmitInput[] = [];
 		const retryStarted = Promise.withResolvers<void>();
 		let attempts = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submitted.push(input);
@@ -877,7 +877,7 @@ describe("E4AgentStreamBridge", () => {
 
 	test("fails and cancels only the sink correlated to a turn-owned runtime error", async () => {
 		const submissionsReady = Promise.withResolvers<void>();
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		const ownershipSnapshots: string[][] = [];
 		const secondReceipt: SubmitReceipt = {
 			...receipt,
@@ -886,7 +886,7 @@ describe("E4AgentStreamBridge", () => {
 			turnId: "turn-2" as SubmitReceipt["turnId"],
 		};
 		let submissionCount = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submissionCount += 1;
@@ -964,7 +964,7 @@ describe("E4AgentStreamBridge", () => {
 			turnId: "turn-2" as SubmitReceipt["turnId"],
 		};
 		let submissionCount = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				const index = submissionCount;
@@ -1027,7 +1027,7 @@ describe("E4AgentStreamBridge", () => {
 		const secondSubmitStarted = Promise.withResolvers<void>();
 		const releaseSecondSubmit = Promise.withResolvers<void>();
 		const runtimeErrorObserved = Promise.withResolvers<void>();
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		const secondReceipt: SubmitReceipt = {
 			...receipt,
 			clientMessageId: "client-message-2" as ClientMessageId,
@@ -1035,7 +1035,7 @@ describe("E4AgentStreamBridge", () => {
 			turnId: "turn-2" as SubmitReceipt["turnId"],
 		};
 		let submissionCount = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit(input) {
 				submissionCount += 1;
@@ -1136,8 +1136,8 @@ describe("E4AgentStreamBridge", () => {
 		},
 	] as const) {
 		test(`does not silently drop ${runtimeFamily.label}`, async () => {
-			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
-			const session: OpenedSessionRuntime = {
+			const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
+			const session: OpenedSession = {
 				...openedSession(
 					[
 						started,
@@ -1553,7 +1553,7 @@ describe("E4AgentStreamBridge", () => {
 			wireEvent(10, "assistant.message.end", { text: "Finished." }),
 			wireEvent(11, "turn_completed", {}),
 		];
-		const runtime: OpenedSessionRuntime = {
+		const runtime: OpenedSession = {
 			...openedSession([], submitted),
 			async submit(input) {
 				submitted.push(input);
@@ -1821,7 +1821,7 @@ describe("E4AgentStreamBridge", () => {
 			"external-turn-1",
 		);
 		const externalRef = new WeakRef(external);
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async *events(request) {
 				yield external!;
@@ -1865,7 +1865,7 @@ describe("E4AgentStreamBridge", () => {
 				return started.turnId;
 			},
 		} as LoggedSessionEvent;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([racedDelta, wireEvent(4, "turn_completed", {})], submitted),
 			async submit(input) {
 				submitted.push(input);
@@ -1895,7 +1895,7 @@ describe("E4AgentStreamBridge", () => {
 		const submitObserved = Promise.withResolvers<void>();
 		const partialObserved = Promise.withResolvers<void>();
 		const lifecycle: string[] = [];
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit() {
 				submitObserved.resolve();
@@ -1958,10 +1958,10 @@ describe("E4AgentStreamBridge", () => {
 			[String(receipt.turnId)]: Promise.withResolvers<CancellationReceipt>(),
 			[String(secondReceipt.turnId)]: Promise.withResolvers<CancellationReceipt>(),
 		};
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		let submitIndex = 0;
 		let sdkCloseCount = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit() {
 				const pending = pendingSubmissions[submitIndex];
@@ -2032,7 +2032,7 @@ describe("E4AgentStreamBridge", () => {
 	test("closes the SDK session after cancellation rejects", async () => {
 		const submitObserved = Promise.withResolvers<void>();
 		const lifecycle: string[] = [];
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit() {
 				submitObserved.resolve();
@@ -2075,7 +2075,7 @@ describe("E4AgentStreamBridge", () => {
 	test("coalesces concurrent and repeated close calls", async () => {
 		const releaseClose = Promise.withResolvers<void>();
 		let sdkCloseCount = 0;
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async *events(request) {
 				if (!request?.signal?.aborted) {
@@ -2133,8 +2133,8 @@ describe("E4AgentStreamBridge", () => {
 			const submitStarted = Promise.withResolvers<void>();
 			const submitSettled = Promise.withResolvers<void>();
 			const observerExited = Promise.withResolvers<void>();
-			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
-			const session: OpenedSessionRuntime = {
+			const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
+			const session: OpenedSession = {
 				...openedSession([], []),
 				async submit() {
 					submitStarted.resolve();
@@ -2193,8 +2193,8 @@ describe("E4AgentStreamBridge", () => {
 			const submitStarted = Promise.withResolvers<void>();
 			const submitSettled = Promise.withResolvers<void>();
 			const observerExited = Promise.withResolvers<void>();
-			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
-			const session: OpenedSessionRuntime = {
+			const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
+			const session: OpenedSession = {
 				...openedSession([], []),
 				async submit() {
 					submitStarted.resolve();
@@ -2249,8 +2249,8 @@ describe("E4AgentStreamBridge", () => {
 		const submitStarted = Promise.withResolvers<void>();
 		const submitSettled = Promise.withResolvers<void>();
 		const observerExited = Promise.withResolvers<void>();
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
-		const session: OpenedSessionRuntime = {
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit() {
 				submitStarted.resolve();
@@ -2302,8 +2302,8 @@ describe("E4AgentStreamBridge", () => {
 		const submitStarted = Promise.withResolvers<void>();
 		const submitSettled = Promise.withResolvers<void>();
 		const observerExited = Promise.withResolvers<void>();
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
-		const session: OpenedSessionRuntime = {
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async submit() {
 				submitStarted.resolve();
@@ -2355,8 +2355,8 @@ describe("E4AgentStreamBridge", () => {
 
 	for (const decision of ["allow", "deny"] as const) {
 		test(`hands ${decision} permission decisions back to E4`, async () => {
-			const responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]> = [];
-			const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+			const responded: Array<Parameters<OpenedSession["respondPermission"]>[0]> = [];
+			const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 			const permission = permissionSession(responded, cancelled);
 			let promptCount = 0;
 			const bridge = new E4AgentStreamBridge({
@@ -2392,8 +2392,8 @@ describe("E4AgentStreamBridge", () => {
 	}
 
 	test("cancels the turn when the OMP permission UI is cancelled", async () => {
-		const responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]> = [];
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const responded: Array<Parameters<OpenedSession["respondPermission"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		const permission = permissionSession(responded, cancelled);
 		let promptCount = 0;
 		const bridge = new E4AgentStreamBridge({
@@ -2427,8 +2427,8 @@ describe("E4AgentStreamBridge", () => {
 	});
 
 	test("fails and cancels the turn when the OMP permission UI errors", async () => {
-		const responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]> = [];
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const responded: Array<Parameters<OpenedSession["respondPermission"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		const permission = permissionSession(responded, cancelled);
 		let promptCount = 0;
 		const bridge = new E4AgentStreamBridge({
@@ -2463,8 +2463,8 @@ describe("E4AgentStreamBridge", () => {
 	});
 
 	test("fails closed when permission UI wiring is missing", async () => {
-		const responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]> = [];
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const responded: Array<Parameters<OpenedSession["respondPermission"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		const permission = permissionSession(responded, cancelled);
 		const bridge = new E4AgentStreamBridge({
 			async submissionOwned() {},
@@ -2522,7 +2522,7 @@ describe("E4AgentStreamBridge", () => {
 		let observations = 0;
 		let observedAfter: { eventId: string; sequence: number } | undefined;
 		const observing = Promise.withResolvers<void>();
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async *events(request) {
 				observations += 1;
@@ -2555,7 +2555,7 @@ describe("E4AgentStreamBridge", () => {
 	test("omits SDK after for a sequence-zero cursor and fails StreamFn closed before activation", async () => {
 		let observedAfter: unknown = "not-observed";
 		const observing = Promise.withResolvers<void>();
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async *events(request) {
 				observedAfter = request?.after;
@@ -2710,7 +2710,7 @@ describe("E4AgentStreamBridge", () => {
 			inputId: "input-2" as SubmitReceipt["inputId"],
 			turnId: "turn-2" as SubmitReceipt["turnId"],
 		};
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], submitted),
 			async submit(input) {
 				submitted.push(input);
@@ -2781,7 +2781,7 @@ describe("E4AgentStreamBridge", () => {
 		const admitted = Promise.withResolvers<void>();
 		const globalProcessed = Promise.withResolvers<void>();
 		const commits: Array<{ eventId: string; sequence: number }> = [];
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], submitted),
 			async submit(input) {
 				submitted.push(input);
@@ -2844,14 +2844,14 @@ describe("E4AgentStreamBridge", () => {
 		const projectedKeys: string[] = [];
 		const releasedKeys: string[] = [];
 		const commits: Array<{ eventId: string; sequence: number }> = [];
-		const cancelled: Array<Parameters<OpenedSessionRuntime["cancel"]>[0]> = [];
+		const cancelled: Array<Parameters<OpenedSession["cancel"]>[0]> = [];
 		const secondReceipt: SubmitReceipt = {
 			...receipt,
 			clientMessageId: "client-message-2" as ClientMessageId,
 			inputId: "input-2" as SubmitReceipt["inputId"],
 			turnId: "turn-2" as SubmitReceipt["turnId"],
 		};
-		const session: OpenedSessionRuntime = {
+		const session: OpenedSession = {
 			...openedSession([], submitted),
 			async submit(input) {
 				submitted.push(input);
@@ -2933,8 +2933,8 @@ describe("E4AgentStreamBridge", () => {
 		const terminalProcessed = Promise.withResolvers<void>();
 		const lifecycle: string[] = [];
 		const commits: Array<{ eventId: string; sequence: number }> = [];
-		const responded: Array<Parameters<OpenedSessionRuntime["respondPermission"]>[0]> = [];
-		const session: OpenedSessionRuntime = {
+		const responded: Array<Parameters<OpenedSession["respondPermission"]>[0]> = [];
+		const session: OpenedSession = {
 			...openedSession([], []),
 			async respondPermission(request) {
 				lifecycle.push("respond");

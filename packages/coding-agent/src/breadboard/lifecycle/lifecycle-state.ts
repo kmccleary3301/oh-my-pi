@@ -188,6 +188,16 @@ export function lifecycleState(
 	return Object.freeze({ name, mode, attempt, ...(reason === undefined ? {} : { reason }) });
 }
 
+function lifecycleFailureState(
+	mode: BreadboardEngineMode,
+	name: LifecycleFailureStateName,
+	reason: LifecycleReason,
+	attempt: number,
+): LifecycleState & { readonly name: LifecycleFailureStateName; readonly reason: LifecycleReason } {
+	lifecycleState(mode, name, attempt, reason);
+	return Object.freeze({ name, mode, attempt, reason });
+}
+
 export function lifecycleFailure(
 	mode: BreadboardEngineMode,
 	name: LifecycleFailureStateName,
@@ -196,6 +206,6 @@ export function lifecycleFailure(
 ): LifecycleResult {
 	return {
 		kind: "failure",
-		state: lifecycleState(mode, name, attempt, reason) as LifecycleResult & never,
-	} as LifecycleResult;
+		state: lifecycleFailureState(mode, name, reason, attempt),
+	};
 }

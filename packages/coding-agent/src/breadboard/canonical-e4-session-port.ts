@@ -1,10 +1,32 @@
-import { type CanonicalE4Client, CanonicalE4ClientError } from "@breadboard/sdk";
+import {
+	type CanonicalE4Client,
+	CanonicalE4ClientError,
+	type OpenedSession as CanonicalOpenedSession,
+} from "@breadboard/sdk";
 import type { BreadboardSessionPort, OpenedSession, OpenSession } from "./session-port";
 
 type CanonicalSessionClient = Pick<CanonicalE4Client, "attach" | "create">;
 
+type CanonicalSession = CanonicalOpenedSession;
+
 export interface CanonicalE4SessionPortOptions {
 	readonly onLateCloseError: (error: unknown) => void;
+}
+
+function adaptSession(runtime: CanonicalSession): OpenedSession {
+	let closePromise: Promise<void> | undefined;
+	return {
+		sessionId: runtime.sessionId,
+		snapshot: () => runtime.snapshot(),
+		submit: input => runtime.submit(input),
+		cancel: request => runtime.cancel(request),
+		respondPermission: request => runtime.respondPermission(request),
+		events: request => runtime.events(request),
+		close: () => {
+			closePromise ??= runtime.close();
+			return closePromise;
+		},
+	};
 }
 
 export class CanonicalE4SessionPort implements BreadboardSessionPort {
@@ -22,9 +44,9 @@ export class CanonicalE4SessionPort implements BreadboardSessionPort {
 			target.kind === "create"
 				? this.#client.create(target.request)
 				: this.#client.attach({ sessionId: target.sessionId });
-		if (signal === undefined) return pending;
+		if (signal === undefined) return adaptSession(await pending);
 
-		const { promise, resolve, reject } = Promise.withResolvers<OpenedSession>();
+		const { promise, resolve, reject } = Promise.withResolvers<CanonicalSession>();
 		let settled = false;
 		const abort = (): void => {
 			if (settled) return;
@@ -49,6 +71,6 @@ export class CanonicalE4SessionPort implements BreadboardSessionPort {
 				reject(error);
 			},
 		);
-		return promise;
+		return adaptSession(await promise);
 	}
 }

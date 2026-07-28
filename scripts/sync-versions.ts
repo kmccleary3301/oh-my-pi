@@ -12,6 +12,7 @@ interface PackageJson {
 	name: string;
 	version: string;
 	dependencies?: Record<string, string>;
+	private?: boolean;
 	devDependencies?: Record<string, string>;
 }
 
@@ -28,13 +29,16 @@ const packageDirs = readdirSync(packagesDir, { withFileTypes: true })
 // Read all package.json files and build version map
 const packages: Record<string, PackageInfo> = {};
 const versionMap: Record<string, string> = {};
+const check = process.argv.includes("--check");
+const expectedDependencyVersion = (current: string, version: string): string =>
+	current.startsWith("catalog:") || current.startsWith("workspace:") ? current : `^${version}`;
 
 for (const dir of packageDirs) {
 	const pkgPath = join(packagesDir, dir, "package.json");
 	try {
 		const pkg = (await Bun.file(pkgPath).json()) as PackageJson;
 		packages[dir] = { path: pkgPath, data: pkg };
-		versionMap[pkg.name] = pkg.version;
+		if (!pkg.private) versionMap[pkg.name] = pkg.version;
 	} catch (e) {
 		const error = e as Error;
 		console.error(`Failed to read ${pkgPath}:`, error.message);
@@ -69,7 +73,7 @@ for (const dir in packages) {
 	if (pkg.data.dependencies) {
 		for (const [depName, currentVersion] of Object.entries(pkg.data.dependencies)) {
 			if (versionMap[depName]) {
-				const newVersion = `^${versionMap[depName]}`;
+				const newVersion = expectedDependencyVersion(currentVersion, versionMap[depName]);
 				if (currentVersion !== newVersion) {
 					console.log(`\n${pkg.data.name}:`);
 					console.log(`  ${depName}: ${currentVersion} → ${newVersion}`);
@@ -85,7 +89,7 @@ for (const dir in packages) {
 	if (pkg.data.devDependencies) {
 		for (const [depName, currentVersion] of Object.entries(pkg.data.devDependencies)) {
 			if (versionMap[depName]) {
-				const newVersion = `^${versionMap[depName]}`;
+				const newVersion = expectedDependencyVersion(currentVersion, versionMap[depName]);
 				if (currentVersion !== newVersion) {
 					console.log(`\n${pkg.data.name}:`);
 					console.log(`  ${depName}: ${currentVersion} → ${newVersion} (devDependencies)`);
@@ -97,8 +101,8 @@ for (const dir in packages) {
 		}
 	}
 
-	// Write if updated
-	if (updated) {
+	// Write if updated unless this is a read-only drift check.
+	if (updated && !check) {
 		await Bun.write(pkg.path, `${JSON.stringify(pkg.data, null, "\t")}\n`);
 	}
 }
@@ -107,4 +111,5 @@ if (totalUpdates === 0) {
 	console.log("\nAll inter-package dependencies already in sync.");
 } else {
 	console.log(`\n✅ Updated ${totalUpdates} dependency version(s)`);
+	if (check) process.exitCode = 1;
 }

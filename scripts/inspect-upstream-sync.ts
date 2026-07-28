@@ -4,12 +4,7 @@ export const UPSTREAM_ORACLE_COMMIT = "7b141199d524b859c357fc89654f10b62b9f3df1"
 export const DEFAULT_UPSTREAM_REF = UPSTREAM_ORACLE_COMMIT;
 export const POLICY_PATH = path.join(import.meta.dir, "p31", "upstream-sync-policy.json");
 
-export const SYNC_CLASSES = [
-	"breadboard-owned",
-	"upstream-owned",
-	"generated",
-	"manual-review",
-] as const;
+export const SYNC_CLASSES = ["breadboard-owned", "upstream-owned", "generated", "manual-review"] as const;
 
 export type SyncClass = (typeof SYNC_CLASSES)[number];
 export type ChangeSide = "upstream" | "candidate";
@@ -172,7 +167,11 @@ export function createGitRunner(repoRoot = process.cwd()): GitRunner {
 class GitCommandError extends Error {
 	readonly code = "git-command-failed" as const;
 
-	constructor(readonly args: readonly string[], readonly exitCode: number, operation: string) {
+	constructor(
+		readonly args: readonly string[],
+		readonly exitCode: number,
+		operation: string,
+	) {
 		super(`${operation} failed (git exit ${exitCode})`);
 		this.name = "GitCommandError";
 	}
@@ -238,15 +237,13 @@ function classifyPaths(
 		}
 	}
 
-	const paths = [...sidesByPath.keys()]
-		.sort(comparePaths)
-		.map(filePath => {
-			const classification = classifyPath(filePath, policy);
-			const sides = ["upstream", "candidate"].filter(side =>
-				sidesByPath.get(filePath)?.has(side as ChangeSide),
-			) as ChangeSide[];
-			return { path: filePath, sides, ...classification };
-		});
+	const paths = [...sidesByPath.keys()].sort(comparePaths).map(filePath => {
+		const classification = classifyPath(filePath, policy);
+		const sides = ["upstream", "candidate"].filter(side =>
+			sidesByPath.get(filePath)?.has(side as ChangeSide),
+		) as ChangeSide[];
+		return { path: filePath, sides, ...classification };
+	});
 	const byClass = Object.fromEntries(SYNC_CLASSES.map(syncClass => [syncClass, 0])) as Record<SyncClass, number>;
 	for (const entry of paths) byClass[entry.class]++;
 	const unresolvedPaths = paths
@@ -317,13 +314,7 @@ export async function inspectUpstreamSync(options: InspectOptions = {}): Promise
 			mergeBase,
 		},
 		ancestry: {
-			relation: relationFor(
-				upstream,
-				head,
-				mergeBase,
-				upstreamIsAncestorOfHead,
-				headIsAncestorOfUpstream,
-			),
+			relation: relationFor(upstream, head, mergeBase, upstreamIsAncestorOfHead, headIsAncestorOfUpstream),
 			upstreamIsAncestorOfHead,
 			headIsAncestorOfUpstream,
 		},
@@ -358,7 +349,11 @@ function parseArgs(argv: readonly string[]): { upstreamRef: string } {
 	return { upstreamRef: upstreamRef ?? DEFAULT_UPSTREAM_REF };
 }
 
-function errorPayload(error: unknown): { schemaVersion: typeof SCHEMA_VERSION; mode: "read-only"; error: { code: string; message: string } } {
+function errorPayload(error: unknown): {
+	schemaVersion: typeof SCHEMA_VERSION;
+	mode: "read-only";
+	error: { code: string; message: string };
+} {
 	if (error instanceof GitCommandError) {
 		return { schemaVersion: SCHEMA_VERSION, mode: "read-only", error: { code: error.code, message: error.message } };
 	}
