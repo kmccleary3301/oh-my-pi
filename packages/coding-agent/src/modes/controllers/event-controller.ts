@@ -842,6 +842,22 @@ export class EventController {
 				if (mode === "assistant" || mode === "all") vocalizer.flush();
 			}
 		}
+		if (
+			event.message.role === "assistant" &&
+			!this.ctx.streamingComponent &&
+			(assistantHasVisibleContent(event.message) || Boolean(event.message.errorMessage))
+		) {
+			// The BreadBoard bridge can interleave durable projected tool messages
+			// inside the model stream's open assistant message. Their paired
+			// message_end clears the single streaming slot, so the outer stream may
+			// later deliver its visible final message_end without a live component.
+			// Recover at the display boundary instead of silently dropping that
+			// terminal answer; the normal completion path below still owns layout,
+			// finalization, usage, and error presentation.
+			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
+			this.ctx.streamingMessage = event.message;
+			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
+		}
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			this.ctx.streamingMessage = event.message;
 			this.#streamingReveal.stop();

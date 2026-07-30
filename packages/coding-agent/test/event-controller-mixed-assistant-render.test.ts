@@ -210,4 +210,45 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(middleLine).toBeLessThan(toolResultBLine);
 		expect(toolResultBLine).toBeLessThan(finalLine);
 	});
+
+	it("renders an orphan final assistant message_end after a tool result", async () => {
+		const { controller, chatContainer } = createFixture();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: TOOL_CALL_A_ID,
+			name: "contract_probe_a",
+			arguments: { value: "a" },
+		};
+		const toolMessage = assistantMessage([toolCall]);
+		const finalMessage = assistantMessage([{ type: "text", text: "TASK COMPLETE" }]);
+
+		await controller.handleEvent({ type: "message_start", message: toolMessage } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent({ type: "message_end", message: toolMessage } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+		await controller.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: TOOL_CALL_A_ID,
+			toolName: "contract_probe_a",
+			args: { value: "a" },
+		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
+		await controller.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: TOOL_CALL_A_ID,
+			toolName: "contract_probe_a",
+			result: { content: [{ type: "text", text: TOOL_RESULT_A_MARKER }] },
+			isError: false,
+		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
+		await controller.handleEvent({ type: "message_end", message: finalMessage } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+
+		const lines = chatContainer.render(120).map(line => Bun.stripANSI(line));
+		expect(lineContaining(lines, TOOL_RESULT_A_MARKER)).toBeLessThan(lineContaining(lines, "TASK COMPLETE"));
+	});
 });
