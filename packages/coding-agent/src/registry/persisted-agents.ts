@@ -11,6 +11,81 @@ import { type AgentRegistry, MAIN_AGENT_ID } from "./agent-registry";
  * persisted-subagent scan must not register them as plain `sub` refs.
  */
 const VIBE_LIFECYCLE_MARKER = Buffer.from('"vibe-session-lifecycle"');
+const MAX_METADATA_LINES = 64;
+
+interface PersistedAgentMetadata {
+	activity?: string;
+	createdAt?: number;
+	lastActivity?: number;
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function timestampOf(value: unknown): number | undefined {
+	if (typeof value !== "string") return undefined;
+	const timestamp = Date.parse(value);
+	return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function summarizePersistedTask(task: string): string | undefined {
+	const withoutPreamble = task.replace(/^Complete the assignment below,\s*thoroughly:\s*/i, "");
+	const lines = withoutPreamble.split(/\r?\n/);
+	const targetIndex = lines.findIndex(line => line.trim().toLowerCase() === "# target");
+	const targetLines: string[] = [];
+	if (targetIndex >= 0) {
+		for (const line of lines.slice(targetIndex + 1)) {
+			if (line.trimStart().startsWith("# ")) break;
+			targetLines.push(line);
+		}
+	}
+	const summary = (targetLines.length > 0 ? targetLines : lines).join(" ").replace(/\s+/g, " ").trim();
+	return summary ? summary.slice(0, 1_000) : undefined;
+}
+
+/**
+ * Read only the small session prefix needed by the Hub. A subagent's first
+ * `session_init` is written before its conversation, so this never walks a
+ * multi-megabyte historical transcript just to populate one roster row.
+ */
+async function readPersistedAgentMetadata(sessionFile: string): Promise<PersistedAgentMetadata> {
+	const stat = fs.promises.stat(sessionFile).catch(() => undefined);
+	let createdAt: number | undefined;
+	let activity: string | undefined;
+	try {
+		let linesRead = 0;
+		for await (const bytes of readLines(Bun.file(sessionFile).stream())) {
+			if (linesRead++ >= MAX_METADATA_LINES) break;
+			const line = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+			let entry: Record<string, unknown> | undefined;
+			try {
+				entry = recordOf(JSON.parse(line.toString("utf8")));
+			} catch {
+				continue;
+			}
+			if (entry?.type === "session") {
+				createdAt ??= timestampOf(entry.timestamp);
+				continue;
+			}
+			if (entry?.type !== "session_init") continue;
+			createdAt ??= timestampOf(entry.timestamp);
+			if (typeof entry.task === "string") activity = summarizePersistedTask(entry.task);
+			break;
+		}
+	} catch {
+		// A readable transcript is still useful even when its optional metadata
+		// prefix is malformed.
+	}
+	const file = await stat;
+	return {
+		activity,
+		createdAt: createdAt ?? file?.birthtimeMs,
+		lastActivity: file?.mtimeMs,
+	};
+}
 
 async function readPersistedVibeChildIds(sessionFile: string): Promise<Set<string>> {
 	const ids = new Set<string>();
@@ -76,6 +151,7 @@ async function registerPersistedSubagentsFromDir(
 			if (existing?.sessionFile !== sessionFile) {
 				// The id is reused across `/new`; refresh it to the current session's file.
 				if (existing) registry.unregister(advisorId);
+				const metadata = await readPersistedAgentMetadata(sessionFile);
 				registry.register({
 					id: advisorId,
 					displayName,
@@ -83,6 +159,9 @@ async function registerPersistedSubagentsFromDir(
 					parentId: owner,
 					session: null,
 					sessionFile,
+					activity: metadata.activity,
+					createdAt: metadata.createdAt,
+					lastActivity: metadata.lastActivity,
 					status: "parked",
 				});
 			}
@@ -91,6 +170,7 @@ async function registerPersistedSubagentsFromDir(
 		const id = entry.name.slice(0, -6);
 		if (vibeOwnedIds.has(id) && registry.get(id)?.sessionFile !== sessionFile) continue;
 		if (!registry.get(id)) {
+			const metadata = await readPersistedAgentMetadata(sessionFile);
 			registry.register({
 				id,
 				displayName: id,
@@ -98,6 +178,9 @@ async function registerPersistedSubagentsFromDir(
 				parentId: parentId ?? MAIN_AGENT_ID,
 				session: null,
 				sessionFile,
+				activity: metadata.activity,
+				createdAt: metadata.createdAt,
+				lastActivity: metadata.lastActivity,
 				status: "parked",
 			});
 		}

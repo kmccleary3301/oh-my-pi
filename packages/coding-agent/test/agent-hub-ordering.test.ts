@@ -102,6 +102,20 @@ describe("Agent hub row ordering", () => {
 		AgentRegistry.resetGlobalForTests();
 	});
 
+	it("renders a useful empty state before any task agents exist", () => {
+		geometry = stubStdoutGeometry(120);
+		const hub = makeHub(new AgentRegistry());
+
+		try {
+			const rendered = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(rendered).toContain("No agents in this session");
+			expect(rendered).toContain("Finished, parked, and killed subagents remain with the session");
+			expect(rendered).toContain("Resume that session with omp-dev --continue, or spawn a task here.");
+		} finally {
+			hub.dispose();
+		}
+	});
+
 	it("freezes the initial lastActivity order while the hub is open", () => {
 		vi.useFakeTimers();
 		let hub: AgentHubOverlayComponent | undefined;
@@ -359,7 +373,7 @@ describe("Agent hub row ordering", () => {
 
 		try {
 			const rendered = Bun.stripANSI(hub.render(140).join("\n"));
-			expect(rendered).toContain("Roster · 1 running");
+			expect(rendered).toMatch(/Roster · \S+ 1 running/u);
 			expect(rendered).toContain("$0.213 · 18K tok · 12 req · 27 tools · 2m14s agent time");
 			expect(rendered).toContain("Security Reviewer");
 			expect(rendered).toContain("Review the session lifecycle and produce");

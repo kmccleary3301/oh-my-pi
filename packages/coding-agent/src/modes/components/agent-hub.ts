@@ -115,6 +115,19 @@ function statusGlyph(status: AgentStatus): string {
 	}
 }
 
+function statusText(status: AgentStatus, text: string): string {
+	switch (status) {
+		case "running":
+			return theme.fg("accent", text);
+		case "idle":
+			return theme.fg("success", text);
+		case "parked":
+			return theme.fg("muted", text);
+		case "aborted":
+			return theme.fg("error", text);
+	}
+}
+
 /** Model id + thinking level (`sonnet-4-6 ◒ high`), level colored per theme. */
 function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): string {
 	const model = theme.fg("muted", replaceTabs(modelId));
@@ -277,6 +290,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#disposed = false;
 	/** Resolves after persisted historical subagents have been registered and rows refreshed. */
 	readonly persistedSubagentsReady: Promise<void>;
+	/** Prevent the async persisted-session scan from flashing a false empty state. */
+	#loadingPersistedSubagents = false;
 
 	// Table state
 	#rows: AgentRef[] = [];
@@ -322,6 +337,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#requestRender = deps.requestRender;
 		this.#hubKeys = deps.hubKeys;
 		this.#remote = deps.remote;
+		this.#loadingPersistedSubagents = !this.#remote && Boolean(deps.sessionFile?.endsWith(".jsonl"));
 		this.#ui =
 			deps.ui ??
 			({
@@ -351,6 +367,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 						logger.warn("Failed to register persisted subagents", { error });
 					})
 					.finally(() => {
+						this.#loadingPersistedSubagents = false;
 						if (!this.#disposed) this.#requestRender();
 					});
 		this.#refreshRows();
@@ -626,9 +643,21 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const noticeLines = this.#notice ? [theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width)))] : [];
 		const budget = Math.max(0, rows - lines.length - noticeLines.length);
 		if (this.#rows.length === 0) {
-			if (budget > 0) {
-				lines.push(theme.fg("dim", "no subagents yet — task spawns appear here"));
-				hitRows.push(undefined);
+			if (this.#loadingPersistedSubagents) {
+				if (budget > 0) {
+					lines.push(`${statusGlyph("running")} ${theme.fg("accent", "Loading saved agents…")}`);
+					hitRows.push(undefined);
+				}
+			} else {
+				const emptyState = [
+					`${theme.fg("muted", theme.status.shadowed)} ${theme.bold("No agents in this session")}`,
+					theme.fg("dim", "Finished, parked, and killed subagents remain with the session that created them."),
+					theme.fg("dim", "Resume that session with omp-dev --continue, or spawn a task here."),
+				];
+				for (const line of emptyState.slice(0, budget)) {
+					lines.push(line);
+					hitRows.push(undefined);
+				}
 			}
 		} else if (budget > 0) {
 			const window = this.#renderRosterWindow(width, budget, observedById);
@@ -763,7 +792,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const parts: string[] = [];
 		for (const status of ["running", "idle", "parked", "aborted"] as const) {
 			const count = counts[status];
-			if (count > 0) parts.push(`${count} ${status}`);
+			if (count > 0) parts.push(`${statusGlyph(status)} ${statusText(status, `${count} ${status}`)}`);
 		}
 		return parts.join(theme.sep.dot);
 	}
@@ -815,12 +844,13 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 		add(`${statusGlyph(ref.status)} ${theme.bold(replaceTabs(ref.displayName || ref.id))}`);
 		if (ref.displayName && ref.displayName !== ref.id) add(theme.fg("dim", ref.id));
-		const lifecycle = [
-			ref.status,
+		const lifecycleDetails = [
 			metrics?.durationMs ? formatDuration(metrics.durationMs) : undefined,
 			`active ${formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))}`,
 		].filter(Boolean);
-		add(theme.fg("dim", lifecycle.join(theme.sep.dot)));
+		add(
+			`${statusText(ref.status, ref.status)}${theme.fg("dim", `${theme.sep.dot}${lifecycleDetails.join(theme.sep.dot)}`)}`,
+		);
 		const badge = modelBadge(ref, observed);
 		if (badge) add(badge);
 
@@ -893,7 +923,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
 		const depth = this.#viewMode === "tree" ? (this.#treeDepthById.get(ref.id) ?? 0) : 0;
 		const branch = this.#viewMode === "tree" && depth > 0 ? `${"  ".repeat(depth - 1)}↳ ` : "";
-		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${branch}${theme.bold(replaceTabs(ref.id))}`];
+		const id = replaceTabs(ref.id);
+		const styledId = selected ? theme.bold(theme.fg("accent", id)) : theme.bold(id);
+		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${branch}${styledId}`];
 		if (ref.displayName && ref.displayName !== ref.id) {
 			fields.push(theme.fg("dim", replaceTabs(ref.displayName)));
 		}

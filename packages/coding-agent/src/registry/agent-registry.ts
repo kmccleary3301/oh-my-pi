@@ -62,6 +62,12 @@ export interface RegisterInput {
 	session: AgentSession | null;
 	sessionFile?: string | null;
 	status?: AgentStatus;
+	/** Last persisted task summary, when restoring a historical agent. */
+	activity?: string;
+	/** Original registration timestamp, when known from persisted history. */
+	createdAt?: number;
+	/** Last transcript activity timestamp, when known from persisted history. */
+	lastActivity?: number;
 }
 
 export class AgentRegistry {
@@ -96,8 +102,9 @@ export class AgentRegistry {
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,
-			createdAt: now,
-			lastActivity: now,
+			createdAt: input.createdAt ?? now,
+			lastActivity: input.lastActivity ?? now,
+			activity: input.activity,
 		};
 		this.#refs.set(ref.id, ref);
 		this.#emit({ type: "registered", ref });

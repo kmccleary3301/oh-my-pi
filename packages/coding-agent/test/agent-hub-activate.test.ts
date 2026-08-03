@@ -116,6 +116,53 @@ describe("Agent hub Enter activation", () => {
 		expect(agents.get("Worker")?.sessionFile).toBe(workerSessionFile);
 		hub.dispose();
 	});
+
+	it("restores saved task metadata and timestamps for completed agents", async () => {
+		using tempDir = TempDir.createSync("@omp-agent-hub-persisted-metadata-");
+		const sessionFile = path.join(tempDir.path(), "main.jsonl");
+		const workerSessionFile = path.join(tempDir.path(), "main", "Worker.jsonl");
+		const createdAt = "2026-07-30T01:13:37.835Z";
+		const lastActivity = new Date("2026-07-30T01:15:00.000Z");
+		await Bun.write(sessionFile, "");
+		await Bun.write(
+			workerSessionFile,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "worker-session", timestamp: createdAt, cwd: TEST_CWD }),
+				JSON.stringify({
+					type: "session_init",
+					id: "init",
+					parentId: null,
+					timestamp: createdAt,
+					systemPrompt: "system",
+					task: "Complete the assignment below, thoroughly:\n\n# Target\nInspect dependency boundaries and report unsafe coupling.\n\n# Change\nRead the implementation.",
+					tools: ["read"],
+				}),
+			].join("\n"),
+		);
+		await fs.utimes(workerSessionFile, lastActivity, lastActivity);
+		const agents = new AgentRegistry();
+		const hub = new AgentHubOverlayComponent({
+			observers: new SessionObserverRegistry(),
+			hubKeys: [],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+			irc: new IrcBus(agents),
+			sessionFile,
+		});
+		await hub.persistedSubagentsReady;
+
+		expect(agents.get("Worker")).toMatchObject({
+			activity: "Inspect dependency boundaries and report unsafe coupling.",
+			createdAt: Date.parse(createdAt),
+			lastActivity: lastActivity.getTime(),
+			status: "parked",
+		});
+		expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain(
+			"Inspect dependency boundaries and report unsafe coupling.",
+		);
+		hub.dispose();
+	});
 	it("avoids multi-second event-loop stalls while discovering agents from a large session", async () => {
 		using tempDir = TempDir.createSync("@omp-agent-hub-responsive-");
 		const sessionFile = path.join(tempDir.path(), "main.jsonl");
@@ -421,6 +468,7 @@ describe("Agent hub double-← gating", () => {
 		expect(hub).toBeDefined();
 		expect(overlayOptions()).toMatchObject({ width: "100%", maxHeight: "100%", margin: 0, fullscreen: true });
 		expect(agents.get("Worker")).toBeUndefined();
+		expect(Bun.stripANSI(hub!.render(120).join("\n"))).toContain("Loading saved agents");
 		await hub!.persistedSubagentsReady;
 		expect(agents.get("Worker")?.status).toBe("parked");
 		hub!.dispose();
