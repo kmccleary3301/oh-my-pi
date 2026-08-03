@@ -4,8 +4,8 @@
  * One overlay, two views:
  * - Table view: every registered agent except Main (Main IS the ambient
  *   chat), live from the global AgentRegistry — status, unread irc count,
- *   current/last task, last activity. Select with j/k, Enter opens a chat,
- *   `r` revives a parked agent, `x` aborts + releases one.
+ *   current/last task, last activity. Navigate with keys, wheel, hover, and
+ *   click; `r` revives a parked agent, `x` aborts + releases one.
  * - Chat view: per-agent transcript (incremental session-file tail, absorbed
  *   from the old session observer overlay) plus an input line. Submitting
  *   revives a parked agent, then prompts/steers it; the message lands in the
@@ -14,7 +14,18 @@
  * Replaces the old SessionObserverOverlayComponent (ctrl+s observer).
  */
 import { type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { Container, Ellipsis, matchesKey, type OverlayHandle, padding, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
+import {
+	Container,
+	Ellipsis,
+	matchesKey,
+	type OverlayHandle,
+	padding,
+	routeSelectListMouse,
+	routeSgrMouseInput,
+	type SelectListMouseTarget,
+	type TUI,
+	visibleWidth,
+} from "@oh-my-pi/pi-tui";
 import { formatAge, getProjectDir, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
@@ -162,11 +173,12 @@ export interface AgentHubDeps {
 	focusAgent?: (id: string) => Promise<void>;
 	/** Current main session file; used to seed parked historical subagents after restart. */
 	sessionFile?: string | null;
+
 	/** Collab guest: route actions/transcripts to the host instead of local sessions. */
 	remote?: AgentHubRemote;
 }
 
-export class AgentHubOverlayComponent extends Container {
+export class AgentHubOverlayComponent extends Container implements SelectListMouseTarget {
 	#registry: AgentRegistry;
 	#observers: SessionObserverRegistry;
 	#irc: IrcBus;
@@ -178,12 +190,16 @@ export class AgentHubOverlayComponent extends Container {
 	#ageTimer: NodeJS.Timeout | undefined;
 	#dataChangeTimer?: NodeJS.Timeout;
 	#remote: AgentHubRemote | undefined;
+	#disposed = false;
 	/** Resolves after persisted historical subagents have been registered and rows refreshed. */
 	readonly persistedSubagentsReady: Promise<void>;
 
 	// Table state
 	#rows: AgentRef[] = [];
 	#selectedRow = 0;
+	#hoveredRow: number | null = null;
+	/** Per-render screen-line to agent-row map, shared by click and hover routing. */
+	#hitRows: Array<number | undefined> = [];
 	#notice: string | undefined;
 	/** Captured row order from the first refresh; keeps the hub stable while open. */
 	#rowOrder: Map<string, number> | undefined;
@@ -238,13 +254,15 @@ export class AgentHubOverlayComponent extends Container {
 		this.persistedSubagentsReady = this.#remote
 			? Promise.resolve()
 			: registerPersistedSubagents(this.#registry, deps.sessionFile)
+					.then(() => {
+						if (!this.#disposed) this.#refreshRows();
+					})
 					.catch((error: unknown) => {
 						logger.warn("Failed to register persisted subagents", { error });
 					})
-					.then(() => {
-						this.#refreshRows();
-					})
-					.finally(() => this.#requestRender());
+					.finally(() => {
+						if (!this.#disposed) this.#requestRender();
+					});
 		this.#refreshRows();
 	}
 
@@ -259,6 +277,8 @@ export class AgentHubOverlayComponent extends Container {
 
 	/** Tear down every subscription and timer. Called by the overlay owner on close. */
 	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
 		for (const unsubscribe of this.#unsubscribers.splice(0)) unsubscribe();
 		if (this.#ageTimer) {
 			clearInterval(this.#ageTimer);
@@ -272,10 +292,21 @@ export class AgentHubOverlayComponent extends Container {
 	}
 
 	override render(width: number): readonly string[] {
-		return this.#renderTable(width).map(line => clampHubLine(line, width));
+		const frame = this.#renderTable(width).map(line => clampHubLine(line, width));
+		const termHeight = this.#ui.terminal?.rows || process.stdout.rows || 40;
+		if (frame.length <= termHeight) return frame;
+
+		// A tiny terminal can leave less room than the fixed chrome needs. Keep
+		// the header and footer visible rather than allowing the fullscreen modal
+		// to spill into the terminal's scrollback.
+		const footerLines = Math.min(3, frame.length);
+		const bodyEnd = Math.max(0, termHeight - footerLines);
+		return [...frame.slice(0, bodyEnd), ...frame.slice(-footerLines)].slice(0, termHeight);
 	}
 
 	handleInput(keyData: string): void {
+		if (routeSgrMouseInput(keyData, event => routeSelectListMouse(this, event, event.row))) return;
+
 		// The hub/observe keys always close the overlay (toggle semantics)
 		for (const key of this.#hubKeys) {
 			if (matchesKey(keyData, key)) {
@@ -369,7 +400,8 @@ export class AgentHubOverlayComponent extends Container {
 		const selectedId = this.#rows[this.#selectedRow]?.id;
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
 
-		if (!this.#rowOrder) {
+		const rowOrder = this.#rowOrder;
+		if (!rowOrder) {
 			// First refresh (usually the constructor): order by status, then recency.
 			this.#rows = refs.sort(
 				(a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity,
@@ -382,14 +414,10 @@ export class AgentHubOverlayComponent extends Container {
 			this.#rows = refs.sort((a, b) => {
 				const statusDiff = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
 				if (statusDiff !== 0) return statusDiff;
-				const aOrder = this.#rowOrder!.get(a.id) ?? Number.MAX_SAFE_INTEGER;
-				const bOrder = this.#rowOrder!.get(b.id) ?? Number.MAX_SAFE_INTEGER;
-				return aOrder - bOrder;
+				return (rowOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rowOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER);
 			});
 			for (const ref of this.#rows) {
-				if (!this.#rowOrder.has(ref.id)) {
-					this.#rowOrder.set(ref.id, this.#rowOrder.size);
-				}
+				if (!rowOrder.has(ref.id)) rowOrder.set(ref.id, rowOrder.size);
 			}
 		}
 
@@ -406,7 +434,9 @@ export class AgentHubOverlayComponent extends Container {
 	// ========================================================================
 
 	#renderTable(width: number): string[] {
+		this.#hitRows.length = 0;
 		const lines: string[] = [];
+		const termHeight = this.#ui.terminal?.rows || process.stdout.rows || 40;
 		lines.push(...new DynamicBorder().render(width));
 		const counts = this.#statusSummary();
 		lines.push(` ${theme.fg("accent", "Agent Hub")}${counts ? theme.fg("dim", `${theme.sep.dot}${counts}`) : ""}`);
@@ -415,44 +445,77 @@ export class AgentHubOverlayComponent extends Container {
 		if (this.#rows.length === 0) {
 			lines.push(` ${theme.fg("dim", "no subagents yet — task spawns appear here")}`);
 		} else {
-			const termHeight = process.stdout.rows || 40;
-			// Chrome: 2 borders + title + notice? + blank + hints + border
-			const budget = Math.max(4, termHeight - 7 - (this.#notice ? 1 : 0));
-			const entries = this.#rows.map((ref, i) => this.#renderEntry(ref, i === this.#selectedRow, width));
-			// Entries are 1-2 lines tall; grow a window around the selection until
-			// the line budget is spent, so the selected entry stays centered.
-			let start = this.#selectedRow;
-			let end = this.#selectedRow + 1;
-			let used = entries[start]?.length ?? 0;
-			for (let grew = true; grew; ) {
-				grew = false;
-				if (end < entries.length && used + entries[end].length <= budget) {
-					used += entries[end].length;
-					end++;
-					grew = true;
+			// Reserve both possible overflow markers plus the fixed table chrome.
+			// Rendering only this window keeps a large persisted registry cheap.
+			const chrome = 3 + 3 + (this.#notice ? 1 : 0);
+			const budget = Math.max(0, termHeight - chrome - 2);
+			if (budget > 0) {
+				const rendered: Array<string[] | undefined> = [];
+				const entryAt = (index: number): string[] => {
+					const cached = rendered[index];
+					if (cached) return cached;
+					const entry = this.#renderEntry(
+						this.#rows[index],
+						index === this.#selectedRow,
+						width,
+						index === this.#hoveredRow,
+					);
+					rendered[index] = entry;
+					return entry;
+				};
+				const appendEntry = (index: number, entry = entryAt(index)): void => {
+					for (const line of entry) {
+						this.#hitRows[lines.length] = index;
+						lines.push(line);
+					}
+				};
+
+				let start = this.#selectedRow;
+				let end = this.#selectedRow + 1;
+				let used = entryAt(this.#selectedRow).length;
+				if (used > budget) {
+					appendEntry(this.#selectedRow, entryAt(this.#selectedRow).slice(0, budget));
+				} else {
+					// Grow a window around the selection until the line budget is
+					// spent, so selection remains visible without rendering every row.
+					for (let grew = true; grew; ) {
+						grew = false;
+						if (end < this.#rows.length) {
+							const next = entryAt(end);
+							if (used + next.length <= budget) {
+								used += next.length;
+								end++;
+								grew = true;
+							}
+						}
+						if (start > 0) {
+							const previous = entryAt(start - 1);
+							if (used + previous.length <= budget) {
+								start--;
+								used += previous.length;
+								grew = true;
+							}
+						}
+					}
+					if (start > 0) {
+						lines.push(` ${theme.fg("dim", `… ${start} more`)}`);
+					}
+					for (let i = start; i < end; i++) {
+						appendEntry(i);
+					}
+					if (end < this.#rows.length) {
+						lines.push(` ${theme.fg("dim", `… ${this.#rows.length - end} more`)}`);
+					}
 				}
-				if (start > 0 && used + entries[start - 1].length <= budget) {
-					start--;
-					used += entries[start].length;
-					grew = true;
-				}
-			}
-			if (start > 0) {
-				lines.push(` ${theme.fg("dim", `… ${start} more`)}`);
-			}
-			for (let i = start; i < end; i++) {
-				lines.push(...entries[i]);
-			}
-			if (end < this.#rows.length) {
-				lines.push(` ${theme.fg("dim", `… ${this.#rows.length - end} more`)}`);
 			}
 		}
 
 		if (this.#notice) {
 			lines.push(` ${theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width - 2)))}`);
 		}
+		while (lines.length < termHeight - 3) lines.push("");
 		lines.push("");
-		lines.push(` ${theme.fg("dim", "j/k:select  Enter:open  r:revive  x:kill  Esc/←←:close")}`);
+		lines.push(` ${theme.fg("dim", "j/k/wheel:select  Enter/click:open  r:revive  x:kill  Esc/←←:close")}`);
 		lines.push(...new DynamicBorder().render(width));
 		return lines;
 	}
@@ -476,7 +539,7 @@ export class AgentHubOverlayComponent extends Container {
 	 * left, metadata right-aligned (inlined when the terminal is too narrow) —
 	 * plus an indented dim task line when the agent's work is known.
 	 */
-	#renderEntry(ref: AgentRef, selected: boolean, width: number): string[] {
+	#renderEntry(ref: AgentRef, selected: boolean, width: number, hovered = false): string[] {
 		const max = Math.max(1, width - 2);
 		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
 		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${theme.bold(replaceTabs(ref.id))}`];
@@ -514,7 +577,40 @@ export class AgentHubOverlayComponent extends Container {
 		if (task) {
 			entry.push(`     ${theme.fg("muted", sanitizeLine(task, Math.max(10, max - 5)))}`);
 		}
-		return entry;
+		if (!hovered) return entry;
+		return entry.map(row => {
+			const rowWidth = visibleWidth(row);
+			return theme.bg("selectedBg", rowWidth < max ? row + padding(max - rowWidth) : row);
+		});
+	}
+
+	handleWheel(delta: -1 | 1): void {
+		this.#hoveredRow = null;
+		if (this.#rows.length > 0) {
+			this.#selectedRow = Math.max(0, Math.min(this.#selectedRow + delta, this.#rows.length - 1));
+		}
+		this.#requestRender();
+	}
+
+	hitTest(line: number): number | undefined {
+		return this.#hitRows[line];
+	}
+
+	setHoverIndex(index: number | null): void {
+		if (index === this.#hoveredRow) return;
+		this.#hoveredRow = index;
+		this.#requestRender();
+	}
+
+	clickItem(index: number): void {
+		this.#hoveredRow = index;
+		if (index === this.#selectedRow) {
+			const selected = this.#rows[index];
+			if (selected) this.#activateAgent(selected);
+			return;
+		}
+		this.#selectedRow = index;
+		this.#requestRender();
 	}
 
 	#handleTableInput(keyData: string): void {
@@ -532,6 +628,7 @@ export class AgentHubOverlayComponent extends Container {
 			}
 			return;
 		}
+		this.#hoveredRow = null;
 		if (matchesKey(keyData, "j") || matchesSelectDown(keyData)) {
 			if (this.#rows.length > 0) {
 				this.#selectedRow = Math.min(this.#selectedRow + 1, this.#rows.length - 1);

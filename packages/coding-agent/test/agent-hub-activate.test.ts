@@ -116,6 +116,62 @@ describe("Agent hub Enter activation", () => {
 		expect(agents.get("Worker")?.sessionFile).toBe(workerSessionFile);
 		hub.dispose();
 	});
+	it("avoids multi-second event-loop stalls while discovering agents from a large session", async () => {
+		using tempDir = TempDir.createSync("@omp-agent-hub-responsive-");
+		const sessionFile = path.join(tempDir.path(), "main.jsonl");
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "responsive-test",
+			timestamp: new Date().toISOString(),
+			cwd: tempDir.path(),
+		});
+		const payload = "x".repeat(250_000);
+		const message = JSON.stringify({
+			type: "message",
+			id: "large-message",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text: payload }],
+				timestamp: Date.now(),
+			},
+		});
+		await Bun.write(sessionFile, `${header}\n${Array.from({ length: 600 }, () => message).join("\n")}\n`);
+		Bun.gc(true);
+
+		const agents = new AgentRegistry();
+		const hub = new AgentHubOverlayComponent({
+			observers: new SessionObserverRegistry(),
+			hubKeys: [],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+			irc: new IrcBus(agents),
+			focusAgent: async () => {},
+			sessionFile,
+		});
+
+		let maxLagMs = 0;
+		let previous = performance.now();
+		const timer = setInterval(() => {
+			const now = performance.now();
+			maxLagMs = Math.max(maxLagMs, now - previous - 2);
+			previous = now;
+		}, 2);
+		try {
+			await hub.persistedSubagentsReady;
+			await Bun.sleep(10);
+		} finally {
+			clearInterval(timer);
+			hub.dispose();
+		}
+
+		// Guard the original seconds-long freeze without treating shared-runner
+		// scheduling jitter as an Agent Hub regression.
+		expect(maxLagMs).toBeLessThan(500);
+	});
 
 	it("does not generically revive active or tombstoned Vibe children copied by a post-exit fork", async () => {
 		using tempDir = TempDir.createSync("@omp-agent-hub-vibe-fork-");
@@ -191,21 +247,22 @@ describe("Agent hub Enter activation", () => {
 
 		const editor = {};
 		let capturedHub: AgentHubOverlayComponent | undefined;
-		let editorRestoredCount = 0;
 		const focusedIds: string[] = [];
 		const focusResolved = Promise.withResolvers<void>();
 		const editorFocused = Promise.withResolvers<void>();
 		const focusTargets: unknown[] = [];
 		const editorContainer = {
+			children: [editor],
 			clear: () => {},
-			addChild: (child: unknown) => {
-				if (child === editor) editorRestoredCount++;
-				else capturedHub = child as AgentHubOverlayComponent;
-			},
+			addChild: () => {},
 		};
 		const ctx = {
 			keybindings: { getKeys: () => [] },
 			ui: {
+				showOverlay: (component: AgentHubOverlayComponent) => {
+					capturedHub = component;
+					return { hide: () => {} };
+				},
 				setFocus: (target: unknown) => {
 					focusTargets.push(target);
 					if (target === editor) editorFocused.resolve();
@@ -235,7 +292,6 @@ describe("Agent hub Enter activation", () => {
 		await editorFocused.promise;
 
 		expect(focusedIds).toEqual([AGENT_ID]);
-		expect(editorRestoredCount).toBe(1);
 		expect(focusTargets.at(-1)).toBe(editor);
 		capturedHub!.dispose();
 	});
@@ -252,12 +308,19 @@ describe("Agent hub double-← gating", () => {
 
 	function setup(agents: AgentRegistry, sessionFile: string | null = null) {
 		let shown: AgentHubOverlayComponent | undefined;
+		let overlayOptions: Record<string, unknown> | undefined;
 		const shownReady = Promise.withResolvers<AgentHubOverlayComponent>();
 		const editor = {};
 		const focusTargets: unknown[] = [];
 		const ctx = {
 			keybindings: { getKeys: () => [] },
 			ui: {
+				showOverlay: (component: AgentHubOverlayComponent, options: Record<string, unknown>) => {
+					shown = component;
+					overlayOptions = options;
+					shownReady.resolve(component);
+					return { hide: () => {} };
+				},
 				setFocus: (target: unknown) => {
 					focusTargets.push(target);
 				},
@@ -265,13 +328,9 @@ describe("Agent hub double-← gating", () => {
 			},
 			editor,
 			editorContainer: {
+				children: [editor],
 				clear: () => {},
-				addChild: (child: unknown) => {
-					if (child !== editor) {
-						shown = child as AgentHubOverlayComponent;
-						shownReady.resolve(shown);
-					}
-				},
+				addChild: () => {},
 			},
 			collabGuest: { agentRegistry: agents, hubRemote: undefined },
 			focusAgentSession: async () => {},
@@ -285,6 +344,7 @@ describe("Agent hub double-← gating", () => {
 			editor,
 			shown: () => shown,
 			shownReady: shownReady.promise,
+			overlayOptions: () => overlayOptions,
 			focusTargets,
 		};
 	}
@@ -347,14 +407,23 @@ describe("Agent hub double-← gating", () => {
 		shownHub!.dispose();
 	});
 
-	it("the explicit hub key opens the empty roster even with no subagents", () => {
+	it("the explicit hub opens fullscreen before persisted subagents load", async () => {
+		using tempDir = TempDir.createSync("@omp-agent-hub-explicit-");
+		const sessionFile = path.join(tempDir.path(), "main.jsonl");
+		await Bun.write(sessionFile, "");
+		await Bun.write(path.join(tempDir.path(), "main", "Worker.jsonl"), "");
 		const agents = new AgentRegistry();
-		const { controller, shown } = setup(agents);
+		const { controller, shown, overlayOptions } = setup(agents, sessionFile);
 
 		controller.showAgentHub(new SessionObserverRegistry());
 
-		expect(shown()).toBeDefined();
-		shown()!.dispose();
+		const hub = shown();
+		expect(hub).toBeDefined();
+		expect(overlayOptions()).toMatchObject({ width: "100%", maxHeight: "100%", margin: 0, fullscreen: true });
+		expect(agents.get("Worker")).toBeUndefined();
+		await hub!.persistedSubagentsReady;
+		expect(agents.get("Worker")?.status).toBe("parked");
+		hub!.dispose();
 	});
 
 	it("armCloseTap lets a single ← dismiss the hub the opening ←← raised", () => {

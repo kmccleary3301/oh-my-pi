@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { readLines } from "@oh-my-pi/pi-utils";
 import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor/transcript-recorder";
-import { SessionManager } from "../session/session-manager";
 import { persistedVibeChildIds } from "../vibe/runtime";
 import { type AgentRegistry, MAIN_AGENT_ID } from "./agent-registry";
 
@@ -10,17 +10,25 @@ import { type AgentRegistry, MAIN_AGENT_ID } from "./agent-registry";
  * workers are revived through the Vibe registry's own journal, so the generic
  * persisted-subagent scan must not register them as plain `sub` refs.
  */
+const VIBE_LIFECYCLE_MARKER = Buffer.from('"vibe-session-lifecycle"');
+
 async function readPersistedVibeChildIds(sessionFile: string): Promise<Set<string>> {
-	let sessionManager: SessionManager;
+	const ids = new Set<string>();
 	try {
-		sessionManager = await SessionManager.open(sessionFile, undefined, undefined, { suppressBreadcrumb: true });
+		for await (const bytes of readLines(Bun.file(sessionFile).stream())) {
+			const line = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+			if (line.indexOf(VIBE_LIFECYCLE_MARKER) === -1) continue;
+			try {
+				const entry: unknown = JSON.parse(line.toString("utf8"));
+				for (const id of persistedVibeChildIds([entry])) ids.add(id);
+			} catch {
+				// Match lenient session loading: one malformed line must not hide
+				// valid lifecycle entries later in the transcript.
+			}
+		}
+		return ids;
 	} catch {
 		return new Set();
-	}
-	try {
-		return persistedVibeChildIds(sessionManager.getEntries());
-	} finally {
-		await sessionManager.close();
 	}
 }
 

@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeAll, describe, expect, it, setSystemTime, vi } from "bun:test";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
-import { AgentHubOverlayComponent } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
+import { type AgentHubDeps, AgentHubOverlayComponent } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -40,7 +40,7 @@ function stubStdoutGeometry(cols: number): GeometryStub {
 	};
 }
 
-function makeHub(agents: AgentRegistry) {
+function makeHub(agents: AgentRegistry, overrides: Partial<AgentHubDeps> = {}) {
 	return new AgentHubOverlayComponent({
 		observers: new SessionObserverRegistry(),
 		hubKeys: [],
@@ -49,18 +49,40 @@ function makeHub(agents: AgentRegistry) {
 		registry: agents,
 		irc: new IrcBus(agents),
 		focusAgent: async () => {},
+		...overrides,
 	});
 }
 
-function renderedAgentIds(hub: AgentHubOverlayComponent): string[] {
+interface RenderedAgentRow {
+	id: string;
+	selected: boolean;
+}
+
+function renderedAgentRows(hub: AgentHubOverlayComponent): RenderedAgentRow[] {
 	// Entry first lines are ` <cursor> <status-glyph> <id> …`; task lines are
 	// indented deeper and chrome lines never carry the cursor slot.
-	const ids: string[] = [];
+	const rows: RenderedAgentRow[] = [];
 	for (const raw of hub.render(120)) {
-		const match = /^ (?:❯| ) (\S+) (\S+)/u.exec(Bun.stripANSI(raw));
-		if (match) ids.push(match[2]!);
+		const match = /^ (❯| ) (\S+) (\S+)/u.exec(Bun.stripANSI(raw));
+		if (match) rows.push({ id: match[3]!, selected: match[1] === "❯" });
 	}
-	return ids;
+	return rows;
+}
+
+function renderedAgentIds(hub: AgentHubOverlayComponent): string[] {
+	return renderedAgentRows(hub).map(row => row.id);
+}
+
+function selectedAgentId(hub: AgentHubOverlayComponent): string | undefined {
+	return renderedAgentRows(hub).find(row => row.selected)?.id;
+}
+
+function leftClick(row1Based: number): string {
+	return `\x1b[<0;4;${row1Based}M`;
+}
+
+function wheel(direction: "up" | "down"): string {
+	return `\x1b[<${direction === "down" ? 65 : 64};4;4M`;
 }
 
 describe("Agent hub row ordering", () => {
@@ -144,15 +166,7 @@ describe("Agent hub row ordering", () => {
 			},
 		]);
 
-		const hub = new AgentHubOverlayComponent({
-			observers,
-			hubKeys: [],
-			onDone: () => {},
-			requestRender: () => {},
-			registry: agents,
-			irc: new IrcBus(agents),
-			focusAgent: async () => {},
-		});
+		const hub = makeHub(agents, { observers });
 
 		const lines = hub.render(80);
 		for (const line of lines) {
@@ -164,6 +178,73 @@ describe("Agent hub row ordering", () => {
 		}
 
 		hub.dispose();
+	});
+	it("fits the fullscreen table to short terminals and windows large registries", () => {
+		geometry = stubStdoutGeometry(80);
+		geometry.setRows(10);
+		const agents = new AgentRegistry();
+		for (let i = 0; i < 50; i++) {
+			agents.register({
+				id: `Agent${i}`,
+				displayName: `Agent ${i}`,
+				kind: "sub",
+				session: {} as AgentSession,
+			});
+		}
+
+		const observers = new SessionObserverRegistry();
+		const sessions = vi.spyOn(observers, "getSessions").mockReturnValue([]);
+		const hub = makeHub(agents, { observers });
+
+		try {
+			const lines = hub.render(80);
+			expect(lines.length).toBe(10);
+			expect(sessions.mock.calls.length).toBeLessThan(agents.list().length);
+			expect(Bun.stripANSI(lines.join("\n"))).toContain("…");
+		} finally {
+			hub.dispose();
+		}
+	});
+	it("matches fullscreen menu mouse selection, wheel, and activation", async () => {
+		geometry = stubStdoutGeometry(120);
+		const agents = new AgentRegistry();
+		setSystemTime(1_000);
+		agents.register({ id: "Alpha", displayName: "Alpha", kind: "sub", session: {} as AgentSession });
+		setSystemTime(2_000);
+		agents.register({ id: "Beta", displayName: "Beta", kind: "sub", session: {} as AgentSession });
+		setSystemTime(3_000);
+		agents.register({ id: "Gamma", displayName: "Gamma", kind: "sub", session: {} as AgentSession });
+
+		const focused: string[] = [];
+		const done = vi.fn();
+		const hub = makeHub(agents, {
+			onDone: done,
+			focusAgent: async id => {
+				focused.push(id);
+			},
+		});
+
+		try {
+			expect(selectedAgentId(hub)).toBe("Gamma");
+			hub.handleInput(wheel("down"));
+			expect(selectedAgentId(hub)).toBe("Beta");
+
+			const frame = hub.render(120);
+			const alphaRow = frame.findIndex(line => /^ {3}\S+ Alpha/u.test(Bun.stripANSI(line)));
+			expect(alphaRow).toBeGreaterThanOrEqual(0);
+			hub.handleInput(leftClick(alphaRow + 1));
+			expect(selectedAgentId(hub)).toBe("Alpha");
+			expect(focused).toEqual([]);
+
+			const selectedFrame = hub.render(120);
+			const selectedAlphaRow = selectedFrame.findIndex(line => /^ ❯ \S+ Alpha/u.test(Bun.stripANSI(line)));
+			hub.handleInput(leftClick(selectedAlphaRow + 1));
+			await Promise.resolve();
+			expect(focused).toEqual(["Alpha"]);
+			expect(done).toHaveBeenCalledTimes(1);
+		} finally {
+			hub.dispose();
+		}
 	});
 
 	it("flags a fallback badge for observer-only rows with no live session", () => {
@@ -188,15 +269,7 @@ describe("Agent hub row ordering", () => {
 			},
 		]);
 
-		const hub = new AgentHubOverlayComponent({
-			observers,
-			hubKeys: [],
-			onDone: () => {},
-			requestRender: () => {},
-			registry: agents,
-			irc: new IrcBus(agents),
-			focusAgent: async () => {},
-		});
+		const hub = makeHub(agents, { observers });
 
 		try {
 			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("fallback → openai/gpt-4o");
@@ -230,15 +303,7 @@ describe("Agent hub row ordering", () => {
 			},
 		]);
 
-		const hub = new AgentHubOverlayComponent({
-			observers,
-			hubKeys: [],
-			onDone: () => {},
-			requestRender: () => {},
-			registry: agents,
-			irc: new IrcBus(agents),
-			focusAgent: async () => {},
-		});
+		const hub = makeHub(agents, { observers });
 
 		try {
 			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("fallback → fireworks/kimi-k2");
