@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced arktype with `@oh-my-pi/omptype` in tests and test utilities.
+
 ## [17.2.6] - 2026-08-03
 
 ### Fixed

@@ -45,7 +45,14 @@ The function input is:
 
 `code` runs with top-level `await` in a persistent, full-host-access Bun session. Window handles, screenshot frames, and recent AX references survive between calls. Available globals include `desktop`, `wait`, `assert`, `display`, `print`, `read`, `write`, and `tool.*`.
 
-Use `read_only: true` for inspection. In that mode screenshots and AX reads work, while input, clipboard writes, and other mutation are rejected. Calls are serialized through one lazy worker. Aborting a run terminates the worker; the next call starts a fresh session and requires new handles/frames.
+Use `read_only: true` to declare an inspection-only call for approval and to
+block mutation through the `desktop` facade: screenshots and AX reads work,
+while facade input and clipboard-write methods reject the call. This is **not a
+sandbox**. The evaluated code still has the worker's full Bun/Node host access,
+including `process`, `require`, and `fs`, so `read_only` does not prevent
+mutation through arbitrary host APIs. Calls are serialized through one lazy
+worker. Aborting a run terminates the worker; the next call starts a fresh
+session and requires new handles/frames.
 
 ## Discover targets
 
@@ -74,13 +81,13 @@ Window methods include:
 
 - `screenshot({ silent? })`
 - `click(x, y, { button?, count?, modifiers?, delivery? })` and `doubleClick(x, y)`
-- `move(x, y, options?)`, `drag([[x, y], ...], options?)`, and `scroll(x, y, { dx?, dy?, delivery? })`
+- `move(x, y)`, `drag([[x, y], ...], options?)`, and `scroll(x, y, { dx?, dy?, delivery? })`
 - `type(text, { delivery? })` and `press(chord, { delivery? })`
 - `raise()`
 
 The `desktop` object exposes the same screenshot and input surface for the all-displays composite.
 
-Pixel coordinates always belong to the most recent screenshot of the same target. Coordinate input before that capture is rejected. A resized/closed target or changed display layout invalidates the frame; capture again instead of guessing. Screenshots display automatically and are also saved at full resolution; `{ silent: true }` suppresses display in loops.
+Pixel coordinates always belong to the most recent screenshot of the same target. Coordinate input before that capture is rejected. A resized/closed target or changed display layout invalidates the frame; capture again instead of guessing. Screenshots display automatically and are also saved at the captured resolution, subject to `computer.maxWidth` / `computer.maxHeight` and any effective model-transport cap. When a capture is scaled, the tool reports both the saved capture dimensions and the native source dimensions. `{ silent: true }` suppresses display in loops.
 
 Input defaults to `delivery: "background"`, which avoids changing the user's focus, pointer, or window order. If the OS or application cannot target that event safely, the call throws `BackgroundUnavailable`. Use AX, or explicitly retry with `delivery: "foreground"`, which briefly activates the target and restores focus afterward. macOS keyboard delivery to one of several windows in the same app and all Wayland per-window native input require this fallback.
 

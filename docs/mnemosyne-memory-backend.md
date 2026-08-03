@@ -171,3 +171,17 @@ new Mnemopi({
 - `/memory stats` and `/memory diagnose` render backend-specific bank statistics/diagnostics when the Mnemopi backend is active.
 - Subagents do not own separate Mnemopi retain loops; they alias the parent state when a parent Mnemopi state exists, and otherwise remain inert.
 - Backend startup is best-effort. If database/model initialization fails, the session continues with Mnemopi inert and logs a warning; memory tools then report that the backend is not initialized.
+
+## Shutdown and durability
+
+Normal interactive and print-mode exit uses a deliberately lighter path than `/memory enqueue`:
+
+1. The primary state retains the current transcript with new fact extraction disabled.
+2. It flushes extractions that were already in flight, but does not run per-session sleep or full cross-session promotion.
+3. Only after that drain settles does it close the owned SQLite bank handles; the embedding worker shuts down after state disposal because the drain may still use it.
+
+Aliased subagent states do not own or close the shared banks; the parent state owns final retention, flushing, and handle closure.
+
+Interactive and print exits give this drain 1.5 seconds. If the budget expires, shutdown detaches the in-flight drain and arranges for handles to close when it settles rather than racing writes against closed databases. The process may exit first. Working-memory rows already written remain durable, but promotion or embedding for the last few turns can remain incomplete; earlier turn retention performed at agent end is unaffected.
+
+`/memory enqueue` is the explicit stronger durability boundary: it forces retention, flushes pending extraction, and runs full sleep/consolidation across the owned banks. Use it before exit when the latest material must be promoted rather than relying on the bounded normal shutdown path.

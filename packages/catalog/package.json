@@ -35,8 +35,8 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "catalog:",
+    "@oh-my-pi/omptype": "catalog:",
     "@oh-my-pi/pi-utils": "catalog:",
-    "arktype": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

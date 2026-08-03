@@ -1,11 +1,7 @@
+import { type } from "@oh-my-pi/omptype";
 import { once } from "@oh-my-pi/pi-utils";
-import { scope } from "arktype";
 
 export const getSecurityContractSchemas = once(() => {
-	// Security schemas validate only during security scans, so lazy construction
-	// with interpreted traversal avoids eager JIT startup tax without changing correctness.
-	const { type } = scope({}, { jitless: true });
-
 	const stringRecordSchema = type({ "[string]": "string" });
 	const unknownRecordSchema = type({ "[string]": "unknown" });
 

@@ -1,8 +1,15 @@
 # Autonomous Memory
 
-When the local memory backend is enabled, the agent automatically extracts durable knowledge from past sessions and injects a compact summary into future sessions for the same project. Over time it builds a project-scoped memory store — technical decisions, recurring workflows, pitfalls — that carries forward without manual effort.
+Oh My Pi supports four memory modes. Memory is disabled by default; select one backend via `/settings` or `config.yml`:
 
-Disabled by default. Enable the local summary pipeline via `/settings` or `config.yml`:
+| `memory.backend` | Storage and behavior                                                   | Guide                                                   |
+| ---------------- | ---------------------------------------------------------------------- | ------------------------------------------------------- |
+| `off`            | No memory backend                                                      | —                                                       |
+| `local`          | Project-scoped summaries and lessons generated from persisted sessions | This page                                               |
+| `hindsight`      | Remote, bank-scoped Hindsight memory                                   | [Hindsight](#hindsight-remote-backend)                  |
+| `mnemopi`        | Local Mnemopi SQLite memory                                            | [Mnemopi memory backend](./mnemosyne-memory-backend.md) |
+
+Enable the local summary pipeline:
 
 ```yaml
 memory:
@@ -112,6 +119,28 @@ If the requested memory role is not configured, memory model resolution falls ba
 | `memories.phase1InputTokenLimit`      | `4000`  | Per-session extraction input cap                                                                                                         |
 | `memories.fallbackTokenLimit`         | `16000` | Model token budget used when the model has no finite declared context window                                                             |
 | `memories.summaryInjectionTokenLimit` | `5000`  | Shared approximate token cap for the summary and captured lessons injected into the system prompt                                        |
+
+## Hindsight remote backend
+
+Hindsight requires a reachable [Hindsight](https://hindsight.vectorize.io/) server. The default endpoint is `http://localhost:8888`; set a token when the server requires authentication:
+
+```yaml
+memory:
+  backend: hindsight
+hindsight:
+  apiUrl: http://localhost:8888
+  apiToken: ${HINDSIGHT_API_TOKEN}
+```
+
+`HINDSIGHT_*` environment variables override `hindsight.*` settings, which override built-in defaults. See the [complete Hindsight environment-variable table](./environment-variables.md#hindsight-memory-backend) for all 18 supported overrides, accepted values, parsing rules, precedence, and defaults.
+
+By default, Hindsight uses `per-project-tagged` scoping: writes go to a shared bank with a project tag, while recall includes project-tagged and untagged global memories. `per-project` isolates each working-directory project in its own bank; `global` uses one shared bank. An explicit `hindsight.bankId` selects the bank base. Changes to the bank ID, prefix, or scoping rebuild the primary session state so later operations use the new scope.
+
+The primary session recalls on its first model turn (`hindsight.autoRecall: true`) and automatically retains completed conversation turns every three user turns by default. `/memory enqueue` flushes queued tool retains and forces retention of the current session. At agent end, the primary state schedules cadence-based retention and flushes the retain queue; session disposal drains that queue before releasing the state. Request failures and configured timeouts are logged and leave the coding session usable. Subagents alias the parent's client, bank, and scope for explicit `recall`, `retain`, and `reflect` calls, but do not run their own automatic recall or retention.
+
+Recall is injected as background context, not instructions, and recalled memory is also available as extra context during compaction. Selecting Hindsight exposes `recall`, `retain`, and `reflect`; `memory_edit` is not available because upstream Hindsight memories are not edited through this backend.
+
+`/memory view`, `/memory stats`, `/memory diagnose`, and `/memory enqueue` operate through the active Hindsight state. `/memory clear` first drains pending retains, then clears only the local session state and recall cache. It **does not delete the server-side bank**; delete that bank with the Hindsight UI or API.
 
 ## Key files
 

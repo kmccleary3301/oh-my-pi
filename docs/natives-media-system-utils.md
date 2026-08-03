@@ -59,7 +59,7 @@ Supported decode formats are whatever the compiled `image` crate supports for `I
 
 ### Snapcompact PNG rendering
 
-`renderSnapcompactPng(text, options)` renders pre-normalized text on a bounded bitmap and asynchronously returns PNG bytes encoded as a one-byte/Latin-1 JavaScript string. `options.size` is required; optional controls include `font`, `cellWidth`, `cellHeight`, `variant`, `lineRepeat`, `stretch`, and `columns`. Output height hugs used rows and overflowing input is ignored. `snapcompactSupportedChars(font, chars)` returns only characters supported by the named bundled font.
+`renderSnapcompactPng(text, options)` renders pre-normalized text on a bounded bitmap and asynchronously returns a **base64-encoded PNG string**. The N-API transport type is `Latin1String`, but the string contains base64 text rather than raw one-byte PNG data; base64-decode it before treating the result as PNG bytes. `options.size` is required; optional controls include `font`, `cellWidth`, `cellHeight`, `variant`, `lineRepeat`, `stretch`, and `columns`. Output height hugs used rows and overflowing input is ignored. `snapcompactSupportedChars(font, chars)` returns only characters supported by the named bundled font.
 
 ### HTML conversion (`html`)
 

@@ -2094,7 +2094,7 @@ export class SessionManager {
 	}
 
 	/**
-	 * Append the durable conversation boundary recorded by `/reset`. The
+	 * Append the durable conversation boundary recorded by `/clear`. The
 	 * collapsed live transcript and the model-context rebuild start after the
 	 * latest one, while the full history stays on disk (the plain
 	 * `transcript:true` export walks it unchanged).

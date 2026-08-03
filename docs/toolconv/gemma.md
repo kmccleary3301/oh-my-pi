@@ -11,11 +11,11 @@ Gemma 4 wraps each structural element in a paired token. Note the **asymmetric p
 | Open | Close | Purpose |
 |---|---|---|
 | `<bos>` | — | Beginning of sequence |
-| `<|turn>` | `<turn|>` | One conversation turn; the role name is the first line of the body |
-| `<|tool_call>` | `<tool_call|>` | One tool **call** emitted by the model |
-| `<|tool_response>` | `<tool_response|>` | One tool **result** fed back to the model |
-| `<|channel>` | `<channel|>` | Reasoning channel; `<|channel>thought` opens the model's chain-of-thought (closed by `<channel|>`) before the visible reply |
-| `<|"|>` | `<|"|>` | String-literal delimiter (same token on both ends) |
+| `<\|turn>` | `<turn\|>` | One conversation turn; the role name is the first line of the body |
+| `<\|tool_call>` | `<tool_call\|>` | One tool **call** emitted by the model |
+| `<\|tool_response>` | `<tool_response\|>` | One tool **result** fed back to the model |
+| `<\|channel>` | `<channel\|>` | Reasoning channel; `<\|channel>thought` opens the model's chain-of-thought (closed by `<channel\|>`) before the visible reply |
+| `<\|"\|>` | `<\|"\|>` | String-literal delimiter (same token on both ends) |
 | `<eos>` | — | End of sequence |
 
 Because the string delimiter is a token (`<|"|>`), values may contain raw ASCII quotes and commas without escaping — only a literal `<|"|>` token sequence cannot appear inside a string.
@@ -28,7 +28,7 @@ Each turn is `<|turn>{role}\n{body}<turn|>`, and turns are concatenated with no 
 
 ## Tool definitions
 
-The `gemma` dialect does not put tool schemas on the wire. Tools are advertised in the system prompt by `renderInbandToolPrompt` (`packages/ai/src/dialect/catalog.ts`): an OpenAI-style JSON catalog — one object per line inside a `<tools></tools>` block — followed by the format guide (`packages/ai/src/dialect/gemma.md`):
+The owned `gemma` prompt **does** carry each tool's normalized wire schema. `renderInbandToolPrompt` serializes one compact OpenAI-style object per line inside `<tools></tools>`, followed by the Gemma format guide:
 
 ```text
 <tools>
@@ -36,7 +36,7 @@ The `gemma` dialect does not put tool schemas on the wire. Tools are advertised 
 </tools>
 ```
 
-The verbose system-prompt inventory and `/dump` additionally render each tool as a `# Tool: <name>` section — description, a TypeScript-style parameter signature, and native `<|tool_call>` examples — via `renderToolInventory` (`packages/ai/src/dialect/inventory.ts`).
+`renderToolInventory` is a separate verbose inventory used by the system prompt and `/dump`. It emits one `## functions` TypeScript `namespace functions { … }` block. Tool descriptions are `//` comments above `type NAME = (_: PARAMS);` declarations; configured examples appear as JSDoc-style `// @example` entries whose calls use Python keyword-argument syntax. It does not emit per-tool Markdown sections or native Gemma `<|tool_call>` examples.
 
 ## Tool-call format
 
@@ -50,12 +50,12 @@ Value grammar inside `{…}`:
 
 | Value kind | Encoding | Example |
 |---|---|---|
-| string | `<|"|>text<|"|>` | `location:<|"|>London<|"|>` |
+| string | `<\|"\|>text<\|"\|>` | `location:<\|"\|>London<\|"\|>` |
 | int / float | bare | `count:42` |
 | bool | bare | `flag:true` |
 | null | bare | `unit:null` |
-| list | `[v,v,…]` | `tags:[<|"|>a<|"|>,<|"|>b<|"|>]` |
-| nested object | `{k:v,…}` | `config:{theme:<|"|>dark<|"|>}` |
+| list | `[v,v,…]` | `tags:[<\|"\|>a<\|"\|>,<\|"\|>b<\|"\|>]` |
+| nested object | `{k:v,…}` | `config:{theme:<\|"\|>dark<\|"\|>}` |
 
 The OMP parser is the streaming `GemmaInbandScanner` (`packages/ai/src/dialect/gemma.ts`), not a flat regex. For each `<|tool_call>` block it:
 
@@ -97,8 +97,9 @@ The current weather in Tokyo is 15 degrees Celsius and sunny.<turn|>
 - **Asymmetric pipes.** The closer is `<tool_call|>`, not `</tool_call>` or `<|tool_call>`. Matching the wrong pipe side will never close the block.
 - **One call per block.** Unlike a JSON `tool_calls[]` array, parallelism is "more blocks", not "more entries in one block".
 - **Bare scalars.** A value not wrapped in `<|"|>` is `true`/`false` → bool, `null`/`none` → null, numeric → number, otherwise a bare string (e.g. an unquoted enum or type name like `STRING`).
-- **Tool-call ids are synthesized.** The format carries no id; OMP mints one when the scanner opens each call block and correlates rendered responses by the surrounding message order/name.
+- **Tool-call ids are synthesized.** The format carries no id; after receiving a complete closed block, OMP parses it and emits adjacent `toolStart`/`toolEnd` events with a newly minted id. Rendered responses are correlated by surrounding message order/name.
 - **Not Gemma 3 / hosted Gemini.** Those use the Pythonic `tool_code` / `default_api` form in `gemini.md`. Gemma 4 replaced it with this token syntax; the two are not interchangeable.
+- **Gemma 3 automatic-selection caveat.** OMP's current family affinity maps Gemma 3 and Gemma 4 model IDs to `gemma`. If a Gemma 3 model is marked `supportsTools: false`, `tools.format=auto` therefore chooses this Gemma 4 grammar even though Gemma 3 requires the Pythonic convention in `gemini.md`; set `tools.format=gemini` explicitly.
 
 ## Sources
 

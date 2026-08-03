@@ -124,9 +124,13 @@ idle watchdogs use request options when supplied, otherwise the standard
 The initial `start` event is not considered progress for the idle watchdog.
 
 If the SSE connection closes without a terminal event, the client synthesizes
-a terminal assistant boundary so `.result()` cannot hang: caller cancellation
-becomes an `error` event with `stopReason: "aborted"`; otherwise it becomes an
-empty `done` event with `stopReason: "stop"`.
+a terminal assistant boundary so `.result()` cannot hang. Caller cancellation
+emits `{type:"error", reason:"aborted", error: syntheticAssistant}`; the nested
+`AssistantMessage` has `stopReason:"aborted"` and
+`errorMessage:"stream closed without terminal event"`. Any other clean close
+emits `{type:"done", reason:"stop", message: syntheticAssistant}`, whose nested
+message has `stopReason:"stop"`. Thus `reason` is the top-level event field;
+`stopReason` exists only on the nested `AssistantMessage`.
 
 The client consumes streaming responses only. The server endpoint also
 supports `stream: false`, returning:
@@ -139,7 +143,7 @@ with the full canonical `AssistantMessage` in `message`.
 
 ## Errors
 
-Pre-stream HTTP failures use:
+Provider/handler failures that reach the pi-native route use:
 
 ```json
 { "error": { "type": "rate_limit_error", "message": "..." } }
@@ -147,10 +151,14 @@ Pre-stream HTTP failures use:
 
 with the appropriate HTTP status, `Content-Type: application/json`, and
 `Cache-Control: no-store`. The client converts this shape into
-`AuthGatewayError`, preserving status, response headers, and `type`. A
-nonconforming error body falls back to
-`auth-gateway STATUS: BODY_OR_STATUS_TEXT`. A successful response with no body
-is also an `AuthGatewayError`.
+`AuthGatewayError`, preserving status, response headers, and `type`.
+
+Bearer authentication runs before the route handler. A missing or invalid
+gateway bearer is rejected as `{"error":"unauthorized"}` instead of the
+structured provider envelope; the client therefore uses its generic
+`auth-gateway STATUS: BODY_OR_STATUS_TEXT` fallback and has no provider error
+`type` to preserve. Other nonconforming error bodies use the same fallback. A
+successful response with no body is also an `AuthGatewayError`.
 
 ## Source of truth
 

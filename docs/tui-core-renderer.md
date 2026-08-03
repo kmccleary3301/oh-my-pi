@@ -29,14 +29,18 @@ which implements the commit-boundary seam described below.
 > when it was safe to rewrite native scrollback, and every policy choice over
 > that unobservable variable traded one failure family for another (yank ↔
 > flash ↔ corruption ↔ invisible-until-resize — see the git history of this
-> file for the full war journal). The current engine removes the guess
-> entirely: **native scrollback is append-only.**
+> file for the full war journal). The default engine removes the guess entirely:
+> **native scrollback is append-only.** An opt-in divergence-rebuild mode can
+> instead clear and replay scrollback outside multiplexers when finalized
+> content no longer matches committed history (§2); it does not probe viewport
+> position.
 
 We keep the transcript on the **normal screen** (native scrollback, native
 selection, transcript persists after exit). The engine maintains one ledger:
 
 - **`committedRows` (C)** — frame rows `[0, C)` have entered terminal history.
-  They are immutable: emitters never rewrite them.
+  Ordinary emitters never rewrite them. An opt-in destructive divergence replay
+  clears the ledger and rebuilds history from the current frame.
 - **`windowTopRow` (W)** — the frame row mapped to grid row 0. The visible
   window is frame rows `[W, W + height)`, repainted with relative cursor moves.
 - **live-region boundary (B)** — the first row that may still mutate, reported
@@ -49,9 +53,9 @@ For an ordinary unpinned frame, `W = max(C, L - height)` and the new commit end
 is `max(C, W)`, clamped to the frame. The only bytes that enter history are the
 chunk between the old and new commit indices. Exact rows remain subject to the
 committed-prefix audit; frozen mutable snapshots are deliberately outside the
-exactness claim. Scrollback therefore records every committed row once, in
-order, with its bytes at commit time. The renderer never needs to know whether
-the user has scrolled away from the tail.
+exactness claim. In the default mode, scrollback therefore records every
+committed row once, in order, with its bytes at commit time. The renderer never
+needs to know whether the user has scrolled away from the tail.
 
 ### What this costs (the accepted tradeoffs)
 
@@ -78,29 +82,39 @@ the user has scrolled away from the tail.
    rows in the last 24, SGR-stripped). A single in-place mismatch is accepted
    as stale history; a structural shift re-anchors at the first changed row,
    favoring duplication over content loss.
-3. Classify the frame as a gesture-driven full paint or ordinary update and
-   calculate the window/commit chunk. Overlays freeze commits. A pinned live
-   region clips its offscreen mutable suffix instead of snapshotting it.
+3. Classify the frame as a gesture-driven full paint, an opt-in divergence
+   rebuild, or an ordinary update and calculate the window/commit chunk.
+   Overlays freeze commits. A pinned live region clips its offscreen mutable
+   suffix instead of snapshotting it.
 4. Extract cursor markers, prepare width-safe lines, slice the window, and
    composite overlays into the screen-coordinate window only.
 5. Emit:
 
-| Emitter                      | Bytes                                              | When                                                        |
-| ---------------------------- | -------------------------------------------------- | ----------------------------------------------------------- |
-| `#emitFullPaint`             | home + committed chunk + window rows; optional ED3 | initial paint and explicit geometry/session/reset gestures  |
-| `#emitUpdate` scroll-append  | new bottom rows plus changed-row range             | rows leaving the screen are exactly the commit chunk        |
-| `#emitUpdate` in-window diff | relative move plus changed-row rewrite             | nothing scrolls or commits                                  |
-| `#emitUpdate` seam rewrite   | commit chunk plus full window rewrite              | commit/window re-anchor, hidden-gap backfill, or mux resize |
+| Emitter                      | Bytes                                              | When                                                                |
+| ---------------------------- | -------------------------------------------------- | ------------------------------------------------------------------- |
+| `#emitFullPaint`             | home + committed chunk + window rows; optional ED3 | initial paint, explicit geometry/session/reset gestures, or rebuild |
+| `#emitUpdate` scroll-append  | new bottom rows plus changed-row range             | rows leaving the screen are exactly the commit chunk                |
+| `#emitUpdate` in-window diff | relative move plus changed-row rewrite             | nothing scrolls or commits                                          |
+| `#emitUpdate` seam rewrite   | commit chunk plus full window rewrite              | commit/window re-anchor, hidden-gap backfill, or mux resize         |
 
-**ED3 (`CSI 3 J`) is emitted in exactly one place** — `#emitFullPaint` with
-`clearScrollback: true` — and is reached only by user gestures: session
-replace/branch/resume (`requestRender(true, { clearScrollback: true })`),
-resize outside a multiplexer, `resetDisplay()` (the display-reset chord,
-`Alt+L` by default). It clears native
-history without `ED2` first; the replay overwrites every row from home so
-terminals without synchronized output do not expose a blank viewport. A gesture
-pins the user to the tail, so the history snap is acceptable; multiplexers never
-get ED3 (it is a no-op there and a replay would duplicate pane history).
+**ED3 (`CSI 3 J`) is emitted in exactly one place** —
+`#emitFullPaint({ clearScrollback: true })`. The normal callers are explicit
+user gestures: session replace/branch/resume
+(`requestRender(true, { clearScrollback: true })`), resize outside a
+multiplexer, and `resetDisplay()` (the display-reset chord, `Alt+L` by
+default). It clears native history without `ED2` first; the replay overwrites
+every row from home so terminals without synchronized output do not expose a
+blank viewport. A gesture pins the user to the tail, so the history snap is
+acceptable.
+
+The second caller is an ordinary-render divergence when
+`tui.scrollbackRebuild` is enabled: if the committed prefix structurally
+resynchronizes or the current frame collapses into committed rows, the renderer
+clears and replays the current frame to replace stale preview history with the
+final form. This path is disabled by default and never runs after the first
+paint, during an explicit replacement/geometry frame, or inside a multiplexer.
+Multiplexers never get ED3 (it is a no-op there and a replay would duplicate
+pane history).
 
 The ordinary update path never emits ED2/ED3 or an absolute cursor home —
 several terminal families snap a scrolled reader to the bottom on those.
@@ -141,12 +155,13 @@ contract, not a terminal-specific optimization.
 ## 3. Invariants — MUST / NEVER
 
 1. **NEVER add a new `CSI 3 J` (ED3) callsite.** ED3 flows only through
-   `#emitFullPaint({ clearScrollback: true })`, only for gestures, never inside
-   multiplexers.
-2. **NEVER rewrite a committed row.** Emitters treat frame rows `< C` as
-   immutable. A shrink or structural resync may re-anchor below the old commit
-   point, but stale history remains and new bytes are appended; it is never
-   erased or silently skipped.
+   `#emitFullPaint({ clearScrollback: true })`, for explicit gestures or the
+   guarded opt-in divergence rebuild, and never inside multiplexers.
+2. **Ordinary emitters NEVER rewrite a committed row.** They treat frame rows
+   `< C` as immutable. A shrink or structural resync may re-anchor below the old
+   commit point, but in default mode stale history remains and new bytes are
+   appended; it is never silently skipped. The opt-in divergence rebuild is the
+   deliberate exception: it clears and replays the complete current frame.
 3. **Commits are exactly the chunk.** Any byte shape that scrolls the screen
    must scroll only rows accounted for by the commit advance.
 4. **NEVER probe the viewport position or fork on platform in the update
@@ -284,17 +299,18 @@ default-on only for kitty/ghostty (`PI_NO_KITTY_PLACEHOLDERS` /
 
 ## 9. Escape hatches (env vars)
 
-| Var                                                      | Effect                                                                                                                                                      |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PI_NO_SYNC_OUTPUT=1`                                    | Disable DEC 2026 BSU/ESU wrappers (autowrap discipline stays on).                                                                                           |
-| `PI_TUI_SYNC_OUTPUT=0\|1` / `PI_FORCE_SYNC_OUTPUT=1`     | Force sync output off / on.                                                                                                                                 |
-| `PI_NO_DECCARA`                                          | Disable Kitty DECCARA rectangular-fill optimization.                                                                                                        |
-| `PI_FORCE_IMAGE_PROTOCOL=kitty\|iterm2\|sixel\|off`      | Override image protocol detection.                                                                                                                          |
-| `PI_NO_KITTY_PLACEHOLDERS=1` / `PI_KITTY_PLACEHOLDERS=1` | Force Kitty Unicode placeholders off / on.                                                                                                                  |
-| `PI_HARDWARE_CURSOR=1`                                   | Show the real hardware cursor instead of a rendered one.                                                                                                    |
-| `PI_NOTIFICATIONS=off\|0\|false`                         | Suppress terminal notifications.                                                                                                                            |
-| `PI_DEBUG_REDRAW=1`                                      | Log the chosen render intent + ledger state per frame to the debug log.                                                                                     |
-| `PI_TUI_RESIZE_IN_PLACE=1\|0`                            | Force resize to repaint in place (no alt-screen borrow, no ED3 rewrap) on / off. Default-on for terminals that re-report size on alt-screen toggles (Warp). |
+| Var                                                      | Effect                                                                                                                                                                      |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PI_NO_SYNC_OUTPUT=1`                                    | Disable DEC 2026 BSU/ESU wrappers (autowrap discipline stays on).                                                                                                           |
+| `PI_TUI_SYNC_OUTPUT=0\|1` / `PI_FORCE_SYNC_OUTPUT=1`     | Force sync output off / on.                                                                                                                                                 |
+| `PI_NO_DECCARA`                                          | Disable Kitty DECCARA rectangular-fill optimization.                                                                                                                        |
+| `PI_FORCE_IMAGE_PROTOCOL=kitty\|iterm2\|sixel\|off`      | Override image protocol detection.                                                                                                                                          |
+| `PI_NO_KITTY_PLACEHOLDERS=1` / `PI_KITTY_PLACEHOLDERS=1` | Force Kitty Unicode placeholders off / on.                                                                                                                                  |
+| `PI_HARDWARE_CURSOR=1`                                   | Show the real hardware cursor instead of a rendered one.                                                                                                                    |
+| `PI_NOTIFICATIONS=off\|0\|false`                         | Suppress terminal notifications.                                                                                                                                            |
+| `PI_DEBUG_REDRAW=1`                                      | Log the chosen render intent + ledger state per frame to the debug log.                                                                                                     |
+| `PI_TUI_RESIZE_IN_PLACE=1\|0`                            | Force resize to repaint in place (no alt-screen borrow, no ED3 rewrap) on / off. Default-on for terminals that re-report size on alt-screen toggles (Warp).                 |
+| `PI_TUI_SCROLLBACK_REBUILD=1`                            | Initialize low-level `TUI` divergence rebuild on. Coding-agent subsequently applies `tui.scrollbackRebuild` (default `false`), so use the setting for interactive sessions. |
 
 Removed with the old engine: `PI_TUI_ED3_SAFE` (no ED3-risk lever exists),
 `PI_CLEAR_ON_SHRINK`, and `PI_TUI_DEBUG` (per-render dump superseded by
@@ -304,8 +320,9 @@ Removed with the old engine: `PI_TUI_ED3_SAFE` (no ED3-risk lever exists),
 
 ## 10. Before you touch the render core — checklist
 
-- [ ] Are you about to emit `CSI 3 J` anywhere other than the gesture-driven
-      `clearScrollback` full paint? **Stop.**
+- [ ] Are you about to emit `CSI 3 J` anywhere other than the existing
+      `clearScrollback` full-paint path for a gesture or guarded divergence
+      rebuild? **Stop.**
 - [ ] Could an ordinary emitter rewrite a row below `committedRows`? **Stop.**
 - [ ] Does your byte shape scroll rows not accounted for by the commit chunk?
       That breaks the append-only ledger.

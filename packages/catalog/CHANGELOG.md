@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced arktype with `@oh-my-pi/omptype` for discovery payload schemas (same definition DSL, lazy JIT validation).
+
 ## [17.2.6] - 2026-08-03
 
 ### Added

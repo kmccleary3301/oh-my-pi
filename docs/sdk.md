@@ -18,9 +18,9 @@ available model, but prompting cannot.
 
 ## Entry points
 
-`@oh-my-pi/pi-coding-agent` exports the SDK APIs from the package root (and also via `@oh-my-pi/pi-coding-agent/sdk`).
+The package root, `@oh-my-pi/pi-coding-agent`, is the complete embedding surface. It includes `createAgentSession` and the focused `/sdk` exports, plus lower-level session, auth, model, mode, extension, and tool APIs.
 
-Core exports for embedders:
+Import these core embedding APIs from the package root:
 
 - `createAgentSession`
 - `SessionManager`
@@ -31,6 +31,8 @@ Core exports for embedders:
 - `discoverAuthStorage`
 - Discovery helpers (`discoverExtensions`, `discoverSkills`, `discoverContextFiles`, `discoverPromptTemplates`, `discoverSlashCommands`, `discoverCustomTSCommands`, `discoverMCPServers`)
 - Tool factory surface (`createTools`, `BUILTIN_TOOLS`, tool classes)
+
+The narrower `@oh-my-pi/pi-coding-agent/sdk` subpath exports `createAgentSession`, its option/result types, `Settings`, `AgentRegistry`, discovery and system-prompt helpers, workspace-tree helpers, selected extension/MCP/tool types, and selected tool classes/factories. It does **not** export `SessionManager`, `AuthStorage`, or `ModelRegistry`; import those three from the package root as the examples below do.
 
 ## Quick start (auto-discovery defaults)
 
@@ -232,6 +234,12 @@ const unsubscribe = session.subscribe((event) => {
 - `notice`
 - `goal_updated`
 
+`agent_end` includes `messages`, optional telemetry fields, and
+`isTerminal?: boolean`. When `isTerminal` is `false`, maintenance or async
+delivery will resume the session before its true final settle. Subscribers that
+use `agent_end` as a completion signal MUST wait for `isTerminal !== false`.
+Treat an absent field as terminal for compatibility with older runtimes.
+
 ## Prompt lifecycle
 
 `session.prompt(text, options?)` is the primary entry point.
@@ -255,6 +263,29 @@ Related APIs:
 - `followUp(text, images?)`
 - `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`
 - `abort()`
+
+## `AgentSession` lifecycle and disposal
+
+Call `await session.dispose()` when the embedder is completely done with a session. `dispose()` starts disposal itself and is idempotent: repeated or concurrent calls receive the same teardown promise, so shutdown events and owned resources are not drained twice.
+
+`beginDispose()` is the synchronous admission barrier for wrappers that must await their own teardown before calling `dispose()`. Call it before the wrapper's first `await`; otherwise deferred work can enter the gap. It immediately marks the session disposed, cancels memory startup, title generation, and auto-learn capture, clears queued yield/asides, stops advisor runtime, detaches aside delivery, and rejects new eval executions. Deferred session work checks the disposed state and is dropped or skipped. `beginDispose()` is also idempotent, and the later `dispose()` call remains required to finish asynchronous cleanup.
+
+```ts
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
+
+async function closeEmbeddedSession(
+  session: AgentSession,
+  closeHostInputAndUi: () => Promise<void>,
+): Promise<void> {
+  session.beginDispose(); // no new deferred work may enter after this point
+  await closeHostInputAndUi();
+  await session.dispose();
+}
+```
+
+During asynchronous disposal, the session records and synchronously flushes its exit diagnostic, emits `session_shutdown` once, stops extension fallback timers, aborts retries, compaction, and the active agent turn, and gives post-prompt and auto-learn work bounded time to settle. It then tears down session-owned async jobs, eval kernels, browser tabs, native computer sessions, MCP connections, advisor state, and memory state concurrently. These subsystem drains are best-effort and bounded where applicable; failures are logged rather than preventing the remaining subsystem cleanup.
+
+Only after work capable of appending session entries has settled does disposal clean up an empty moved session, close the `SessionManager`, close provider session state, disconnect the agent, and remove listeners. A failure from the final persistence cleanup or `SessionManager.close()` rejects the shared disposal promise; individual provider-session close failures are logged.
 
 ## Tools and extension integration
 

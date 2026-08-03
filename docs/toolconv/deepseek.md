@@ -384,13 +384,17 @@ The current scanner accepts all three forms described above:
 - fullwidth or ASCII DSML `invoke` / `parameter` blocks.
 
 For V3.1 and legacy calls, omp emits `toolStart` after the header is complete
-but buffers arguments until `</｜tool▁call▁end｜>`; it then uses the shared
-repairing JSON parser. A missing/invalid argument object becomes `{}`, and an
-unfinished call is discarded on flush. DSML is genuinely incremental:
-`toolArgDelta` events are emitted while each parameter body arrives. A DSML
-parameter is a raw string unless `string="false"`; the latter is
-repairing-JSON-decoded and falls back to the raw text if decoding fails. Call
-IDs for id-less DeepSeek forms are synthesized as `ptc_…`.
+but buffers arguments until `<｜tool▁call▁end｜>`; it then uses the shared
+repairing JSON parser. A missing/invalid completed argument object becomes
+`{}`. Flush emits no `toolEnd` for an unfinished call and only clears the
+scanner's private state. Once `toolStart` has been projected, however, the
+canonical call remains and a normally stopped turn may dispatch it: unfinished
+V3.1/legacy calls retain `{}`, while DSML calls retain any argument text already
+published through `toolArgDelta`. DSML is genuinely incremental: parameter
+body text is streamed as those deltas. A DSML parameter is a raw string unless
+`string="false"`; the latter is repairing-JSON-decoded at a completed close and
+falls back to the raw text if decoding fails. Call IDs for id-less DeepSeek
+forms are synthesized as `ptc_…`.
 
 The scanner also removes leaked DeepSeek chat-template control tokens from
 visible text and, by default, maps `<think>…</think>` to thinking events. Its

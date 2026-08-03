@@ -196,14 +196,16 @@ tool-result messages are collapsed into one synthetic user message containing
 that text.
 
 The scanner recognizes only calls inside a section. Once the argument marker
-arrives it preserves the raw header as the call id and derives the name from
-the last dot-separated segment before the first colon. It emits `toolStart` at
-that point, buffers the argument body until `<|tool_call_end|>`, then applies
-the shared repairing JSON parser and emits `toolEnd`; it does **not** emit
-incremental argument deltas. Invalid/non-object arguments normalize to `{}`,
-and an unfinished call is discarded on flush. Section markers are suppressed
-from visible text, while an isolated call marker outside a section remains
-ordinary text.
+arrives it preserves the raw header as the call id, derives the name from the
+last dot-separated segment before the first colon, and emits `toolStart`. It
+buffers the argument body until `<|tool_call_end|>`, then applies the shared
+repairing JSON parser and emits `toolEnd`; it does **not** emit incremental
+argument deltas. Invalid/non-object completed arguments normalize to `{}`.
+If EOF arrives after `toolStart` but before the close marker, no `toolEnd` is
+emitted, yet the canonical `{}` call remains and may be dispatched on a normal
+stop. Only incomplete input that never reaches the argument marker is
+discarded without creating a call. Section markers are suppressed from visible
+text, while an isolated call marker outside a section remains ordinary text.
 
 Thinking parsing is enabled by default and maps `<think>…</think>` to thinking
 events. `parseThinking: false` leaves those tags and their contents in visible

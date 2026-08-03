@@ -115,6 +115,13 @@ If the message has no concrete task, output exactly `none`.
 
 `TITLE_SYSTEM.md` uses the same project-first, config-base discovery and no-ancestor-walk behavior. When absent, OMP uses its bundled title prompt. The override is used for both initial automatic titles and replan-driven title refreshes.
 
+Generated title output has an enforced normalization contract even with a
+custom prompt. OMP considers only the first trimmed line, strips surrounding
+quotes, `<title>...</title>` markers, and terminal punctuation, and treats
+`none` or `<title/>` as “no title yet.” A result longer than 80 characters or
+12 words is rejected rather than truncated. Empty, deferred, or rejected output
+leaves the session unnamed, so a later eligible title attempt can name it.
+
 ## Full provider-facing replacement (SDK only)
 
 `CreateAgentSessionOptions.systemPrompt` is a different, lower-level API. A string or array replaces the fully rendered default blocks; a callback receives the rendered block array and returns its replacement. This can omit all generated context and safety blocks.

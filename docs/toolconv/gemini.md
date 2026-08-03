@@ -125,7 +125,7 @@ It's currently 11.4°C in London.
 
 ## OpenAI-compatible / native API mapping
 
-- Hosted Gemini's native API normally returns a structured `functionCall` part (`{name, args}`); for Gemini 3 each carries an `id` that must be echoed in the matching `functionResponse`, plus a `thoughtSignature` that must be preserved. The Pythonic text form is what you get when the structured path *fails* (`finish_reason = MALFORMED_FUNCTION_CALL`) or when tool use is driven purely by prompt (Gemma, or Gemini via the code-execution `executableCode` part).
+- Hosted Gemini's native API normally returns a structured `functionCall` part (`{name, args}`). On direct Gemini Generative AI requests, Gemini 3 calls carry an `id` that OMP echoes in the matching `functionResponse`; their `thoughtSignature` must also be preserved. OMP's Vertex adapter is the exception: Vertex GenerateContent rejects function-part IDs, so OMP omits `id` from both `functionCall` and `functionResponse`, retains the originating function name, and relies on function name/order for matching. Thought signatures are still preserved.
 - When parsed out of an OpenAI-compatible shim, each recovered call becomes `tool_calls[i] = {id (server-minted), type:"function", function:{name, arguments:<JSON string>}}` — the Python kwargs are re-serialized to a JSON string at that boundary.
 - Feed results back as the deployment's tool/`functionResponse` turn (hosted) or a `tool_outputs` block in the next user turn (prompt-driven).
 
@@ -139,6 +139,7 @@ It's currently 11.4°C in London.
 - **OMP streaming behavior.** The scanner buffers the entire `tool_code` body and emits tool events only after the closing fence; it does not stream partial arguments. An unterminated block is discarded on flush rather than exposed as text. Positional arguments and malformed keyword segments are skipped. In addition to ordinary quoted strings, the literal decoder accepts Python raw/byte/unicode prefixes, triple quotes, octal escapes, and `\x`/`\u`/`\U` escapes.
 - **Transcript rendering.** OMP wraps the transcript in `<bos>` and Gemma-style `<start_of_turn>user|model` turns. `developer` text is prepended to the next user turn (or emitted as its own user turn if no user message follows); consecutive tool results become one user turn containing their separate `tool_outputs` blocks.
 - **Variant divergence.** Gemma **4** abandoned this Pythonic form for a token-delimited brace syntax (`<|tool_call>call:NAME{…}<tool_call|>`) — a different convention documented in `gemma.md`. This spec covers hosted Gemini and Gemma 3.
+- **Gemma 3 automatic-selection caveat.** OMP's current family affinity maps every recognized Gemma version—including Gemma 3—to the `gemma` dialect. Therefore, when a Gemma 3 model is marked `supportsTools: false` and falls back from native tools, `tools.format=auto` selects the incompatible Gemma 4 grammar. Set `tools.format=gemini` explicitly for the Pythonic Gemma 3 convention documented here.
 
 ## Sources
 

@@ -122,7 +122,7 @@ export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 }
 
 /**
- * Pure marker entry recorded by `/reset` (resetSessionContext). It carries no
+ * Pure marker entry recorded by `/clear` (resetSessionContext). It carries no
  * payload — its presence on the branch is a durable boundary the collapsed
  * live transcript and the model-context rebuild start emission after, so a
  * rebuild (theme change, focus attach, /shake, resume) does not resurrect the

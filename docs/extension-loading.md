@@ -1,8 +1,8 @@
 # Extension Loading (TypeScript/JavaScript Modules)
 
-This document covers how the coding agent discovers and loads **extension modules** (`.ts`/`.js`) at startup.
+This document covers how the coding agent discovers and loads extension modules at startup. Scanned native/configured directories auto-discover `.ts` and `.js`; explicitly named files and installed-plugin manifest entries may also use `.mjs` and `.cjs`.
 
-It does **not** cover `gemini-extension.json` manifest extensions (documented separately).
+It does **not** cover [`gemini-extension.json` manifest extensions](./gemini-manifest-extensions.md), which are documented separately.
 
 ## What this subsystem does
 
@@ -53,6 +53,8 @@ Hook-capability loading already applies its own hook-specific disabled ids, so t
 After hook discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`.
 
 Plugin extension entries come from package `omp.extensions` / `pi.extensions` manifests, including enabled feature entries.
+
+Installed-plugin manifest resolution accepts explicit `.ts`, `.js`, `.mjs`, and `.cjs` files. For a manifest entry that names a directory, it recognizes `index.ts`, `index.js`, `index.mjs`, or `index.cjs`; extension-directory expansion uses the same four suffixes. This is broader than native and configured-directory auto-scanning, which remains limited to `.ts` and `.js`.
 
 ### 4) Explicitly configured paths
 
@@ -146,7 +148,7 @@ For configured paths:
 
 ### If configured path is a file
 
-It is used directly as a module entry candidate.
+It is used directly as a module entry candidate. Explicit `.ts`, `.js`, `.mjs`, and `.cjs` files are supported.
 
 ### If configured path is a directory
 

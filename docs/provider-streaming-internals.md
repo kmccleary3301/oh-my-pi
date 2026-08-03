@@ -145,9 +145,10 @@ Observed behavior in current implementation:
 
 - malformed SSE framing or chunk JSON surfaces as an exception or stream `error` event
 - malformed Codex SSE JSON/framing throws from the local SSE reader
-- provider wrapper converts failures into unified terminal `error` events
-- no provider-specific resume/retry inside the stream function itself, except Codex websocket-to-SSE transport fallback before replay-unsafe output is emitted
-- higher-level retries are handled in `AgentSession` auto-retry logic (message-level retry, not stream-chunk replay)
+- providers do not resume from an individual malformed chunk. Depending on the provider and whether any replay-unsafe output has been emitted, a bounded provider-owned request retry may start a fresh attempt for transient transport or malformed-envelope failures.
+- provider-owned recovery also includes bounded empty-completion retries (OpenAI Responses, OpenAI Completions, Anthropic, Google native/Vertex, Gemini CLI, and Ollama) and capability fallbacks such as retrying without rejected strict-tool fields
+- Codex can fall back from websocket to SSE only before replay-unsafe output is emitted
+- `AgentSession` separately handles message-level auto-retry; it does not replay a stream from the failed chunk
 
 ## Cancellation boundaries
 

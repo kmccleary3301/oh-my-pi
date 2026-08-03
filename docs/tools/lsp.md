@@ -131,7 +131,7 @@ Uses the same location normalization and output shape as `definition`, but sends
 
 ### `symbols`
 **Inputs**
-- Workspace mode: `file: "*"` or omitted file on the early workspace branch, plus required `query`.
+- Workspace mode: required `file: "*"`, plus required `query`. Omitting `file` currently returns `Error: file parameter required...` before workspace-symbol dispatch.
 - Document mode: required `file`.
 - Optional: `timeout`.
 

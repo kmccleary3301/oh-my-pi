@@ -18,8 +18,8 @@ If you need the model to call code directly, use a custom tool.
 There are two active integration styles:
 
 1. **SDK-provided custom tools** (`options.customTools`)
-   - Wrapped into agent tools via `CustomToolAdapter` or extension wrappers.
-   - Always included in the initial active tool set in SDK bootstrap.
+   - In unrestricted SDK bootstrap, converted to extension tool definitions, registered through a generated extension, and always included in the initial active tool set.
+   - In a restricted session (`restrictToolNames: true`), SDK-provided custom tools are excluded unless `allowRestrictedCustomTools: true`; opted-in tools are active only when their names also appear in `toolNames`.
 
 2. **Filesystem-discovered modules via loader API** (`discoverAndLoadCustomTools` / `loadCustomTools`)
    - Exposed as library APIs in `packages/coding-agent/src/extensibility/custom-tools/loader.ts`.
@@ -31,7 +31,7 @@ Model tool call flow
 LLM tool call
    │
    ▼
-Tool registry (built-ins + custom tool adapters)
+Tool registry (built-ins + registered custom definitions)
    │
    ▼
 CustomTool.execute(toolCallId, params, onUpdate, ctx, signal)
@@ -148,15 +148,15 @@ execute(toolCallId, params, onUpdate, ctx, signal);
 - `ctx` includes `sessionManager`, `modelRegistry`, current `model`, `isIdle()`, `hasQueuedMessages()`, `abort()`, and optional `settings`, `fetch`, `localProtocolOptions`, and `autoApprove`.
 - `signal` carries cancellation and may be `undefined`.
 
-`CustomToolAdapter` bridges this to the agent tool interface and forwards calls in the correct argument order.
+The session bootstrap bridge converts custom tools to extension `ToolDefinition`s and forwards calls in the correct argument order. `CustomToolAdapter` remains available to library consumers that directly adapt a custom tool to the agent tool interface.
 
-Tool definitions may also declare `strict`, `hidden`, `loadMode`, `deferrable`, `mcpServerName`, `mcpToolName`, `approval`, and `formatApprovalDetails`. Custom tools default to the `"discoverable"` load mode; use `"essential"` to keep a tool top-level.
+Tool definitions may also declare `strict`, `hidden`, `loadMode`, `deferrable`, `mcpServerName`, `mcpToolName`, and `approval`. When `loadMode` is omitted, custom tool names default to `"discoverable"` except for the canonical essential built-in names (`read`, `write`, `bash`, `edit`, `glob`, `computer`, `eval`, `task`, `hub`, `learn`, and `manage_skill`), which default to `"essential"` so wrappers or re-registrations do not demote them. An explicit `loadMode` always wins; use `"essential"` to keep any other tool top-level. Although the public `CustomTool` type also declares `formatApprovalDetails`, the SDK/discovery bridge does not propagate that callback into the registered tool definition, so it cannot customize approval details on the normal integration paths.
 
 ## How tools are exposed to the model
 
-- Tools are wrapped into `AgentTool` instances (`CustomToolAdapter` or extension wrappers).
+- Session bootstrap wraps included SDK-provided and discovered custom tools as extension tool definitions; library consumers may instead use `CustomToolAdapter` directly.
 - They are inserted into the session tool registry by name.
-- In SDK bootstrap, custom and extension-registered tools are force-included in the initial active set.
+- In unrestricted SDK bootstrap, custom and extension-registered tools are force-included in the initial active set. Restricted sessions exclude SDK-provided custom tools unless `allowRestrictedCustomTools: true`, and expose an opted-in custom tool only when its name appears in `toolNames`.
 - CLI `--tools` currently validates only built-in tool names; custom tool inclusion is handled through discovery/registration paths and SDK options.
 
 ## Rendering hooks
@@ -164,12 +164,14 @@ Tool definitions may also declare `strict`, `hidden`, `loadMode`, `deferrable`, 
 Optional rendering hooks:
 
 - `renderCall(args, options, theme)`
-- `renderResult(result, options, theme, args?)`
+- `renderResult(result, options, theme)`
+
+The normal SDK and filesystem-discovery paths wrap custom tools as extensions. On those paths, `renderResult` receives only the three arguments above; the bridge does not forward the original tool arguments. The public `CustomTool` type retains an optional fourth `args` parameter for direct `CustomToolAdapter` consumers.
 
 Runtime behavior in TUI:
 
 - If hooks exist, tool output is rendered inside a `Box` container.
-- `renderResult` receives `{ expanded, isPartial, spinnerFrame? }`.
+- `renderResult` receives `{ expanded, isPartial, spinnerFrame? }` as its `options` argument.
 - Renderer errors are caught and logged; UI falls back to default text rendering.
 
 ## Session/state handling

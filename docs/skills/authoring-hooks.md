@@ -21,7 +21,7 @@ export default function myHook(omp: HookAPI): void {
 }
 ```
 
-The default export must be a plain synchronous function (not an async function or class). It receives a `HookAPI` instance and must register all handlers synchronously during execution.
+The default export must be a function (not a class). It receives a `HookAPI` instance and should register handlers during factory execution; the loader awaits a returned promise, so asynchronous initialization is accepted.
 
 Alternatively, using `ExtensionAPI` (preferred):
 

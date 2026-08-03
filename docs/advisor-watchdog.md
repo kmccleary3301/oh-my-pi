@@ -178,6 +178,22 @@ Practical interpretation:
 
 Advisor failures do not permanently stall the primary. The host first attempts its credential/fallback recovery. Retriable failures are attempted up to three times before that backlog is dropped; three dropped-backlog cycles halt the runtime until an explicit reset, and a permanent request rejection can halt it after one cycle. A quota/usage-limit failure pauses the advisor with its batch retained until `/advisor` rebuilds it, configuration is reloaded, a new session starts, or the process restarts. Catch-up waiters are released as soon as an advisor is failing.
 
+Unsafe Advisor output follows a separate quarantine path rather than that
+three-attempt request-retry policy. Before tool dispatch, the runtime
+quarantines a turn that requests non-bridge tools unavailable to the Advisor.
+It also quarantines generated text/advice when an output-only destructive-shell
+directive is detected, or when at least three output-only hazard classes match
+among destructive shell, instruction override, denial instruction, and
+account-deletion claim. A new instruction override paired with a destructive
+command quoted in the input also qualifies. The entire Advisor turn, including
+any advice in it, is discarded before dispatch.
+
+The first consecutive quarantine silently resets and re-primes the Advisor with
+the latest pending context. A second consecutive quarantine emits one
+deduplicated host warning, drops the affected batch, and resets the Advisor
+context to break the loop. Any successful Advisor turn resets the quarantine
+counter.
+
 ## WATCHDOG.md
 
 `WATCHDOG.md` is advisor-only guidance. It is appended to the advisor system prompt; it is not injected into the primary agent's normal context and does not behave like `AGENTS.md`, `RULES.md`, or other context files.

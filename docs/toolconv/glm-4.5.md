@@ -307,12 +307,17 @@ instead.
 
 The scanner synthesizes `ptc_…` ids, emits `toolStart` once the name delimiter
 arrives, and streams each argument body as keyed `toolArgDelta` events.
-String-only schema properties stay verbatim; every other property is parsed
-with strict `JSON.parse` after trimming and falls back to the original raw text
-on failure. An unfinished key/value drops the open call on flush. The scanner
-also heals narrowly recognizable model mistakes: `</arg_key>` used in place
-of `</arg_value>`, a stray wrong closer before the real closer, and a missing
-value closer immediately before the next argument or call close.
+String-only schema properties stay verbatim; every other completed property is
+parsed with strict `JSON.parse` after trimming and falls back to the original
+raw text on failure. On flush, an unfinished key/value drops only the scanner's
+private call state. If `toolStart` was already emitted, OMP retains the
+canonical call and a normal stop may dispatch it; previously accumulated
+arguments—including partial value text published through `toolArgDelta`—remain
+on that call. Input that never yields a valid name emits no `toolStart` and
+therefore leaves no call. The scanner also heals narrowly recognizable model
+mistakes: `</arg_key>` used in place of `</arg_value>`, a stray wrong closer
+before the real closer, and a missing value closer immediately before the next
+argument or call close.
 
 Thinking parsing is enabled by default and excludes `<think>…</think>` from
 visible text. If `<tool_response>` appears in assistant output, the scanner

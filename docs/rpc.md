@@ -499,6 +499,21 @@ Extension runner errors are emitted separately as:
 
 `message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
 
+`agent_end` has this session-level shape (in addition to optional telemetry fields):
+
+```ts
+{
+  type: "agent_end";
+  messages: AgentMessage[];
+  isTerminal?: boolean;
+}
+```
+
+`isTerminal: false` means maintenance or async delivery has scheduled more work,
+so the session will resume before its true final settle. Treat an `agent_end` as
+run completion only when `isTerminal !== false`; the field is optional so frames
+from older runtimes, where it is absent, remain terminal-compatible.
+
 ### Available commands
 
 `get_available_commands` returns `{ commands }`, and the same array is pushed
@@ -536,7 +551,7 @@ This is the most important operational behavior.
 That means:
 
 - command acceptance != run completion
-- agent turns complete via `agent_end`
+- agent turns complete only on `agent_end` frames where `isTerminal !== false`
 - local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
 
 ### While streaming
@@ -784,7 +799,7 @@ stdout sequence (typical):
 { "id": "req_1", "type": "response", "command": "prompt", "success": true }
 { "type": "agent_start" }
 { "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "delta": "..." }, "message": { "role": "assistant", "content": [] } }
-{ "type": "agent_end", "messages": [] }
+{ "type": "agent_end", "messages": [], "isTerminal": true }
 ```
 
 ### 2) Prompt during streaming with explicit queue policy
@@ -830,7 +845,9 @@ stdin:
 { "type": "extension_ui_response", "id": "ui_7", "value": "feature/rpc-host" }
 ```
 
-## Notes on `RpcClient` helper
+## Client libraries
+
+### TypeScript helper
 
 `packages/coding-agent/src/modes/rpc/rpc-client.ts` is a convenience wrapper, not the protocol definition.
 
@@ -842,4 +859,17 @@ Current helper characteristics:
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
 - Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for any surface not wrapped by the helper.
 
-Use raw protocol frames if you need complete surface coverage.
+### Python package
+
+The bundled [`omp-rpc`](../python/omp-rpc/pyproject.toml) distribution provides the process-backed Python client. Its import package is `omp_rpc`; the package API, typed commands and events, host-tool/host-URI helpers, and orchestration examples are maintained in the [`omp-rpc` README](../python/omp-rpc/README.md).
+
+```python
+from omp_rpc import RpcClient
+
+with RpcClient(provider="anthropic", model="claude-sonnet-4-5") as client:
+    state = client.get_state()
+    turn = client.prompt_and_wait("Reply with just the word hello")
+    print(turn.require_assistant_text())
+```
+
+By default, `RpcClient` starts `omp --mode rpc`; pass `command=[...]` to own the exact child command. It handles request correlation, typed notifications, v2 negotiation and chunk reassembly, message pagination, extension UI, and host-owned tools and URI schemes. The Python package owns that client API and process lifecycle; this document and `rpc-types.ts` remain the canonical wire contract. Use raw protocol frames when a client library does not wrap the surface you need.

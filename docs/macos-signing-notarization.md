@@ -92,7 +92,7 @@ The App Store Connect API key is the one credential that **cannot** be minted
 from a CLI — it is the bootstrap credential for the API itself, and the `.p8`
 downloads exactly once. Everything else is local.
 
-### Uploading (no value leaves disk)
+### Uploading without printing secret values
 
 `scripts/ci-macos-upload-secrets.sh` validates the files (opens the `.p12` with
 your password, sanity-checks the `.p8`) and pipes each value to `gh secret set`

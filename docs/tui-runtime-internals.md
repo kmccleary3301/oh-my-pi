@@ -18,6 +18,7 @@ Boundary rule: the TUI engine is message-agnostic. It only knows `Component.rend
 ## Implementation files
 
 - [`packages/coding-agent/src/modes/interactive-mode.ts`](../packages/coding-agent/src/modes/interactive-mode.ts)
+- [`packages/coding-agent/src/modes/session-teardown.ts`](../packages/coding-agent/src/modes/session-teardown.ts)
 - [`packages/coding-agent/src/modes/controllers/event-controller.ts`](../packages/coding-agent/src/modes/controllers/event-controller.ts)
 - [`packages/coding-agent/src/modes/controllers/input-controller.ts`](../packages/coding-agent/src/modes/controllers/input-controller.ts)
 - [`packages/coding-agent/src/modes/components/custom-editor.ts`](../packages/coding-agent/src/modes/components/custom-editor.ts)
@@ -69,6 +70,22 @@ A forced render (`requestRender(true)`) queues a viewport repaint or explicit se
 
 This prevents partial escape chunks from being misinterpreted as normal keypresses.
 
+### Shutdown and terminal handoff
+
+Exit from double `Ctrl+C`, empty-editor `Ctrl+D`, `/exit`, and postmortem signals converges on a promise-memoized session teardown. The first caller wins: it snapshots the editor draft, calls `beginDispose()` synchronously, attempts to save the draft, and then disposes the session. A draft-save failure is logged but does not skip disposal; later keypress or signal callers await the same promise and cannot double-run shutdown.
+
+Interactive shutdown then follows this ownership order:
+
+1. `InteractiveMode` stops live commands and transient controllers, displays the closing status, and awaits session disposal before handing the terminal back.
+2. It drains in-flight Kitty input for up to one second so release sequences do not leak into the parent shell.
+3. It disposes the run-state title/spinner state and restores the prior terminal title before stopping the UI.
+4. `TUI.stop()` leaves resize/fullscreen alternate-screen state, purges image/probe state, stops watchdog and render/resize timers, positions and forcibly restores the cursor, then delegates to `ProcessTerminal.stop()`.
+5. `ProcessTerminal.stop()` restores real stderr and terminal modes, disables keyboard/mouse/appearance protocols, clears probes and timers, destroys `StdinBuffer`, removes stdin/stdout listeners, pauses stdin, and restores its previous raw-mode state.
+
+Terminal disconnects mark the terminal dead and stop interactive rendering. Cleanup still removes owned state, but raw-mode restoration errors are suppressed only for that dead-terminal case because there is no live TTY left to restore.
+
+Suspend is distinct from exit: `Ctrl+Z` stops the TUI to release terminal modes, sends `SIGTSTP`, and retains the session. Its one-shot `SIGCONT` handler starts the TUI again and forces a repaint; it does not run session teardown or terminal handoff to a parent shell.
+
 ## Input routing and focus model
 
 Input path:
@@ -99,7 +116,7 @@ Routing details:
 
 This keeps key parsing/editor mechanics in `packages/tui` and mode semantics in coding-agent controllers.
 
-## Render loop and the append-only contract
+## Render loop and the default append-only contract
 
 `TUI.requestRender()` coalesces render requests and rate-limits ordinary frames:
 
@@ -115,9 +132,11 @@ This keeps key parsing/editor mechanics in `packages/tui` and mode semantics in 
 2. Audit the already committed raw prefix for structural shifts; an insertion/deletion re-anchors commits at the first changed row so stale history may duplicate but new content is not lost.
 3. Advance the append-only ledger. Rows before the live boundary are exact/final; mutable rows that scroll above the window normally commit as frozen snapshots, while a pinned live region stays viewport-local.
 4. Extract and strip `CURSOR_MARKER`, normalize lines, slice the visible window, and composite overlays into that screen-coordinate window slice (overlays freeze commits).
-5. Emit one of: gesture-driven full paint, scroll-append, in-window row diff, or seam rewrite.
+5. Emit one of: gesture-driven or divergence-rebuild full paint, scroll-append, in-window row diff, or seam rewrite.
 
-Native scrollback is append-only: committed frame rows are never rewritten. Exact rows enter history after the component seam declares them final; an unpinned mutable row that scrolls off is recorded as the snapshot that was visible at commit time. There are no viewport-position probes or deferred reconciliation; see [`tui-core-renderer.md`](./tui-core-renderer.md).
+By default, native scrollback is append-only: committed frame rows are never rewritten. Exact rows enter history after the component seam declares them final; an unpinned mutable row that scrolls off is recorded as the snapshot that was visible at commit time. There are no viewport-position probes or deferred reconciliation; see [`tui-core-renderer.md`](./tui-core-renderer.md).
+
+The opt-in `tui.scrollbackRebuild` setting (default `false`) changes how a committed-prefix divergence is repaired. When finalized content replaces a scrolled-off preview, or a frame collapses into already committed rows, a direct terminal session clears native scrollback with ED3 and replays the current frame so the stale and final forms do not both remain. Multiplexer sessions never take this destructive path and retain the append/repair-below fallback. `PI_TUI_SCROLLBACK_REBUILD=1` initializes the low-level `TUI` flag, but `InteractiveMode` then applies the configured `tui.scrollbackRebuild` value; the setting is therefore the effective control in coding-agent.
 
 Render writes use synchronized output mode (`CSI ? 2026 h/l`) when enabled; capability detection, DECRQM, or `PI_NO_SYNC_OUTPUT` can disable the wrappers while leaving autowrap discipline on.
 

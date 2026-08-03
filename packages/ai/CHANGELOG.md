@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced arktype with `@oh-my-pi/omptype`, an ArkType-compatible validator with lazy JIT compilation: ~100x faster schema construction and 60-100x faster hot-path validation. `packages/ai` re-exports `type`/`Type` from omptype; the wire schema detection contract (`isArkSchema`) is unchanged.
+
+### Fixed
+
+- Fixed OpenAI-Codex (ChatGPT OAuth) requests failing with `Unsupported service_tier: auto` on default/legacy sessions. `shouldSendServiceTier` no longer forwards `auto` on the wire — it is OpenAI's implicit default, so omitting `service_tier` is equivalent, and the Codex endpoint rejects an explicit `auto`. Explicit `default`/`flex`/`scale`/`priority` are unaffected ([#7517](https://github.com/can1357/oh-my-pi/issues/7517)).
+
 ## [17.2.6] - 2026-08-03
 
 ### Added

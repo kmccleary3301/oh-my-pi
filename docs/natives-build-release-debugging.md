@@ -367,7 +367,7 @@ When `pi-natives` is built inside the robomp orchestrator (`python/robomp/`), wo
 
 ### What is cached
 
-The complete set of files in `packages/natives/native/` that are pure functions of the cache-key inputs:
+The cache captures the following files from `packages/natives/native/` under the computed key. Correct reuse assumes the worktree contents of keyed paths match committed `HEAD`; because the key ignores uncommitted changes, a build from a dirty keyed path can otherwise be captured under and later reused from the unchanged key:
 
 - `pi_natives.<platform>-<arch>[-variant].node` (glob `pi_natives.*.node`)
 - `index.d.ts`
@@ -430,4 +430,4 @@ Workspaces that hardlinked a `.node` before GC retain access via the kernel inod
 - Everything: `rm -rf /data/cache/pi-natives/*` (preserve the root so its setgid mode survives).
 - Stuck lock: `rm /data/cache/pi-natives/<repo-slug>/.lock` (only when no orchestrator process is touching the repo).
 
-An automatic miss occurs only when committed `HEAD` changes under `crates/`, `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`, or `packages/natives/`. Merely editing an uncommitted worktree does not change the key.
+For a fixed target suffix, a committed `HEAD` change under `crates/`, `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`, or `packages/natives/` produces an automatic miss. Changing platform/architecture, or `TARGET_VARIANT` on x64, also selects a different key. Merely editing an uncommitted worktree changes neither the `HEAD` hashes nor the key.

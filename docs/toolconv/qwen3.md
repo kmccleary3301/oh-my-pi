@@ -197,22 +197,27 @@ pi tool-call events. `hermes` remains a separate selectable dialect even
 though both emit the same basic JSON-in-`<tool_call>` convention.
 
 The catalog's current family-affinity helper maps every model id containing
-`qwen` to `qwen3`, including Qwen3-Coder. That broad affinity does not change
-the format distinction described below, so callers must explicitly select the
-appropriate dialect for Coder endpoints.
+`qwen` to `qwen3`, including Qwen3-Coder. For a Coder endpoint, set
+`tools.format=native` (or the equivalent native-tool setting) and configure the
+serving endpoint itself with its `qwen3_xml` parser. `qwen3_xml` is not an
+OMP-owned dialect and therefore is not a valid `tools.format` value.
 
 The omp renderer always writes a nested `arguments` object and renders
 parallel calls newline-separated. Results become newline-delimited
 `<tool_response>` blocks inside the synthetic user history message. The
-scanner mints an id (`ptc_…`), emits `toolStart` as soon as the leading JSON
-contains a complete string `name`, and waits for `</tool_call>` before emitting
-`toolEnd`; it does not stream argument deltas. At close it uses the shared
+scanner mints an id (`ptc_…`) and emits `toolStart` as soon as the leading JSON
+contains a complete string `name`. It waits for `</tool_call>` before emitting
+`toolEnd` and does not stream argument deltas. At close it uses the shared
 repairing JSON parser. For compatibility it also accepts a stringified
 `arguments` value and parses it once more, although the owned renderer never
-emits that shape. A malformed completed block, a non-object argument value, or
-an unfinished block does not become visible fallback prose: malformed calls
-are consumed, with a string parse failure/non-object normalized to `{}` or the
-whole call omitted when its outer object/name cannot be recovered.
+emits that shape. A completed string parse failure or non-object argument
+normalizes to `{}`; a completed outer object whose name cannot be recovered is
+consumed without creating a call.
+
+If EOF arrives after the name was recovered but before `</tool_call>`, no
+`toolEnd` is emitted, but the canonical call created by `toolStart` survives
+with empty arguments and may be dispatched on a normal stop. Malformed input
+that never yields a name produces no call.
 
 Thinking parsing is enabled by default: `<think>…</think>` becomes thinking
 events and is excluded from visible text. Callers creating the scanner can set
@@ -235,7 +240,7 @@ text.
   through vLLM's structured-outputs backend when using vLLM native tools, but
   owned mode sends no native provider tool definition and therefore cannot rely
   on that backend.
-- **Version/scope:** this `hermes` template covers `Qwen3-*`, `Qwen2.5-*`, and `QwQ-32B`. It does **not** cover `Qwen3-Coder`, which uses a different XML scheme parsed by vLLM's `qwen3_xml` parser — a separate convention.
+- **Version/scope:** this `hermes` template covers `Qwen3-*`, `Qwen2.5-*`, and `QwQ-32B`. It does **not** cover `Qwen3-Coder`, which uses a different XML scheme parsed by a serving engine's `qwen3_xml` parser. OMP has no `qwen3_xml` owned dialect; use `tools.format=native` and configure that parser at the endpoint.
 
 ## Sources
 

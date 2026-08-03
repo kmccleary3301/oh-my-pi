@@ -1,6 +1,6 @@
-# Session Operations: export, dump, share, fresh, fork, resume/continue
+# Session Operations: export, dump, share, fresh, clear, fork, resume/continue
 
-This document describes operator-visible behavior for session export/share/fork/resume operations as currently implemented.
+This document describes operator-visible behavior for session export, sharing, conversation reset, lifecycle, fork, and resume operations as currently implemented.
 
 ## Implementation files
 
@@ -19,7 +19,10 @@ This document describes operator-visible behavior for session export/share/fork/
 | `/export [--themes] [path]`             | Slash command (TUI/headless) | No                                            | No                                                                                         | HTML file                                                                           |
 | `--export <session.jsonl> [outputPath]` | CLI startup fast-path        | No runtime session mutation                   | No active session; reads target file                                                       | HTML file                                                                           |
 | `/share`                                | Slash command (TUI/headless) | No                                            | No                                                                                         | Encrypted share link (gist or share server); temp HTML only for TUI custom handlers |
+| `/new`                                  | Interactive slash command    | Yes (starts an empty conversation)            | Switches identity; assigns a new transcript path in persistent mode                        | None                                                                                |
 | `/fresh`                                | Slash command (TUI/headless) | Yes (provider-facing in-memory id/state only) | No; keeps current session file/header                                                      | None                                                                                |
+| `/clear`                                | Interactive slash command    | Yes (clears live/model conversation context)  | No; retains session identity, metadata, transcript file, and full on-disk history          | Appends a durable `reset_boundary`                                                  |
+| `/drop`                                 | Interactive slash command    | Yes (starts an empty conversation)            | Attempts to delete the current persisted session and artifacts, then switches to a new one | None                                                                                |
 | `/fork`                                 | Interactive slash command    | Yes (active session identity changes)         | Creates new session file and switches current session to it (persistent mode only)         | Copies artifact directory to new session namespace when present                     |
 | `--fork <id\|path>`                     | CLI startup                  | Yes after session creation                    | Creates a new session fork from the selected source into current cwd/session dir           | None                                                                                |
 | `/resume [id\|@claude\|@codex]`         | Interactive slash command    | Yes (active in-memory state replaced)         | Switches to a selected/matched session, or imports a selected foreign session              | None                                                                                |
@@ -176,10 +179,39 @@ keeping the conversation you can see.
 - Leaves the local transcript, session file, and session identity unchanged, so
   nothing you have said or received is lost.
 
-Because it keeps the current session file, `/fresh` differs from `/new` (start a
-brand-new empty session) and `/drop` (delete the current session and start a new
-one): only `/fresh` preserves the visible history while giving the provider a
-clean slate.
+Because it keeps both the visible and model-facing conversation, `/fresh`
+differs from `/clear` (clear the live/model conversation in place), `/new`
+(start a brand-new empty session), and `/drop` (attempt to delete the current
+session and start a new one). Only `/fresh` preserves the existing conversation
+while giving the provider stream state a clean slate.
+
+## Clear
+
+Interactive `/clear` clears the current conversation context in place. It is
+available only in the TUI and is rejected while a response is streaming or a
+foreground bash/Python execution is running. If compaction is active, the
+command aborts it and waits for it to stop before resetting.
+
+`AgentSession.resetSessionContext()`:
+
+- Drops live messages, queued steer/follow-up turns, pending tool calls, error
+  state, checkpoint/rewind and deferred tool state, and session-stop
+  continuation state. It also cancels this agent's queued continuation work and
+  async bash/task jobs.
+- Rotates provider-side session state, re-primes advisors, invalidates
+  append-only model context, and resets memory promotion so the next turn
+  rebuilds from the base system prompt and current project instructions.
+- Retains the session id, title, cwd, model, settings, active plan path, and
+  transcript file.
+- Appends a durable `reset_boundary`. The collapsed live transcript and rebuilt
+  model context begin after the latest boundary, while the JSONL transcript and
+  full-transcript export retain the pre-reset history on disk.
+
+The TUI clears its rendered transcript after a successful clear. This differs
+from `/fresh`, which rotates provider stream state without clearing the
+conversation; `/new`, which creates a new session identity and transcript file;
+and `/drop`, which attempts to delete the old persisted session before starting
+a new one.
 
 ## Fork
 
@@ -337,7 +369,7 @@ These callbacks are observational; they do not cancel switch/fork.
 
 - `/fork` is blocked while streaming (user must wait/abort current response first).
 - `/resume` selector can be cancelled by user closing selector.
-- Cross-project `--resume <id>` can be cancelled by declining fork prompt.
+- Cross-project `--resume <id>` can be cancelled by declining the missing-directory move/re-root prompt.
 - `/share` has a UI abort path (`Share cancelled`); the upload itself is not killed mid-flight.
 
 ## Non-persistent (in-memory) session behavior
@@ -355,3 +387,8 @@ When session manager is created with `SessionManager.inMemory()` (`--no-session`
 - `SelectorController.handleResumeSession()` does not check the boolean result from `session.switchSession(...)`; a hook-cancelled switch can still proceed through UI "Resumed session" repaint/status path.
 - `/share` custom-share failures do not degrade to the default encrypted share flow; they terminate the TUI command with an error.
 - `/export` argument tokenization does not preserve quoted paths with spaces.
+- `/drop` treats deletion as best-effort: it attempts to delete the current
+  session JSONL and artifact directory, logs any deletion failure, and still
+  creates and switches to a new session. A failed or partial deletion can leave
+  the old session or its artifacts on disk, so `/drop` is not a guaranteed
+  erasure boundary.

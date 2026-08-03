@@ -156,6 +156,7 @@ Terminology follows `docs/natives-architecture.md`:
 - `astEdit(options)` returns replacement changes, per-file counts, searched/touched file counts, parse errors, and whether edits were applied.
 - `dryRun` defaults to true for edit options in the generated documentation.
 - Options include language override, path/glob/selector, strictness, limits, parse-error policy, `signal`, and `timeoutMs`.
+- For `astGrep` and `astEdit`, a directory `path` uses the shared cache for candidate discovery with configured stale-empty rechecking; a direct file `path` returns that file without traversal or cache access. `astMatch` remains in-memory.
 
 These exports are direct native APIs used by tooling; they are not mediated by a TS wrapper in `packages/natives`.
 
@@ -163,7 +164,7 @@ These exports are direct native APIs used by tooling; they are not mediated by a
 
 `pi-walker` owns traversal and cache policy. `crates/pi-natives/src/iofs.rs` contains only JavaScript-facing DTO conversion, error mapping, and the invalidation export.
 
-The cache stores normalized relative entries (`path`, `fileType`, optional `mtime` and regular-file `size`) keyed by canonical search root plus the complete `WalkOptions` value, including hidden/gitignore, link-following, filtering, ordering, and detail policy.
+The cache stores normalized relative entries (`path`, `fileType`, optional `mtime` and regular-file `size`) keyed by canonical search root plus the effective traversal-level `WalkOptions`: hidden/gitignore and directory-pruning policy, link following, metadata detail, traversal order/depth, root emission, directory-error handling, filesystem boundary, and cache mode. `WalkFilter` predicates, ranking, and result limits run after collection and do not independently partition the cache, so requests with different glob, file-type, size-threshold, or limit values can share an entry. A filter or rank that requires extra metadata can still promote the effective detail policy and thereby select a different key.
 
 Configuration is read from environment once:
 
@@ -242,17 +243,17 @@ Text functions generally return deterministic transformed output; errors are lim
 
 ## Pure utility vs filesystem-dependent flows
 
-| Flow                         | Filesystem access | Shared cache | Notes                                                      |
-| ---------------------------- | ----------------- | ------------ | ---------------------------------------------------------- |
-| `search` / `hasMatch`        | No                | No           | regex on provided bytes/string only                        |
-| `text` module functions      | No                | No           | ANSI/width utilities only                                  |
-| `highlight` module functions | No                | No           | syntax + ANSI coloring only                                |
-| `countTokens`                | No                | No           | tokenization only                                          |
-| `astMatch`                   | No                | No           | in-memory syntax-aware match (no disk)                     |
-| `astGrep` / `astEdit`        | Yes               | No           | syntax-aware file search/edit                              |
-| `glob`                       | Yes               | Optional     | directory scans + glob filtering                           |
-| `fuzzyFind`                  | Yes               | Optional     | directory scans + fuzzy scoring                            |
-| `grep` (file/dir path)       | Yes               | No           | walker discovery + regex search, optional filters/callback |
+| Flow                         | Filesystem access | Shared cache              | Notes                                                                |
+| ---------------------------- | ----------------- | ------------------------- | -------------------------------------------------------------------- |
+| `search` / `hasMatch`        | No                | No                        | regex on provided bytes/string only                                  |
+| `text` module functions      | No                | No                        | ANSI/width utilities only                                            |
+| `highlight` module functions | No                | No                        | syntax + ANSI coloring only                                          |
+| `countTokens`                | No                | No                        | tokenization only                                                    |
+| `astMatch`                   | No                | No                        | in-memory syntax-aware match (no disk)                               |
+| `astGrep` / `astEdit`        | Yes               | Yes (directory discovery) | directory paths use cached traversal; a direct file path bypasses it |
+| `glob`                       | Yes               | Optional                  | directory scans + glob filtering                                     |
+| `fuzzyFind`                  | Yes               | Optional                  | directory scans + fuzzy scoring                                      |
+| `grep` (file/dir path)       | Yes               | No                        | walker discovery + regex search, optional filters/callback           |
 
 ## End-to-end lifecycle summary
 

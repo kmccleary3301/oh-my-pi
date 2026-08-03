@@ -3898,8 +3898,7 @@ export class AgentSession {
 
 		// Record a durable boundary on the persisted branch. The collapsed live
 		// transcript and the model-context rebuild start emission after the latest
-		// boundary, so a rebuild across a `/reset` (theme change, focus attach,
-		// /shake, resume) does not resurrect the pre-reset conversation. The
+		// boundary, so a rebuild across a `/clear` (theme change, focus attach,
 		// on-disk record and the plain `transcript:true` export path keep the full
 		// pre-reset history.
 		this.sessionManager.appendResetBoundary();

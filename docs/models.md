@@ -51,6 +51,7 @@ providers:
     disableStrictTools: false # set true for Anthropic-compatible endpoints that reject the strict field
     discovery:
       type: ollama
+      timeoutMs: 10000 # optional per-provider HTTP probe timeout in milliseconds
     modelOverrides:
       some-model-id:
         name: Renamed model
@@ -123,10 +124,18 @@ Must define at least one of:
 - `disableStrictTools`
 - `modelOverrides`
 - `discovery`
+- `remoteCompaction`
 
 ### Discovery
 
+- `discovery.timeoutMs` overrides that provider's runtime HTTP probe timeout in milliseconds. It must be a positive finite number.
 - `discovery` requires provider-level `api`, except `discovery.type: proxy` (per-model wire auto-detected).
+
+### Remote compaction
+
+`remoteCompaction` is independently sufficient for an override-only provider.
+It supports `enabled`, `api`, `endpoint`, `model`, `v2StreamingEnabled`,
+`v2Endpoint`, and `streamingEndpoint`.
 
 ### Model value checks
 
@@ -163,7 +172,7 @@ ModelRegistry pipeline (on refresh):
 ### Provider-model cache and static fingerprint
 
 Cached per-provider model lists are persisted in the model-cache SQLite
-database (current schema version 6) with a `static_fingerprint` column that
+database (current schema version 12) with a `static_fingerprint` column that
 hashes the static catalog slice merged into the row. When `resolveProviderModels`
 skips the network fetch and the fingerprint of the in-memory static
 catalog matches the cached one, the cached rows are returned verbatim —
