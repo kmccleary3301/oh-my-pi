@@ -25,8 +25,9 @@ import {
 	type SelectListMouseTarget,
 	type TUI,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
-import { formatAge, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { formatAge, formatDuration, formatNumber, getProjectDir, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
@@ -40,7 +41,42 @@ import type { ObservableSession, SessionObserverRegistry } from "../session-obse
 import { theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
 import { AgentTranscriptViewer } from "./agent-transcript-viewer";
-import { DynamicBorder } from "./dynamic-border";
+import {
+	bottomBorder,
+	divider,
+	dividerSplit,
+	row,
+	splitBodyWidth,
+	splitRow,
+	topBorder,
+	topBorderSplit,
+} from "./overlay-box";
+
+/** Two-pane mode needs a useful roster and a readable inspector. */
+const SPLIT_MIN_WIDTH = 96;
+const DETAIL_MIN_WIDTH = 34;
+const ROSTER_MIN_WIDTH = 48;
+
+type HubViewMode = "roster" | "tree";
+
+interface AgentMetrics {
+	tokens: number;
+	requests: number;
+	tools: number;
+	cost: number;
+	durationMs: number;
+	contextTokens?: number;
+	contextWindow?: number;
+}
+
+interface AggregateMetrics extends AgentMetrics {
+	reportedAgents: number;
+}
+
+interface RosterRender {
+	lines: string[];
+	hitRows: Array<number | undefined>;
+}
 
 /** Refresh cadence for the relative-time column */
 const AGE_TICK_MS = 5_000;
@@ -60,7 +96,7 @@ function sanitizeLine(text: string, maxWidth?: number): string {
 }
 
 function clampHubLine(line: string, width: number): string {
-	return truncateToWidth(line.replace(/[\r\n]+/g, " "), Math.max(1, width - 2), Ellipsis.Omit);
+	return truncateToWidth(line.replace(/[\r\n]+/g, " "), Math.max(1, width), Ellipsis.Omit);
 }
 
 const STATUS_ORDER: Record<AgentStatus, number> = { running: 0, idle: 1, parked: 2, aborted: 3 };
@@ -124,6 +160,54 @@ function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): str
 	}
 	const resolved = progress?.resolvedModel;
 	return resolved ? formatResolvedModelBadge(resolved) : undefined;
+}
+
+/** Direct usage for one roster entry. Prefer executor progress; fall back to a live session snapshot. */
+function metricsFor(ref: AgentRef, observed: ObservableSession | undefined): AgentMetrics | undefined {
+	const progress = observed?.progress;
+	if (progress) {
+		return {
+			tokens: progress.tokens,
+			requests: progress.requests,
+			tools: progress.toolCount,
+			cost: progress.cost,
+			durationMs: progress.durationMs,
+			contextTokens: progress.contextTokens,
+			contextWindow: progress.contextWindow,
+		};
+	}
+	const getSessionStats = ref.session?.getSessionStats;
+	if (typeof getSessionStats !== "function") return undefined;
+	try {
+		const stats = getSessionStats.call(ref.session);
+		return {
+			// Match AgentProgress lifetime billing volume: cache reads are
+			// deliberately excluded because every turn rereads cached context.
+			tokens: stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite,
+			requests: stats.assistantMessages,
+			tools: stats.toolCalls,
+			cost: stats.cost,
+			durationMs: 0,
+			contextTokens: stats.contextUsage?.tokens,
+			contextWindow: stats.contextUsage?.contextWindow,
+		};
+	} catch {
+		// Render-only test doubles and sessions being torn down may not expose a
+		// complete statistics host. Missing metrics are preferable to a broken hub.
+		return undefined;
+	}
+}
+
+function formatCost(cost: number): string {
+	if (cost < 0.01) return `$${cost.toFixed(4)}`;
+	if (cost < 1) return `$${cost.toFixed(3)}`;
+	return `$${cost.toFixed(2)}`;
+}
+
+function contextGauge(tokens: number, window: number): string {
+	const ratio = Math.max(0, Math.min(1, tokens / window));
+	const filled = Math.round(ratio * 10);
+	return `${theme.fg("accent", "━".repeat(filled))}${theme.fg("dim", "─".repeat(10 - filled))} ${formatNumber(tokens)}/${formatNumber(window)} ${Math.round(ratio * 100)}%`;
 }
 
 /** Result of one host-backed transcript read for the Agent Hub viewer. */
@@ -205,6 +289,12 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#rowOrder: Map<string, number> | undefined;
 	/** Double-tap window state for the table's left-left "close hub" gesture. */
 	#lastLeftTap = 0;
+	/** Operational ordering by default; tree mode groups descendants under their spawner. */
+	#viewMode: HubViewMode = "roster";
+	#treeDepthById = new Map<string, number>();
+	/** On narrow terminals Tab replaces the roster with the selected-agent inspector. */
+	#narrowDetailsOpen = false;
+	#lastRenderWasSplit = false;
 
 	// Transcript-viewer launch deps (passed through to AgentTranscriptViewer).
 	#ui: TUI;
@@ -292,13 +382,12 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	}
 
 	override render(width: number): readonly string[] {
-		const frame = this.#renderTable(width).map(line => clampHubLine(line, width));
 		const termHeight = this.#ui.terminal?.rows || process.stdout.rows || 40;
+		const frame = this.#renderTable(width, termHeight).map(line => clampHubLine(line, width));
 		if (frame.length <= termHeight) return frame;
 
 		// A tiny terminal can leave less room than the fixed chrome needs. Keep
-		// the header and footer visible rather than allowing the fullscreen modal
-		// to spill into the terminal's scrollback.
+		// the title and footer visible instead of spilling into scrollback.
 		const footerLines = Math.min(3, frame.length);
 		const bodyEnd = Math.max(0, termHeight - footerLines);
 		return [...frame.slice(0, bodyEnd), ...frame.slice(-footerLines)].slice(0, termHeight);
@@ -401,130 +490,276 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
 
 		const rowOrder = this.#rowOrder;
+		let rosterRows: AgentRef[];
 		if (!rowOrder) {
 			// First refresh (usually the constructor): order by status, then recency.
-			this.#rows = refs.sort(
+			rosterRows = refs.sort(
 				(a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity,
 			);
-			this.#rowOrder = new Map(this.#rows.map((ref, i) => [ref.id, i]));
+			this.#rowOrder = new Map(rosterRows.map((ref, i) => [ref.id, i]));
 		} else {
-			// After the hub is open, freeze the relative order so keyboard selection
-			// does not jump around as agents heartbeat or update activity. New agents
-			// are appended at the end and then stay put.
-			this.#rows = refs.sort((a, b) => {
+			// After the hub is open, freeze relative order within each lifecycle
+			// group. New agents append instead of moving the user's selection.
+			rosterRows = refs.sort((a, b) => {
 				const statusDiff = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
 				if (statusDiff !== 0) return statusDiff;
 				return (rowOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rowOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER);
 			});
-			for (const ref of this.#rows) {
+			for (const ref of rosterRows) {
 				if (!rowOrder.has(ref.id)) rowOrder.set(ref.id, rowOrder.size);
 			}
 		}
 
+		this.#rows = this.#viewMode === "tree" ? this.#orderAsTree(rosterRows) : rosterRows;
+		if (this.#viewMode === "roster") this.#treeDepthById.clear();
 		const keptIndex = selectedId ? this.#rows.findIndex(ref => ref.id === selectedId) : -1;
 		this.#selectedRow = keptIndex >= 0 ? keptIndex : Math.min(this.#selectedRow, Math.max(0, this.#rows.length - 1));
 	}
 
-	#observableFor(id: string): ObservableSession | undefined {
-		return this.#observers.getSessions().find(s => s.id === id);
+	/** Parent-before-child projection preserving the roster's stable sibling order. */
+	#orderAsTree(refs: AgentRef[]): AgentRef[] {
+		const ids = new Set(refs.map(ref => ref.id));
+		const children = new Map<string, AgentRef[]>();
+		for (const ref of refs) {
+			const parent =
+				ref.parentId && ref.parentId !== MAIN_AGENT_ID && ids.has(ref.parentId) ? ref.parentId : MAIN_AGENT_ID;
+			const siblings = children.get(parent);
+			if (siblings) siblings.push(ref);
+			else children.set(parent, [ref]);
+		}
+
+		const ordered: AgentRef[] = [];
+		const visited = new Set<string>();
+		this.#treeDepthById.clear();
+		const visit = (ref: AgentRef, depth: number): void => {
+			if (visited.has(ref.id)) return;
+			visited.add(ref.id);
+			this.#treeDepthById.set(ref.id, depth);
+			ordered.push(ref);
+			for (const child of children.get(ref.id) ?? []) visit(child, depth + 1);
+		};
+		for (const root of children.get(MAIN_AGENT_ID) ?? []) visit(root, 0);
+		// Corrupt persisted parent cycles remain visible as roots instead of
+		// disappearing from the operational surface.
+		for (const ref of refs) visit(ref, 0);
+		return ordered;
+	}
+
+	#observablesById(): Map<string, ObservableSession> {
+		return new Map(this.#observers.getSessions().map(session => [session.id, session]));
 	}
 
 	// ========================================================================
 	// Table view
 	// ========================================================================
 
-	#renderTable(width: number): string[] {
+	#renderTable(width: number, termHeight: number): string[] {
 		this.#hitRows.length = 0;
+		const contentRows = Math.max(1, termHeight - 4);
+		const observedById = this.#observablesById();
+		const split = this.#splitRosterWidth(width);
+		this.#lastRenderWasSplit = split !== undefined;
+		const selected = this.#rows[this.#selectedRow];
 		const lines: string[] = [];
-		const termHeight = this.#ui.terminal?.rows || process.stdout.rows || 40;
-		lines.push(...new DynamicBorder().render(width));
-		const counts = this.#statusSummary();
-		lines.push(` ${theme.fg("accent", "Agent Hub")}${counts ? theme.fg("dim", `${theme.sep.dot}${counts}`) : ""}`);
-		lines.push(...new DynamicBorder().render(width));
 
-		if (this.#rows.length === 0) {
-			lines.push(` ${theme.fg("dim", "no subagents yet — task spawns appear here")}`);
+		if (split !== undefined) {
+			const detailWidth = splitBodyWidth(width, split);
+			const roster = this.#renderRosterPanel(split, contentRows, observedById);
+			const details = this.#renderDetailPanel(selected, detailWidth, contentRows, observedById);
+			lines.push(topBorderSplit(width, "Agent Hub", split));
+			for (let i = 0; i < contentRows; i++) {
+				const hit = roster.hitRows[i];
+				if (hit !== undefined) this.#hitRows[lines.length] = hit;
+				lines.push(splitRow(roster.lines[i] ?? "", details[i] ?? "", width, split));
+			}
+			lines.push(dividerSplit(width, split));
+			lines.push(row(this.#footer(false, Math.max(1, width - 4)), width));
+			lines.push(bottomBorder(width));
+			return lines;
+		}
+
+		const innerWidth = Math.max(1, width - 4);
+		if (this.#narrowDetailsOpen && selected) {
+			const details = this.#renderDetailPanel(selected, innerWidth, contentRows, observedById);
+			lines.push(topBorder(width, `Agent Hub · ${selected.id}`));
+			for (const detail of details) lines.push(row(detail, width));
 		} else {
-			// Reserve both possible overflow markers plus the fixed table chrome.
-			// Rendering only this window keeps a large persisted registry cheap.
-			const chrome = 3 + 3 + (this.#notice ? 1 : 0);
-			const budget = Math.max(0, termHeight - chrome - 2);
-			if (budget > 0) {
-				const rendered: Array<string[] | undefined> = [];
-				const entryAt = (index: number): string[] => {
-					const cached = rendered[index];
-					if (cached) return cached;
-					const entry = this.#renderEntry(
-						this.#rows[index],
-						index === this.#selectedRow,
-						width,
-						index === this.#hoveredRow,
-					);
-					rendered[index] = entry;
-					return entry;
-				};
-				const appendEntry = (index: number, entry = entryAt(index)): void => {
-					for (const line of entry) {
-						this.#hitRows[lines.length] = index;
-						lines.push(line);
-					}
-				};
+			const roster = this.#renderRosterPanel(innerWidth, contentRows, observedById);
+			lines.push(topBorder(width, "Agent Hub"));
+			for (let i = 0; i < contentRows; i++) {
+				const hit = roster.hitRows[i];
+				if (hit !== undefined) this.#hitRows[lines.length] = hit;
+				lines.push(row(roster.lines[i] ?? "", width));
+			}
+		}
+		lines.push(divider(width));
+		lines.push(row(this.#footer(this.#narrowDetailsOpen, innerWidth), width));
+		lines.push(bottomBorder(width));
+		return lines;
+	}
 
-				let start = this.#selectedRow;
-				let end = this.#selectedRow + 1;
-				let used = entryAt(this.#selectedRow).length;
-				if (used > budget) {
-					appendEntry(this.#selectedRow, entryAt(this.#selectedRow).slice(0, budget));
-				} else {
-					// Grow a window around the selection until the line budget is
-					// spent, so selection remains visible without rendering every row.
-					for (let grew = true; grew; ) {
-						grew = false;
-						if (end < this.#rows.length) {
-							const next = entryAt(end);
-							if (used + next.length <= budget) {
-								used += next.length;
-								end++;
-								grew = true;
-							}
-						}
-						if (start > 0) {
-							const previous = entryAt(start - 1);
-							if (used + previous.length <= budget) {
-								start--;
-								used += previous.length;
-								grew = true;
-							}
-						}
-					}
-					if (start > 0) {
-						lines.push(` ${theme.fg("dim", `… ${start} more`)}`);
-					}
-					for (let i = start; i < end; i++) {
-						appendEntry(i);
-					}
-					if (end < this.#rows.length) {
-						lines.push(` ${theme.fg("dim", `… ${this.#rows.length - end} more`)}`);
-					}
+	#splitRosterWidth(width: number): number | undefined {
+		if (width < SPLIT_MIN_WIDTH) return undefined;
+		const rosterWidth = Math.max(ROSTER_MIN_WIDTH, Math.min(Math.floor(width * 0.58), width - DETAIL_MIN_WIDTH - 7));
+		return splitBodyWidth(width, rosterWidth) >= DETAIL_MIN_WIDTH ? rosterWidth : undefined;
+	}
+
+	#footer(showingNarrowDetails: boolean, availableWidth: number): string {
+		const nextView = this.#viewMode === "roster" ? "tree" : "roster";
+		if (showingNarrowDetails) {
+			return theme.fg("dim", `Tab:roster  Enter:open  t:${nextView}  Esc:roster`);
+		}
+		if (availableWidth < 96) {
+			return theme.fg("dim", `j/k:select  Enter:open  t:${nextView}  Tab:details  r/x:manage  Esc:close`);
+		}
+		return theme.fg("dim", `j/k/wheel:select  Enter/click:open  t:${nextView}  r:revive  x:kill  Esc:close`);
+	}
+
+	#renderRosterPanel(width: number, rows: number, observedById: ReadonlyMap<string, ObservableSession>): RosterRender {
+		const lines = this.#summaryLines(observedById);
+		const hitRows: Array<number | undefined> = Array.from({ length: lines.length });
+		if (rows >= 8) {
+			lines.push("");
+			hitRows.push(undefined);
+		}
+
+		const noticeLines = this.#notice ? [theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width)))] : [];
+		const budget = Math.max(0, rows - lines.length - noticeLines.length);
+		if (this.#rows.length === 0) {
+			if (budget > 0) {
+				lines.push(theme.fg("dim", "no subagents yet — task spawns appear here"));
+				hitRows.push(undefined);
+			}
+		} else if (budget > 0) {
+			const window = this.#renderRosterWindow(width, budget, observedById);
+			lines.push(...window.lines);
+			hitRows.push(...window.hitRows);
+		}
+		for (const notice of noticeLines) {
+			lines.push(notice);
+			hitRows.push(undefined);
+		}
+		while (lines.length < rows) {
+			lines.push("");
+			hitRows.push(undefined);
+		}
+		return { lines: lines.slice(0, rows), hitRows: hitRows.slice(0, rows) };
+	}
+
+	#renderRosterWindow(
+		width: number,
+		budget: number,
+		observedById: ReadonlyMap<string, ObservableSession>,
+	): RosterRender {
+		const lines: string[] = [];
+		const hitRows: Array<number | undefined> = [];
+		const rendered: Array<string[] | undefined> = [];
+		const entryAt = (index: number): string[] => {
+			const cached = rendered[index];
+			if (cached) return cached;
+			const entry = this.#renderEntry(
+				this.#rows[index],
+				index === this.#selectedRow,
+				width,
+				observedById.get(this.#rows[index].id),
+				index === this.#hoveredRow,
+			);
+			rendered[index] = entry;
+			return entry;
+		};
+		const appendEntry = (index: number, entry = entryAt(index)): void => {
+			for (const line of entry) {
+				lines.push(line);
+				hitRows.push(index);
+			}
+		};
+
+		let start = this.#selectedRow;
+		let end = this.#selectedRow + 1;
+		let used = entryAt(this.#selectedRow).length;
+		if (used > budget) {
+			appendEntry(this.#selectedRow, entryAt(this.#selectedRow).slice(0, budget));
+			return { lines, hitRows };
+		}
+
+		// Grow a window around the selection. Only visible entries are rendered,
+		// so the 5,000-agent Hub retains bounded paint cost.
+		for (let grew = true; grew; ) {
+			grew = false;
+			if (end < this.#rows.length) {
+				const next = entryAt(end);
+				if (used + next.length <= budget) {
+					used += next.length;
+					end++;
+					grew = true;
+				}
+			}
+			if (start > 0) {
+				const previous = entryAt(start - 1);
+				if (used + previous.length <= budget) {
+					start--;
+					used += previous.length;
+					grew = true;
 				}
 			}
 		}
-
-		if (this.#notice) {
-			lines.push(` ${theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width - 2)))}`);
+		// Overflow labels consume real rows. Trim the farthest visible neighbors
+		// before painting them so the selected entry and both labels fit.
+		for (
+			let markerRows = Number(start > 0) + Number(end < this.#rows.length);
+			used + markerRows > budget && start < end;
+			markerRows = Number(start > 0) + Number(end < this.#rows.length)
+		) {
+			if (end - 1 > this.#selectedRow) {
+				end--;
+				used -= entryAt(end).length;
+			} else if (start < this.#selectedRow) {
+				used -= entryAt(start).length;
+				start++;
+			} else {
+				break;
+			}
 		}
-		while (lines.length < termHeight - 3) lines.push("");
-		lines.push("");
-		lines.push(` ${theme.fg("dim", "j/k/wheel:select  Enter/click:open  r:revive  x:kill  Esc/←←:close")}`);
-		lines.push(...new DynamicBorder().render(width));
-		return lines;
+		const showTopOverflow = start > 0 && used < budget;
+		const showBottomOverflow = end < this.#rows.length && used + Number(showTopOverflow) < budget;
+		if (showTopOverflow) {
+			lines.push(theme.fg("dim", `… ${start} more`));
+			hitRows.push(undefined);
+		}
+		for (let i = start; i < end; i++) appendEntry(i);
+		if (showBottomOverflow) {
+			lines.push(theme.fg("dim", `… ${this.#rows.length - end} more`));
+			hitRows.push(undefined);
+		}
+		return { lines, hitRows };
+	}
+
+	#summaryLines(observedById: ReadonlyMap<string, ObservableSession>): string[] {
+		const view = this.#viewMode === "roster" ? "Roster" : "Spawn tree";
+		const counts = this.#statusSummary();
+		const metrics = this.#aggregateMetrics(observedById);
+		const usage: string[] = [];
+		if (metrics.cost > 0) usage.push(theme.fg("statusLineCost", formatCost(metrics.cost)));
+		if (metrics.tokens > 0) usage.push(`${formatNumber(metrics.tokens)} tok`);
+		if (metrics.requests > 0) usage.push(`${formatNumber(metrics.requests)} req`);
+		if (metrics.tools > 0) usage.push(`${formatNumber(metrics.tools)} tools`);
+		if (metrics.durationMs > 0) usage.push(`${formatDuration(metrics.durationMs)} agent time`);
+		return [
+			`${theme.bold(view)}${counts ? theme.fg("dim", `${theme.sep.dot}${counts}`) : ""}`,
+			usage.length > 0
+				? theme.fg("dim", usage.join(theme.sep.dot))
+				: theme.fg(
+						"dim",
+						metrics.reportedAgents > 0
+							? "usage not priced by active providers"
+							: "usage appears with agent progress",
+					),
+		];
 	}
 
 	#statusSummary(): string {
 		const counts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
-		for (const ref of this.#rows) {
-			counts[ref.status]++;
-		}
+		for (const ref of this.#rows) counts[ref.status]++;
 		const parts: string[] = [];
 		for (const status of ["running", "idle", "parked", "aborted"] as const) {
 			const count = counts[status];
@@ -533,20 +768,136 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		return parts.join(theme.sep.dot);
 	}
 
+	#aggregateMetrics(observedById: ReadonlyMap<string, ObservableSession>): AggregateMetrics {
+		const total: AggregateMetrics = {
+			tokens: 0,
+			requests: 0,
+			tools: 0,
+			cost: 0,
+			durationMs: 0,
+			reportedAgents: 0,
+		};
+		for (const ref of this.#rows) {
+			const metrics = metricsFor(ref, observedById.get(ref.id));
+			if (!metrics) continue;
+			total.reportedAgents++;
+			total.tokens += metrics.tokens;
+			total.requests += metrics.requests;
+			total.tools += metrics.tools;
+			total.cost += metrics.cost;
+			total.durationMs += metrics.durationMs;
+		}
+		return total;
+	}
+
+	#renderDetailPanel(
+		ref: AgentRef | undefined,
+		width: number,
+		rows: number,
+		observedById: ReadonlyMap<string, ObservableSession>,
+	): string[] {
+		if (!ref) return [theme.fg("dim", "Select an agent to inspect"), ...Array.from({ length: rows - 1 }, () => "")];
+		const observed = observedById.get(ref.id);
+		const progress = observed?.progress;
+		const metrics = metricsFor(ref, observed);
+		const children = this.#rows.filter(candidate => candidate.parentId === ref.id);
+		const lines: string[] = [];
+		const add = (line = ""): void => {
+			if (lines.length < rows) lines.push(truncateToWidth(line, width));
+		};
+		const addWrapped = (text: string, maxRows = 2): void => {
+			for (const wrapped of wrapTextWithAnsi(sanitizeLine(text), Math.max(1, width)).slice(0, maxRows)) add(wrapped);
+		};
+		const section = (label: string): void => {
+			if (lines.length > 0) add();
+			add(theme.bold(theme.fg("accent", label)));
+		};
+
+		add(`${statusGlyph(ref.status)} ${theme.bold(replaceTabs(ref.displayName || ref.id))}`);
+		if (ref.displayName && ref.displayName !== ref.id) add(theme.fg("dim", ref.id));
+		const lifecycle = [
+			ref.status,
+			metrics?.durationMs ? formatDuration(metrics.durationMs) : undefined,
+			`active ${formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))}`,
+		].filter(Boolean);
+		add(theme.fg("dim", lifecycle.join(theme.sep.dot)));
+		const badge = modelBadge(ref, observed);
+		if (badge) add(badge);
+
+		const task = observed?.description ?? progress?.task ?? ref.activity;
+		if (task) {
+			section("Task");
+			addWrapped(task);
+		}
+
+		const current = progress?.currentTool
+			? `${progress.currentTool}${progress.currentToolArgs ? ` · ${progress.currentToolArgs}` : ""}`
+			: (progress?.lastIntent ?? ref.activity);
+		if (current) {
+			section("Current");
+			addWrapped(current);
+			if (progress?.retryState) {
+				add(theme.fg("warning", `retry ${progress.retryState.attempt}/${progress.retryState.maxAttempts}`));
+			}
+		}
+
+		section("Usage");
+		if (metrics) {
+			const spend = [
+				metrics.cost > 0 ? formatCost(metrics.cost) : "cost —",
+				`${formatNumber(metrics.tokens)} tokens`,
+				`${formatNumber(metrics.requests)} requests`,
+				`${formatNumber(metrics.tools)} tools`,
+			];
+			addWrapped(spend.join(theme.sep.dot));
+			if (metrics.contextTokens !== undefined && metrics.contextWindow) {
+				add(contextGauge(metrics.contextTokens, metrics.contextWindow));
+			}
+		} else {
+			add(theme.fg("dim", "No usage snapshot"));
+		}
+
+		section("Lineage");
+		add(
+			`Spawned by ${replaceTabs(ref.parentId ?? MAIN_AGENT_ID)}${children.length > 0 ? ` · ${children.length} children` : ""}`,
+		);
+		if (children.length > 0) addWrapped(children.map(child => child.id).join(", "), 1);
+		add(theme.fg("dim", `Registered ${new Date(ref.createdAt).toISOString().slice(0, 16).replace("T", " ")}Z`));
+
+		section("Changes");
+		add(
+			theme.fg(
+				"dim",
+				ref.kind === "advisor" ? "Read-only transcript" : "Shared workspace · per-agent LoC not attributable",
+			),
+		);
+
+		while (lines.length < rows) lines.push("");
+		return lines.slice(0, rows);
+	}
+
 	/**
 	 * One agent entry, 1-2 lines:
 	 * `❯ ⟳ Name  type  ↳ parent  ⧉ 2 ········ model ◒ level · age` — identity
 	 * left, metadata right-aligned (inlined when the terminal is too narrow) —
 	 * plus an indented dim task line when the agent's work is known.
 	 */
-	#renderEntry(ref: AgentRef, selected: boolean, width: number, hovered = false): string[] {
-		const max = Math.max(1, width - 2);
+	#renderEntry(
+		ref: AgentRef,
+		selected: boolean,
+		width: number,
+		observed: ObservableSession | undefined,
+		hovered = false,
+	): string[] {
+		const max = Math.max(1, width);
 		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
-		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${theme.bold(replaceTabs(ref.id))}`];
+		const depth = this.#viewMode === "tree" ? (this.#treeDepthById.get(ref.id) ?? 0) : 0;
+		const branch = this.#viewMode === "tree" && depth > 0 ? `${"  ".repeat(depth - 1)}↳ ` : "";
+		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${branch}${theme.bold(replaceTabs(ref.id))}`];
 		if (ref.displayName && ref.displayName !== ref.id) {
 			fields.push(theme.fg("dim", replaceTabs(ref.displayName)));
 		}
-		if (ref.parentId && ref.parentId !== MAIN_AGENT_ID) {
+		if (this.#viewMode === "roster" && ref.parentId && ref.parentId !== MAIN_AGENT_ID) {
 			fields.push(theme.fg("dim", `↳ ${replaceTabs(ref.parentId)}`));
 		}
 		if (ref.kind === "advisor") {
@@ -556,9 +907,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		if (unread > 0) {
 			fields.push(theme.fg("warning", `⧉ ${unread}`));
 		}
-		const left = ` ${fields.join("  ")}`;
+		const left = fields.join("  ");
 
-		const observed = this.#observableFor(ref.id);
 		const meta: string[] = [];
 		const badge = modelBadge(ref, observed);
 		if (badge) meta.push(badge);
@@ -575,12 +925,15 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 		const task = observed?.description ?? observed?.progress?.task ?? ref.activity;
 		if (task) {
-			entry.push(`     ${theme.fg("muted", sanitizeLine(task, Math.max(10, max - 5)))}`);
+			const indentWidth = Math.min(max - 1, 4 + depth * 2);
+			entry.push(
+				`${padding(Math.max(0, indentWidth))}${theme.fg("muted", sanitizeLine(task, Math.max(10, max - indentWidth)))}`,
+			);
 		}
 		if (!hovered) return entry;
-		return entry.map(row => {
-			const rowWidth = visibleWidth(row);
-			return theme.bg("selectedBg", rowWidth < max ? row + padding(max - rowWidth) : row);
+		return entry.map(lineRow => {
+			const rowWidth = visibleWidth(lineRow);
+			return theme.bg("selectedBg", rowWidth < max ? lineRow + padding(max - rowWidth) : lineRow);
 		});
 	}
 
@@ -615,10 +968,31 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 	#handleTableInput(keyData: string): void {
 		if (matchesKey(keyData, "escape")) {
-			this.#onDone();
+			if (this.#narrowDetailsOpen && !this.#lastRenderWasSplit) {
+				this.#narrowDetailsOpen = false;
+				this.#requestRender();
+			} else {
+				this.#onDone();
+			}
+			return;
+		}
+		if ((matchesKey(keyData, "tab") || keyData === "\t") && !this.#lastRenderWasSplit) {
+			if (this.#rows.length > 0) this.#narrowDetailsOpen = !this.#narrowDetailsOpen;
+			this.#requestRender();
+			return;
+		}
+		if (keyData === "t") {
+			this.#viewMode = this.#viewMode === "roster" ? "tree" : "roster";
+			this.#refreshRows();
+			this.#requestRender();
 			return;
 		}
 		if (matchesKey(keyData, "left")) {
+			if (this.#narrowDetailsOpen && !this.#lastRenderWasSplit) {
+				this.#narrowDetailsOpen = false;
+				this.#requestRender();
+				return;
+			}
 			const now = Date.now();
 			if (now - this.#lastLeftTap < LEFT_TAP_WINDOW_MS) {
 				this.#lastLeftTap = 0;
