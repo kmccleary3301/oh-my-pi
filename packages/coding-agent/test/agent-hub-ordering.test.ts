@@ -6,10 +6,12 @@
  * agents that appear while the hub is open are appended at the end.
  */
 import { afterEach, beforeAll, describe, expect, it, setSystemTime, vi } from "bun:test";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type AgentHubDeps, AgentHubOverlayComponent } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
@@ -42,6 +44,7 @@ function stubStdoutGeometry(cols: number): GeometryStub {
 
 function makeHub(agents: AgentRegistry, overrides: Partial<AgentHubDeps> = {}) {
 	return new AgentHubOverlayComponent({
+		settings: Settings.isolated(),
 		observers: new SessionObserverRegistry(),
 		hubKeys: [],
 		onDone: () => {},
@@ -58,13 +61,24 @@ interface RenderedAgentRow {
 	selected: boolean;
 }
 
+const ROSTER_ENTRY_PATTERN = /^(❯| ) (\S+) (?:(?: {2})*↳ )?(\S+)/u;
+
+function rosterCell(raw: string): string | undefined {
+	const line = Bun.stripANSI(raw);
+	if (!line.startsWith("│ ")) return undefined;
+	const divider = line.indexOf("│", 2);
+	if (divider < 0) return undefined;
+	return line.slice(2, Math.max(2, divider - 1));
+}
+
 function renderedAgentRows(hub: AgentHubOverlayComponent, width = 120): RenderedAgentRow[] {
-	// Boxed roster entry first lines are
-	// `│ <cursor> <status-glyph> [tree-prefix] <id> …`; task lines are
+	// Roster entry first cells are
+	// `<cursor> <status-glyph> [tree-prefix] <id> …`; task cells are
 	// indented deeper and never match the cursor/status slots.
 	const rows: RenderedAgentRow[] = [];
 	for (const raw of hub.render(width)) {
-		const match = /^│ (❯| ) (\S+) (?:(?: {2})*↳ )?(\S+)/u.exec(Bun.stripANSI(raw));
+		const cell = rosterCell(raw);
+		const match = cell ? ROSTER_ENTRY_PATTERN.exec(cell) : null;
 		if (match) rows.push({ id: match[3]!, selected: match[1] === "❯" });
 	}
 	return rows;
@@ -76,6 +90,32 @@ function renderedAgentIds(hub: AgentHubOverlayComponent): string[] {
 
 function selectedAgentId(hub: AgentHubOverlayComponent): string | undefined {
 	return renderedAgentRows(hub).find(row => row.selected)?.id;
+}
+
+function renderedRosterEntry(hub: AgentHubOverlayComponent, id: string, width: number): string {
+	const cells = hub.render(width).map(rosterCell);
+	const start = cells.findIndex(cell => {
+		const match = cell ? ROSTER_ENTRY_PATTERN.exec(cell) : null;
+		return match?.[3] === id;
+	});
+	expect(start).toBeGreaterThanOrEqual(0);
+	const entry: string[] = [];
+	for (let i = start; i < cells.length; i++) {
+		const cell = cells[i];
+		if (cell === undefined || cell.trim().length === 0) break;
+		if (i > start && ROSTER_ENTRY_PATTERN.test(cell)) break;
+		entry.push(cell.trimEnd());
+	}
+	return entry.join("\n");
+}
+function renderedRosterHeaderLineRaw(hub: AgentHubOverlayComponent, id: string, width: number): string {
+	const line = hub.render(width).find(raw => {
+		const cell = rosterCell(raw);
+		const match = cell ? ROSTER_ENTRY_PATTERN.exec(cell) : null;
+		return match?.[3] === id;
+	});
+	if (!line) throw new Error(`No rendered roster header for ${id}`);
+	return line;
 }
 
 function leftClick(row1Based: number): string {
@@ -327,6 +367,58 @@ describe("Agent hub row ordering", () => {
 		}
 	});
 
+	it("retains the live thinking level unless progress has an explicit suffix", () => {
+		geometry = stubStdoutGeometry(140);
+		const agents = new AgentRegistry();
+		const inheritedSession = { thinkingLevel: ThinkingLevel.High } as unknown as AgentSession;
+		const explicitSession = { thinkingLevel: ThinkingLevel.High } as unknown as AgentSession;
+		agents.register({
+			id: "InheritedLevel",
+			displayName: "Inherited level",
+			kind: "sub",
+			session: inheritedSession,
+		});
+		agents.register({
+			id: "ExplicitLevel",
+			displayName: "Explicit level",
+			kind: "sub",
+			session: explicitSession,
+		});
+		const observers = new SessionObserverRegistry();
+		vi.spyOn(observers, "getSessions").mockReturnValue([
+			{
+				id: "InheritedLevel",
+				kind: "subagent",
+				label: "Inherited level",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: { resolvedModel: "openai/gpt-5.4" } as never,
+			},
+			{
+				id: "ExplicitLevel",
+				kind: "subagent",
+				label: "Explicit level",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: { resolvedModel: "openai/gpt-5.4:low" } as never,
+			},
+		]);
+		const hub = makeHub(agents, { observers });
+
+		try {
+			const inherited = renderedRosterEntry(hub, "InheritedLevel", 140);
+			expect(inherited).toContain("gpt-5.4");
+			expect(inherited).toContain(theme.thinking.high);
+
+			const explicit = renderedRosterEntry(hub, "ExplicitLevel", 140);
+			expect(explicit).toContain("gpt-5.4");
+			expect(explicit).toContain(theme.thinking.low);
+			expect(explicit).not.toContain(theme.thinking.high);
+		} finally {
+			hub.dispose();
+		}
+	});
+
 	it("renders aggregate usage and a selected-agent inspector without inventing change attribution", () => {
 		geometry = stubStdoutGeometry(140);
 		geometry.setRows(28);
@@ -373,12 +465,12 @@ describe("Agent hub row ordering", () => {
 
 		try {
 			const rendered = Bun.stripANSI(hub.render(140).join("\n"));
-			expect(rendered).toMatch(/Roster · \S+ 1 running/u);
-			expect(rendered).toContain("$0.213 · 18K tok · 12 req · 27 tools · 2m14s agent time");
+			expect(rendered).toContain("1 running");
+			expect(rendered).toContain("Flat");
+			expect(rendered).toContain("By parent");
+			expect(rendered).toContain("$0.213 · 2m14s · 12 req · 27 tools · 18K tok");
 			expect(rendered).toContain("Security Reviewer");
-			expect(rendered).toContain("Review the session lifecycle and produce");
 			expect(rendered).toContain("read · src/session/agent-session.ts");
-			expect(rendered).toContain("$0.213 · 18K tokens · 12 requests · 27 tools");
 			expect(rendered).toContain("31K/128K 24%");
 			expect(rendered).toContain("Registered ");
 			expect(rendered).toContain("Shared workspace · per-agent LoC not attributable");
@@ -386,8 +478,241 @@ describe("Agent hub row ordering", () => {
 			hub.dispose();
 		}
 	});
+	it("shows dense measured usage for running and completed progress with aggregate coverage", () => {
+		geometry = stubStdoutGeometry(160);
+		geometry.setRows(32);
+		const agents = new AgentRegistry();
+		agents.register({ id: "Running", displayName: "Running", kind: "sub", session: null, status: "running" });
+		agents.register({ id: "Completed", displayName: "Completed", kind: "sub", session: null, status: "idle" });
+		agents.register({
+			id: "Historical",
+			displayName: "Historical",
+			kind: "sub",
+			session: null,
+			status: "parked",
+			activity: "Restored task",
+		});
+		const observers = new SessionObserverRegistry();
+		vi.spyOn(observers, "getSessions").mockReturnValue([
+			{
+				id: "Running",
+				kind: "subagent",
+				label: "Running",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: {
+					id: "Running",
+					index: 0,
+					agent: "worker",
+					agentSource: "bundled",
+					status: "running",
+					task: "Run checks",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 4,
+					requests: 3,
+					tokens: 1_200,
+					cost: 0.1234,
+					durationMs: 6_500,
+				} as never,
+			},
+			{
+				id: "Completed",
+				kind: "subagent",
+				label: "Completed",
+				status: "completed",
+				lastUpdate: Date.now(),
+				progress: {
+					id: "Completed",
+					index: 1,
+					agent: "worker",
+					agentSource: "bundled",
+					status: "completed",
+					task: "Finish checks",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 8,
+					requests: 5,
+					tokens: 2_500,
+					cost: 0.4567,
+					durationMs: 125_000,
+				} as never,
+			},
+		]);
+		const hub = makeHub(agents, { observers });
 
-	it("toggles a parent-before-child spawn tree while preserving selection", () => {
+		try {
+			const rendered = Bun.stripANSI(hub.render(160).join("\n"));
+			expect(rendered).toContain("2/3 measured");
+			expect(rendered).toContain("$0.580");
+			expect(rendered).toContain("3.7K tok");
+			expect(rendered).toContain("8 req");
+			expect(rendered).toContain("12 tools");
+			expect(rendered).toContain("2m11s agent time");
+
+			const running = renderedRosterEntry(hub, "Running", 160);
+			expect(running).toContain("$0.123");
+			expect(running).toContain("6.5s");
+			expect(running).toContain("3 req");
+			expect(running).toContain("4 tools");
+			expect(running).toContain("1.2K tok");
+
+			const completed = renderedRosterEntry(hub, "Completed", 160);
+			expect(completed).toContain("$0.457");
+			expect(completed).toContain("2m5s");
+			expect(completed).toContain("5 req");
+			expect(completed).toContain("8 tools");
+			expect(completed).toContain("2.5K tok");
+
+			const historical = renderedRosterEntry(hub, "Historical", 160);
+			expect(historical).toContain("Restored task");
+			expect(historical).toContain("usage —");
+			expect(historical).not.toContain("$0.000");
+		} finally {
+			hub.dispose();
+		}
+	});
+	it("treats incomplete and non-finite progress usage as unknown", () => {
+		geometry = stubStdoutGeometry(160);
+		const agents = new AgentRegistry();
+		const getSessionStats = vi.fn(() => ({
+			sessionFile: undefined,
+			sessionId: "incomplete",
+			userMessages: 1,
+			assistantMessages: 9,
+			toolCalls: 4,
+			toolResults: 4,
+			totalMessages: 18,
+			tokens: { input: 100, output: 50, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 150 },
+			premiumRequests: 0,
+			cost: 0.25,
+		}));
+		agents.register({
+			id: "Incomplete",
+			displayName: "Incomplete",
+			kind: "sub",
+			session: { getSessionStats } as unknown as AgentSession,
+		});
+		agents.register({ id: "NonFinite", displayName: "Non-finite", kind: "sub", session: null });
+		const observers = new SessionObserverRegistry();
+		vi.spyOn(observers, "getSessions").mockReturnValue([
+			{
+				id: "Incomplete",
+				kind: "subagent",
+				label: "Incomplete",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: {
+					tokens: 100,
+					toolCount: 2,
+					cost: 0.1,
+					durationMs: 1_000,
+				} as never,
+			},
+			{
+				id: "NonFinite",
+				kind: "subagent",
+				label: "Non-finite",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: {
+					tokens: Number.NaN,
+					requests: 2,
+					toolCount: 2,
+					cost: 0.1,
+					durationMs: 1_000,
+				} as never,
+			},
+		]);
+		const hub = makeHub(agents, { observers });
+
+		try {
+			const rendered = Bun.stripANSI(hub.render(160).join("\n"));
+			expect(rendered).toContain("0/2 measured");
+			expect(renderedRosterEntry(hub, "Incomplete", 160)).toContain("usage —");
+			expect(renderedRosterEntry(hub, "NonFinite", 160)).toContain("usage —");
+			expect(getSessionStats).not.toHaveBeenCalled();
+		} finally {
+			hub.dispose();
+		}
+	});
+	it("shows configured role text beside a resolved model but not for an explicit selector", () => {
+		geometry = stubStdoutGeometry(160);
+		const agents = new AgentRegistry();
+		agents.register({ id: "RoleAgent", displayName: "Role Agent", kind: "sub", session: null });
+		agents.register({ id: "ExplicitAgent", displayName: "Explicit Agent", kind: "sub", session: null });
+		const observers = new SessionObserverRegistry();
+		vi.spyOn(observers, "getSessions").mockReturnValue([
+			{
+				id: "RoleAgent",
+				kind: "subagent",
+				label: "Role Agent",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: {
+					id: "RoleAgent",
+					index: 0,
+					agent: "worker",
+					agentSource: "bundled",
+					status: "running",
+					task: "Run with the configured role",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 0,
+					requests: 1,
+					tokens: 10,
+					cost: 0,
+					durationMs: 100,
+					modelRole: "rapid",
+					resolvedModel: "openai/gpt-4o",
+				} as never,
+			},
+			{
+				id: "ExplicitAgent",
+				kind: "subagent",
+				label: "Explicit Agent",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: {
+					id: "ExplicitAgent",
+					index: 1,
+					agent: "worker",
+					agentSource: "bundled",
+					status: "running",
+					task: "Run with an explicit selector",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 0,
+					requests: 1,
+					tokens: 10,
+					cost: 0,
+					durationMs: 100,
+					resolvedModel: "openai/gpt-4o",
+				} as never,
+			},
+		]);
+		const hub = makeHub(agents, {
+			observers,
+			settings: Settings.isolated({
+				modelRoles: { rapid: "openai/gpt-4o" },
+				modelTags: { rapid: { name: "Quick", color: "warning" } },
+			}),
+		});
+
+		try {
+			const roleBlock = renderedRosterEntry(hub, "RoleAgent", 160);
+			expect(roleBlock).toContain("Quick");
+			expect(roleBlock).toContain("gpt-4o");
+			expect(roleBlock.indexOf("Quick")).toBeLessThan(roleBlock.indexOf("gpt-4o"));
+
+			const explicitBlock = renderedRosterEntry(hub, "ExplicitAgent", 160);
+			expect(explicitBlock).toContain("gpt-4o");
+			expect(explicitBlock).not.toContain("Quick");
+		} finally {
+			hub.dispose();
+		}
+	});
+	it("switches between inline Flat and By parent projections with selection preserved", () => {
 		vi.useFakeTimers();
 		geometry = stubStdoutGeometry(120);
 		const agents = new AgentRegistry();
@@ -402,16 +727,26 @@ describe("Agent hub row ordering", () => {
 		try {
 			expect(renderedAgentIds(hub)).toEqual(["Child", "Peer", "Parent"]);
 			expect(selectedAgentId(hub)).toBe("Child");
+			const flat = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(flat).toContain("Flat");
+			expect(flat).toContain("By parent");
+
+			hub.setHoverIndex(0);
+			expect(renderedRosterHeaderLineRaw(hub, "Child", 120)).toContain(theme.getBgAnsi("selectedBg"));
 			hub.handleInput("t");
-			const treeIds = renderedAgentIds(hub);
-			expect(treeIds.indexOf("Child")).toBe(treeIds.indexOf("Parent") + 1);
+			const byParentIds = renderedAgentIds(hub);
+			expect(byParentIds).toEqual(["Parent", "Child", "Peer"]);
 			expect(selectedAgentId(hub)).toBe("Child");
-			const rendered = Bun.stripANSI(hub.render(120).join("\n"));
-			expect(rendered).toContain("Spawn tree");
-			expect(rendered).toContain("↳ Child");
-			expect(rendered).toContain("Spawned by Parent");
+			const byParent = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(byParent).toContain("Flat");
+			expect(byParent).toContain("By parent");
+			expect(byParentIds.indexOf("Parent")).toBeLessThan(byParentIds.indexOf("Child"));
+			expect(renderedRosterHeaderLineRaw(hub, "Parent", 120)).not.toContain(theme.getBgAnsi("selectedBg"));
+			expect(renderedRosterHeaderLineRaw(hub, "Child", 120)).not.toContain(theme.getBgAnsi("selectedBg"));
+
 			hub.handleInput("t");
 			expect(renderedAgentIds(hub)).toEqual(["Child", "Peer", "Parent"]);
+			expect(selectedAgentId(hub)).toBe("Child");
 		} finally {
 			hub.dispose();
 			vi.useRealTimers();
@@ -457,7 +792,7 @@ describe("Agent hub row ordering", () => {
 			const details = Bun.stripANSI(hub.render(80).join("\n"));
 			expect(details).toContain("Agent Hub · NarrowAgent");
 			expect(details).toContain("Usage");
-			expect(details).toContain("cost — · 900 tokens · 2 requests · 3 tools");
+			expect(details).toContain("$0.0000 · 2.0s · 2 req · 3 tools · 900 tok");
 			expect(details).toContain("Tab:roster");
 			for (const line of hub.render(80)) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 

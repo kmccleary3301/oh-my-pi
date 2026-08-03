@@ -36,6 +36,7 @@ function makeHub(focusAgent: (id: string) => Promise<void>) {
 	const done = Promise.withResolvers<void>();
 	const renderRequested = Promise.withResolvers<void>();
 	const hub = new AgentHubOverlayComponent({
+		settings: Settings.isolated(),
 		observers: new SessionObserverRegistry(),
 		hubKeys: [],
 		onDone: () => {
@@ -48,6 +49,30 @@ function makeHub(focusAgent: (id: string) => Promise<void>) {
 		focusAgent,
 	});
 	return { hub, doneCalls: () => doneCalls, done: done.promise, renderRequested: renderRequested.promise };
+}
+
+const ROSTER_ENTRY_PATTERN = /^(❯| ) (\S+) (?:(?: {2})*↳ )?(\S+)/u;
+
+function renderedRosterEntry(hub: AgentHubOverlayComponent, id: string, width: number): string {
+	const cells = hub.render(width).map(raw => {
+		const line = Bun.stripANSI(raw);
+		if (!line.startsWith("│ ")) return undefined;
+		const divider = line.indexOf("│", 2);
+		return divider < 0 ? undefined : line.slice(2, Math.max(2, divider - 1));
+	});
+	const start = cells.findIndex(cell => {
+		const match = cell ? ROSTER_ENTRY_PATTERN.exec(cell) : null;
+		return match?.[3] === id;
+	});
+	expect(start).toBeGreaterThanOrEqual(0);
+	const entry: string[] = [];
+	for (let i = start; i < cells.length; i++) {
+		const cell = cells[i];
+		if (cell === undefined || cell.trim().length === 0) break;
+		if (i > start && ROSTER_ENTRY_PATTERN.test(cell)) break;
+		entry.push(cell.trimEnd());
+	}
+	return entry.join("\n");
 }
 
 describe("Agent hub Enter activation", () => {
@@ -99,6 +124,7 @@ describe("Agent hub Enter activation", () => {
 		await Bun.write(workerSessionFile, "");
 		const agents = new AgentRegistry();
 		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
 			onDone: () => {},
@@ -110,9 +136,8 @@ describe("Agent hub Enter activation", () => {
 		});
 		await hub.persistedSubagentsReady;
 
-		const rendered = Bun.stripANSI(hub.render(120).join("\n"));
-		expect(rendered).toContain("Worker");
-		expect(rendered).toContain("parked");
+		const workerEntry = renderedRosterEntry(hub, "Worker", 120);
+		expect(workerEntry).toContain("○ Worker");
 		expect(agents.get("Worker")?.sessionFile).toBe(workerSessionFile);
 		hub.dispose();
 	});
@@ -142,6 +167,7 @@ describe("Agent hub Enter activation", () => {
 		await fs.utimes(workerSessionFile, lastActivity, lastActivity);
 		const agents = new AgentRegistry();
 		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
 			onDone: () => {},
@@ -158,9 +184,10 @@ describe("Agent hub Enter activation", () => {
 			lastActivity: lastActivity.getTime(),
 			status: "parked",
 		});
-		expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain(
-			"Inspect dependency boundaries and report unsafe coupling.",
-		);
+		const workerEntry = renderedRosterEntry(hub, "Worker", 120);
+		expect(workerEntry).toContain("Inspect dependency boundaries and report unsafe coupling.");
+		expect(workerEntry.replace(/\s+/g, " ")).toContain("usage —");
+		expect(workerEntry).not.toContain("$0.000");
 		hub.dispose();
 	});
 	it("avoids multi-second event-loop stalls while discovering agents from a large session", async () => {
@@ -190,6 +217,7 @@ describe("Agent hub Enter activation", () => {
 
 		const agents = new AgentRegistry();
 		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
 			onDone: () => {},
@@ -263,6 +291,7 @@ describe("Agent hub Enter activation", () => {
 
 		const agents = new AgentRegistry();
 		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
 			onDone: () => {},
@@ -521,6 +550,7 @@ describe("Agent hub data refresh coalescing", () => {
 		const observers = new SessionObserverRegistry();
 		const requestRender = vi.fn();
 		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
 			observers,
 			hubKeys: [],
 			onDone: () => {},
@@ -559,6 +589,81 @@ describe("Agent hub data refresh coalescing", () => {
 			expect(rendered).toContain("BurstA");
 			expect(rendered).toContain("BurstB");
 			expect(rendered).toContain("BurstC");
+		} finally {
+			hub.dispose();
+			vi.useRealTimers();
+		}
+	});
+
+	it("refreshes direct-session fallback stats on the age cadence, not paints or heartbeats", async () => {
+		vi.useFakeTimers();
+		const agents = new AgentRegistry();
+		const observers = new SessionObserverRegistry();
+		const requestRender = vi.fn();
+		let inputTokens = 100;
+		let assistantMessages = 1;
+		const getSessionStats = vi.fn(() => ({
+			sessionFile: undefined,
+			sessionId: "sdk-agent",
+			userMessages: 1,
+			assistantMessages,
+			toolCalls: 2,
+			toolResults: 2,
+			totalMessages: 6,
+			tokens: {
+				input: inputTokens,
+				output: 50,
+				reasoning: 0,
+				cacheRead: 20,
+				cacheWrite: 0,
+				total: inputTokens + 70,
+			},
+			premiumRequests: 0,
+			cost: 0.1,
+		}));
+		agents.register({
+			id: "SdkAgent",
+			displayName: "SDK agent",
+			kind: "sub",
+			parentId: "Main",
+			session: { getSessionStats, subscribe: () => () => {} } as unknown as AgentSession,
+			status: "running",
+		});
+		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
+			observers,
+			hubKeys: [],
+			onDone: () => {},
+			requestRender,
+			registry: agents,
+			irc: new IrcBus(agents),
+			focusAgent: async () => {},
+		});
+
+		try {
+			await hub.persistedSubagentsReady;
+			expect(getSessionStats).toHaveBeenCalledTimes(1);
+			for (let i = 0; i < 4; i++) hub.render(120);
+			expect(getSessionStats).toHaveBeenCalledTimes(1);
+			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("150 tok");
+
+			inputTokens = 400;
+			assistantMessages = 2;
+			agents.setActivity("SdkAgent", "heartbeat");
+			vi.advanceTimersByTime(100);
+			expect(getSessionStats).toHaveBeenCalledTimes(1);
+			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("150 tok");
+
+			vi.advanceTimersByTime(4_899);
+			expect(getSessionStats).toHaveBeenCalledTimes(1);
+			vi.advanceTimersByTime(1);
+			expect(getSessionStats).toHaveBeenCalledTimes(2);
+			const refreshed = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(refreshed).toContain("450 tok");
+			expect(refreshed).toContain("2 req");
+			expect(refreshed).toContain("1/1 measured");
+			hub.render(120);
+			expect(getSessionStats).toHaveBeenCalledTimes(2);
 		} finally {
 			hub.dispose();
 			vi.useRealTimers();

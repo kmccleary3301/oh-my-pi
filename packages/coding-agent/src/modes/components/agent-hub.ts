@@ -29,6 +29,8 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { formatAge, formatDuration, formatNumber, getProjectDir, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
+import { getRoleInfo } from "../../config/model-roles";
+import type { Settings } from "../../config/settings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
@@ -76,6 +78,11 @@ interface AggregateMetrics extends AgentMetrics {
 interface RosterRender {
 	lines: string[];
 	hitRows: Array<number | undefined>;
+}
+
+/** Legacy progress snapshots may omit counters; snapshot absence remains distinct. */
+function metricNumber(value: number | undefined): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 /** Refresh cadence for the relative-time column */
@@ -135,92 +142,124 @@ function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): st
 	const display = theme.thinking[level as keyof typeof theme.thinking] ?? level;
 	return `${model} ${theme.getThinkingBorderColor(level)(display)}`;
 }
+/** Textual model-role tag; color reinforces (but never replaces) the label. */
+function formatRoleBadge(role: string, settings: Settings): string {
+	const info = getRoleInfo(role, settings);
+	return theme.fg(info.color ?? "muted", replaceTabs(info.tag ?? info.name ?? role));
+}
 
 /** Format a resolved selector, preserving provider identity when requested. */
-function formatResolvedModelBadge(resolved: string, preserveProvider = false): string {
+function formatResolvedModelBadge(resolved: string, preserveProvider = false, fallbackLevel?: ThinkingLevel): string {
 	// Model ids may themselves contain colons (`qwen3:14b`), so only treat the
 	// suffix as a thinking level when it parses as one.
 	const colon = resolved.lastIndexOf(":");
-	const level = colon >= 0 ? parseThinkingLevel(resolved.slice(colon + 1)) : undefined;
-	const selector = level !== undefined ? resolved.slice(0, colon) : resolved;
+	const explicitLevel = colon >= 0 ? parseThinkingLevel(resolved.slice(colon + 1)) : undefined;
+	const selector = explicitLevel !== undefined ? resolved.slice(0, colon) : resolved;
 	const label = preserveProvider ? selector : selector.slice(selector.indexOf("/") + 1);
-	return formatModelBadge(label, level);
+	return formatModelBadge(label, explicitLevel ?? fallbackLevel);
 }
 
 /**
- * Active model + reasoning level for a hub row: live session state when the
- * agent is attached, else the executor-reported `resolvedModel` selector
- * (`provider/id`, optionally `:<level>`). Active retry fallbacks retain their
- * provider and carry an explicit marker. Undefined when no model is known
- * (e.g. a parked historical agent restored from disk).
+ * Resolved model + reasoning level for a hub row. Exact executor progress is
+ * authoritative (and survives completion); direct live sessions are the
+ * fallback for agents without an observer snapshot. Active retry fallbacks
+ * retain provider identity and carry an explicit marker.
  */
 function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): string | undefined {
 	const progress = observed?.progress;
-	// Prefer the live session's own resolved fallback selector; else honor the
-	// executor-reported fallback flag. The latter covers observer-only rows (no
-	// live session) AND live rows whose fallback armed no session retry state —
-	// e.g. the Fireworks Fast → base degrade, which emits `retry_fallback_applied`
-	// without populating `#activeRetryFallback`, so `retryFallbackModel` is undefined.
+	const liveThinkingLevel = ref.session?.thinkingLevel;
+	// The executor fallback flag also covers retries that do not populate the
+	// live session's retryFallbackModel (for example Fireworks Fast → base).
 	const fallbackSelector =
 		ref.session?.retryFallbackModel ?? (progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined);
 	if (fallbackSelector) {
-		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true)}`;
+		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true, liveThinkingLevel)}`;
+	}
+	if (progress?.resolvedModel) {
+		return formatResolvedModelBadge(progress.resolvedModel, false, liveThinkingLevel);
 	}
 	const model = ref.session?.model;
-	if (model) {
-		const level = model.thinking ? ref.session?.thinkingLevel : undefined;
-		return formatModelBadge(model.id, level);
-	}
-	const resolved = progress?.resolvedModel;
-	return resolved ? formatResolvedModelBadge(resolved) : undefined;
+	if (!model) return undefined;
+	const level = model.thinking ? liveThinkingLevel : undefined;
+	return formatModelBadge(model.id, level);
 }
 
-/** Direct usage for one roster entry. Prefer executor progress; fall back to a live session snapshot. */
-function metricsFor(ref: AgentRef, observed: ObservableSession | undefined): AgentMetrics | undefined {
+/** Exact observer usage for one roster entry. */
+function progressMetrics(observed: ObservableSession | undefined): AgentMetrics | undefined {
 	const progress = observed?.progress;
-	if (progress) {
-		return {
-			tokens: progress.tokens,
-			requests: progress.requests,
-			tools: progress.toolCount,
-			cost: progress.cost,
-			durationMs: progress.durationMs,
-			contextTokens: progress.contextTokens,
-			contextWindow: progress.contextWindow,
-		};
-	}
-	const getSessionStats = ref.session?.getSessionStats;
-	if (typeof getSessionStats !== "function") return undefined;
-	try {
-		const stats = getSessionStats.call(ref.session);
-		return {
-			// Match AgentProgress lifetime billing volume: cache reads are
-			// deliberately excluded because every turn rereads cached context.
-			tokens: stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite,
-			requests: stats.assistantMessages,
-			tools: stats.toolCalls,
-			cost: stats.cost,
-			durationMs: 0,
-			contextTokens: stats.contextUsage?.tokens,
-			contextWindow: stats.contextUsage?.contextWindow,
-		};
-	} catch {
-		// Render-only test doubles and sessions being torn down may not expose a
-		// complete statistics host. Missing metrics are preferable to a broken hub.
+	if (!progress) return undefined;
+	const { tokens, requests, toolCount: tools, cost, durationMs } = progress;
+	if (
+		typeof tokens !== "number" ||
+		!Number.isFinite(tokens) ||
+		typeof requests !== "number" ||
+		!Number.isFinite(requests) ||
+		typeof tools !== "number" ||
+		!Number.isFinite(tools) ||
+		typeof cost !== "number" ||
+		!Number.isFinite(cost) ||
+		typeof durationMs !== "number" ||
+		!Number.isFinite(durationMs)
+	) {
 		return undefined;
 	}
+	return {
+		tokens,
+		requests,
+		tools,
+		cost,
+		durationMs,
+		contextTokens:
+			typeof progress.contextTokens === "number" && Number.isFinite(progress.contextTokens)
+				? progress.contextTokens
+				: undefined,
+		contextWindow:
+			typeof progress.contextWindow === "number" && Number.isFinite(progress.contextWindow)
+				? progress.contextWindow
+				: undefined,
+	};
 }
 
 function formatCost(cost: number): string {
-	if (cost < 0.01) return `$${cost.toFixed(4)}`;
-	if (cost < 1) return `$${cost.toFixed(3)}`;
-	return `$${cost.toFixed(2)}`;
+	const amount = metricNumber(cost);
+	if (amount < 0.01) return `$${amount.toFixed(4)}`;
+	if (amount < 1) return `$${amount.toFixed(3)}`;
+	return `$${amount.toFixed(2)}`;
+}
+function formatMetrics(metrics: AgentMetrics): string {
+	return [
+		formatCost(metrics.cost),
+		formatDuration(metrics.durationMs),
+		`${formatNumber(metrics.requests)} req`,
+		`${formatNumber(metrics.tools)} tools`,
+		`${formatNumber(metrics.tokens)} tok`,
+	].join(theme.sep.dot);
 }
 
 function contextGauge(tokens: number, window: number): string {
 	const ratio = Math.max(0, Math.min(1, tokens / window));
 	const filled = Math.round(ratio * 10);
 	return `${theme.fg("accent", "━".repeat(filled))}${theme.fg("dim", "─".repeat(10 - filled))} ${formatNumber(tokens)}/${formatNumber(window)} ${Math.round(ratio * 100)}%`;
+}
+/** Fit a child-id preview without joining an arbitrarily large child set. */
+function formatChildIds(children: readonly AgentRef[], width: number): string {
+	const max = Math.max(1, width);
+	let shown = 0;
+	let text = "";
+	while (shown < children.length) {
+		const id = sanitizeLine(children[shown].id, max);
+		const candidate = text ? `${text}, ${id}` : id;
+		const remaining = children.length - shown - 1;
+		const suffix = remaining > 0 ? `, … +${remaining}` : "";
+		if (visibleWidth(candidate + suffix) > max) {
+			const includesCurrent = text.length === 0;
+			const omitted = children.length - shown - Number(includesCurrent);
+			return truncateToWidth(`${includesCurrent ? id : text}${omitted > 0 ? `, … +${omitted}` : ""}`, max);
+		}
+		text = candidate;
+		shown++;
+	}
+	return text;
 }
 
 /** Result of one host-backed transcript read for the Agent Hub viewer. */
@@ -243,6 +282,8 @@ export interface AgentHubRemote {
 export interface AgentHubDeps {
 	/** Progress/status snapshot source (task lifecycle + progress channels). */
 	observers: SessionObserverRegistry;
+	/** Production settings used to resolve textual model-role tags. */
+	settings?: Settings;
 	/** Keys that toggle the hub closed from inside (app.agents.hub + app.session.observe). */
 	hubKeys: KeyId[];
 	onDone: () => void;
@@ -278,6 +319,7 @@ export interface AgentHubDeps {
 export class AgentHubOverlayComponent extends Container implements SelectListMouseTarget {
 	#registry: AgentRegistry;
 	#observers: SessionObserverRegistry;
+	#settings: Settings | undefined;
 	#irc: IrcBus;
 	#lifecycle: () => AgentLifecycleManager;
 	#onDone: () => void;
@@ -307,6 +349,22 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	/** Operational ordering by default; tree mode groups descendants under their spawner. */
 	#viewMode: HubViewMode = "roster";
 	#treeDepthById = new Map<string, number>();
+	/** Current observer index and summary data, rebuilt on source changes rather than every paint. */
+	#observedById = new Map<string, ObservableSession>();
+	#aggregate: AggregateMetrics = {
+		tokens: 0,
+		requests: 0,
+		tools: 0,
+		cost: 0,
+		durationMs: 0,
+		reportedAgents: 0,
+	};
+	#statusCounts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
+	#childrenByParent = new Map<string, AgentRef[]>();
+	/** Transcript-derived fallback stats are sampled only on the bounded age cadence. */
+	#sessionMetrics = new WeakMap<object, { metrics: AgentMetrics | undefined }>();
+	/** Avoid a cadence-time row scan for the common persisted-only roster. */
+	#hasFallbackLiveSessions = false;
 	/** On narrow terminals Tab replaces the roster with the selected-agent inspector. */
 	#narrowDetailsOpen = false;
 	#lastRenderWasSplit = false;
@@ -329,6 +387,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		super();
 		this.#registry = deps.registry ?? AgentRegistry.global();
 		this.#observers = deps.observers;
+		this.#settings = deps.settings;
 		this.#irc = deps.irc ?? IrcBus.global();
 		// Lazy: the lifecycle global self-constructs against the global
 		// registry, so only touch it when revive/kill actually needs it.
@@ -354,7 +413,12 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 		this.#unsubscribers.push(this.#registry.onChange(() => this.#scheduleDataChange()));
 		this.#unsubscribers.push(this.#observers.onChange(() => this.#scheduleDataChange()));
-		this.#ageTimer = setInterval(() => this.#requestRender(), AGE_TICK_MS);
+		this.#ageTimer = setInterval(() => {
+			if (this.#hasFallbackLiveSessions) {
+				this.#aggregate = this.#aggregateMetrics(this.#observedById, true);
+			}
+			this.#requestRender();
+		}, AGE_TICK_MS);
 		this.#ageTimer.unref?.();
 
 		this.persistedSubagentsReady = this.#remote
@@ -505,6 +569,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#refreshRows(): void {
 		const selectedId = this.#rows[this.#selectedRow]?.id;
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
+		this.#observedById = new Map();
+		for (const session of this.#observers.getSessions()) this.#observedById.set(session.id, session);
 
 		const rowOrder = this.#rowOrder;
 		let rosterRows: AgentRef[];
@@ -513,7 +579,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			rosterRows = refs.sort(
 				(a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity,
 			);
-			this.#rowOrder = new Map(rosterRows.map((ref, i) => [ref.id, i]));
+			this.#rowOrder = new Map();
+			for (let i = 0; i < rosterRows.length; i++) this.#rowOrder.set(rosterRows[i].id, i);
 		} else {
 			// After the hub is open, freeze relative order within each lifecycle
 			// group. New agents append instead of moving the user's selection.
@@ -531,11 +598,66 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		if (this.#viewMode === "roster") this.#treeDepthById.clear();
 		const keptIndex = selectedId ? this.#rows.findIndex(ref => ref.id === selectedId) : -1;
 		this.#selectedRow = keptIndex >= 0 ? keptIndex : Math.min(this.#selectedRow, Math.max(0, this.#rows.length - 1));
+
+		this.#childrenByParent.clear();
+		for (const ref of rosterRows) {
+			const parent = ref.parentId ?? MAIN_AGENT_ID;
+			const children = this.#childrenByParent.get(parent);
+			if (children) children.push(ref);
+			else this.#childrenByParent.set(parent, [ref]);
+		}
+		this.#statusCounts = { running: 0, idle: 0, parked: 0, aborted: 0 };
+		for (const ref of rosterRows) this.#statusCounts[ref.status]++;
+		this.#aggregate = this.#aggregateMetrics(this.#observedById);
+	}
+
+	#metricsFor(ref: AgentRef, observed: ObservableSession | undefined): AgentMetrics | undefined {
+		// An observer snapshot is authoritative. Legacy/incomplete snapshots remain
+		// unknown rather than being silently replaced by unrelated transcript stats.
+		if (observed?.progress) return progressMetrics(observed);
+		const session = this.#fallbackStatsSession(ref, observed);
+		return session ? this.#sessionMetrics.get(session)?.metrics : undefined;
+	}
+
+	#fallbackStatsSession(
+		ref: AgentRef,
+		observed: ObservableSession | undefined,
+	): NonNullable<AgentRef["session"]> | undefined {
+		if (observed?.progress) return undefined;
+		const session = ref.session;
+		return session && typeof session.getSessionStats === "function" ? session : undefined;
+	}
+
+	#readSessionMetrics(session: NonNullable<AgentRef["session"]>): AgentMetrics | undefined {
+		try {
+			const stats = session.getSessionStats();
+			return {
+				// Match AgentProgress lifetime billing volume: cache reads are
+				// deliberately excluded because every turn rereads cached context.
+				tokens: stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite,
+				requests: stats.assistantMessages,
+				tools: stats.toolCalls,
+				cost: stats.cost,
+				durationMs: 0,
+				contextTokens: stats.contextUsage?.tokens,
+				contextWindow: stats.contextUsage?.contextWindow,
+			};
+		} catch {
+			// Render-only doubles and sessions being torn down may not expose a
+			// complete statistics host. Missing metrics are preferable to a broken hub.
+			return undefined;
+		}
 	}
 
 	/** Parent-before-child projection preserving the roster's stable sibling order. */
 	#orderAsTree(refs: AgentRef[]): AgentRef[] {
-		const ids = new Set(refs.map(ref => ref.id));
+		const ids = new Set<string>();
+		const operationalIndex = new Map<string, number>();
+		for (let i = 0; i < refs.length; i++) {
+			ids.add(refs[i].id);
+			operationalIndex.set(refs[i].id, i);
+		}
+
 		const children = new Map<string, AgentRef[]>();
 		for (const ref of refs) {
 			const parent =
@@ -545,25 +667,76 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			else children.set(parent, [ref]);
 		}
 
+		// A tree group occupies the position of its earliest operational row.
+		// Otherwise a recent child could leave its older parent group below an
+		// unrelated peer (`child, peer, parent` → `peer, parent, child`).
+		// Compute subtree minima iteratively so even pathological lineage depth
+		// remains stack-safe.
+		const subtreeOrder = new Map<string, number>();
+		const visiting = new Set<string>();
+		const ranked = new Set<string>();
+		for (const start of refs) {
+			if (ranked.has(start.id)) continue;
+			const stack: Array<{ ref: AgentRef; expanded: boolean }> = [{ ref: start, expanded: false }];
+			while (stack.length > 0) {
+				const current = stack.pop();
+				if (!current) continue;
+				if (current.expanded) {
+					let order = operationalIndex.get(current.ref.id) ?? Number.MAX_SAFE_INTEGER;
+					for (const child of children.get(current.ref.id) ?? []) {
+						order = Math.min(order, subtreeOrder.get(child.id) ?? Number.MAX_SAFE_INTEGER);
+					}
+					subtreeOrder.set(current.ref.id, order);
+					visiting.delete(current.ref.id);
+					ranked.add(current.ref.id);
+					continue;
+				}
+				if (ranked.has(current.ref.id) || visiting.has(current.ref.id)) continue;
+				visiting.add(current.ref.id);
+				stack.push({ ref: current.ref, expanded: true });
+				const descendants = children.get(current.ref.id);
+				if (!descendants) continue;
+				for (let i = descendants.length - 1; i >= 0; i--) {
+					const child = descendants[i];
+					if (!ranked.has(child.id) && !visiting.has(child.id)) {
+						stack.push({ ref: child, expanded: false });
+					}
+				}
+			}
+		}
+		for (const siblings of children.values()) {
+			siblings.sort(
+				(a, b) =>
+					(subtreeOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+						(subtreeOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER) ||
+					(operationalIndex.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+						(operationalIndex.get(b.id) ?? Number.MAX_SAFE_INTEGER),
+			);
+		}
+
 		const ordered: AgentRef[] = [];
 		const visited = new Set<string>();
 		this.#treeDepthById.clear();
-		const visit = (ref: AgentRef, depth: number): void => {
-			if (visited.has(ref.id)) return;
-			visited.add(ref.id);
-			this.#treeDepthById.set(ref.id, depth);
-			ordered.push(ref);
-			for (const child of children.get(ref.id) ?? []) visit(child, depth + 1);
+		const visit = (root: AgentRef, rootDepth: number): void => {
+			const stack: Array<{ ref: AgentRef; depth: number }> = [{ ref: root, depth: rootDepth }];
+			while (stack.length > 0) {
+				const current = stack.pop();
+				if (!current || visited.has(current.ref.id)) continue;
+				visited.add(current.ref.id);
+				this.#treeDepthById.set(current.ref.id, current.depth);
+				ordered.push(current.ref);
+				const descendants = children.get(current.ref.id);
+				if (!descendants) continue;
+				for (let i = descendants.length - 1; i >= 0; i--) {
+					stack.push({ ref: descendants[i], depth: current.depth + 1 });
+				}
+			}
 		};
 		for (const root of children.get(MAIN_AGENT_ID) ?? []) visit(root, 0);
 		// Corrupt persisted parent cycles remain visible as roots instead of
 		// disappearing from the operational surface.
 		for (const ref of refs) visit(ref, 0);
 		return ordered;
-	}
-
-	#observablesById(): Map<string, ObservableSession> {
-		return new Map(this.#observers.getSessions().map(session => [session.id, session]));
 	}
 
 	// ========================================================================
@@ -573,7 +746,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#renderTable(width: number, termHeight: number): string[] {
 		this.#hitRows.length = 0;
 		const contentRows = Math.max(1, termHeight - 4);
-		const observedById = this.#observablesById();
+		const observedById = this.#observedById;
 		const split = this.#splitRosterWidth(width);
 		this.#lastRenderWasSplit = split !== undefined;
 		const selected = this.#rows[this.#selectedRow];
@@ -622,7 +795,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	}
 
 	#footer(showingNarrowDetails: boolean, availableWidth: number): string {
-		const nextView = this.#viewMode === "roster" ? "tree" : "roster";
+		const nextView = this.#viewMode === "roster" ? "by parent" : "flat";
 		if (showingNarrowDetails) {
 			return theme.fg("dim", `Tab:roster  Enter:open  t:${nextView}  Esc:roster`);
 		}
@@ -633,7 +806,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	}
 
 	#renderRosterPanel(width: number, rows: number, observedById: ReadonlyMap<string, ObservableSession>): RosterRender {
-		const lines = this.#summaryLines(observedById);
+		const lines = this.#summaryLines(width);
 		const hitRows: Array<number | undefined> = Array.from({ length: lines.length });
 		if (rows >= 8) {
 			lines.push("");
@@ -682,9 +855,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	): RosterRender {
 		const lines: string[] = [];
 		const hitRows: Array<number | undefined> = [];
-		const rendered: Array<string[] | undefined> = [];
+		const rendered = new Map<number, string[]>();
 		const entryAt = (index: number): string[] => {
-			const cached = rendered[index];
+			const cached = rendered.get(index);
 			if (cached) return cached;
 			const entry = this.#renderEntry(
 				this.#rows[index],
@@ -693,7 +866,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 				observedById.get(this.#rows[index].id),
 				index === this.#hoveredRow,
 			);
-			rendered[index] = entry;
+			rendered.set(index, entry);
 			return entry;
 		};
 		const appendEntry = (index: number, entry = entryAt(index)): void => {
@@ -763,41 +936,49 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		return { lines, hitRows };
 	}
 
-	#summaryLines(observedById: ReadonlyMap<string, ObservableSession>): string[] {
-		const view = this.#viewMode === "roster" ? "Roster" : "Spawn tree";
+	#summaryLines(width: number): string[] {
+		const active = (label: string): string => theme.bg("selectedBg", theme.bold(theme.fg("accent", ` ${label} `)));
+		const inactive = (label: string): string => theme.fg("muted", ` ${label} `);
+		const projection =
+			this.#viewMode === "roster"
+				? `${active("Flat")}${theme.fg("dim", "/")}${inactive("By parent")}`
+				: `${inactive("Flat")}${theme.fg("dim", "/")}${active("By parent")}`;
 		const counts = this.#statusSummary();
-		const metrics = this.#aggregateMetrics(observedById);
-		const usage: string[] = [];
-		if (metrics.cost > 0) usage.push(theme.fg("statusLineCost", formatCost(metrics.cost)));
-		if (metrics.tokens > 0) usage.push(`${formatNumber(metrics.tokens)} tok`);
-		if (metrics.requests > 0) usage.push(`${formatNumber(metrics.requests)} req`);
-		if (metrics.tools > 0) usage.push(`${formatNumber(metrics.tools)} tools`);
-		if (metrics.durationMs > 0) usage.push(`${formatDuration(metrics.durationMs)} agent time`);
-		return [
-			`${theme.bold(view)}${counts ? theme.fg("dim", `${theme.sep.dot}${counts}`) : ""}`,
-			usage.length > 0
-				? theme.fg("dim", usage.join(theme.sep.dot))
-				: theme.fg(
-						"dim",
-						metrics.reportedAgents > 0
-							? "usage not priced by active providers"
-							: "usage appears with agent progress",
-					),
-		];
+		const header = `${theme.bold("Roster")}${theme.fg("dim", theme.sep.dot)}${projection}${counts ? theme.fg("dim", theme.sep.dot) + counts : ""}`;
+		const lines = wrapTextWithAnsi(header, Math.max(1, width));
+
+		const metrics = this.#aggregate;
+		if (metrics.reportedAgents === 0) {
+			lines.push(
+				...wrapTextWithAnsi(
+					theme.fg("dim", `Usage —${theme.sep.dot}0/${this.#rows.length} measured`),
+					Math.max(1, width),
+				),
+			);
+			return lines;
+		}
+		const usage = [
+			theme.fg("statusLineCost", formatCost(metrics.cost)),
+			theme.fg("dim", `${formatDuration(metrics.durationMs)} agent time`),
+			theme.fg("dim", `${formatNumber(metrics.requests)} req`),
+			theme.fg("dim", `${formatNumber(metrics.tools)} tools`),
+			theme.fg("dim", `${formatNumber(metrics.tokens)} tok`),
+			theme.fg("dim", `${metrics.reportedAgents}/${this.#rows.length} measured`),
+		].join(theme.fg("dim", theme.sep.dot));
+		lines.push(...wrapTextWithAnsi(usage, Math.max(1, width)));
+		return lines;
 	}
 
 	#statusSummary(): string {
-		const counts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
-		for (const ref of this.#rows) counts[ref.status]++;
 		const parts: string[] = [];
 		for (const status of ["running", "idle", "parked", "aborted"] as const) {
-			const count = counts[status];
+			const count = this.#statusCounts[status];
 			if (count > 0) parts.push(`${statusGlyph(status)} ${statusText(status, `${count} ${status}`)}`);
 		}
 		return parts.join(theme.sep.dot);
 	}
 
-	#aggregateMetrics(observedById: ReadonlyMap<string, ObservableSession>): AggregateMetrics {
+	#aggregateMetrics(observedById: ReadonlyMap<string, ObservableSession>, refreshFallback = false): AggregateMetrics {
 		const total: AggregateMetrics = {
 			tokens: 0,
 			requests: 0,
@@ -806,8 +987,17 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			durationMs: 0,
 			reportedAgents: 0,
 		};
+		let hasFallbackLiveSessions = false;
 		for (const ref of this.#rows) {
-			const metrics = metricsFor(ref, observedById.get(ref.id));
+			const observed = observedById.get(ref.id);
+			const fallbackSession = this.#fallbackStatsSession(ref, observed);
+			if (fallbackSession) {
+				hasFallbackLiveSessions = true;
+				if (refreshFallback || !this.#sessionMetrics.has(fallbackSession)) {
+					this.#sessionMetrics.set(fallbackSession, { metrics: this.#readSessionMetrics(fallbackSession) });
+				}
+			}
+			const metrics = this.#metricsFor(ref, observed);
 			if (!metrics) continue;
 			total.reportedAgents++;
 			total.tokens += metrics.tokens;
@@ -816,6 +1006,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			total.cost += metrics.cost;
 			total.durationMs += metrics.durationMs;
 		}
+		this.#hasFallbackLiveSessions = hasFallbackLiveSessions;
 		return total;
 	}
 
@@ -828,8 +1019,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		if (!ref) return [theme.fg("dim", "Select an agent to inspect"), ...Array.from({ length: rows - 1 }, () => "")];
 		const observed = observedById.get(ref.id);
 		const progress = observed?.progress;
-		const metrics = metricsFor(ref, observed);
-		const children = this.#rows.filter(candidate => candidate.parentId === ref.id);
+		const metrics = this.#metricsFor(ref, observed);
+		const children = this.#childrenByParent.get(ref.id) ?? [];
 		const lines: string[] = [];
 		const add = (line = ""): void => {
 			if (lines.length < rows) lines.push(truncateToWidth(line, width));
@@ -851,8 +1042,11 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		add(
 			`${statusText(ref.status, ref.status)}${theme.fg("dim", `${theme.sep.dot}${lifecycleDetails.join(theme.sep.dot)}`)}`,
 		);
+		const modelDetails: string[] = [];
+		if (progress?.modelRole && this.#settings) modelDetails.push(formatRoleBadge(progress.modelRole, this.#settings));
 		const badge = modelBadge(ref, observed);
-		if (badge) add(badge);
+		if (badge) modelDetails.push(badge);
+		if (modelDetails.length > 0) add(modelDetails.join(theme.sep.dot));
 
 		const task = observed?.description ?? progress?.task ?? ref.activity;
 		if (task) {
@@ -873,25 +1067,19 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 		section("Usage");
 		if (metrics) {
-			const spend = [
-				metrics.cost > 0 ? formatCost(metrics.cost) : "cost —",
-				`${formatNumber(metrics.tokens)} tokens`,
-				`${formatNumber(metrics.requests)} requests`,
-				`${formatNumber(metrics.tools)} tools`,
-			];
-			addWrapped(spend.join(theme.sep.dot));
+			addWrapped(formatMetrics(metrics), 3);
 			if (metrics.contextTokens !== undefined && metrics.contextWindow) {
 				add(contextGauge(metrics.contextTokens, metrics.contextWindow));
 			}
 		} else {
-			add(theme.fg("dim", "No usage snapshot"));
+			add(theme.fg("dim", "usage —"));
 		}
 
 		section("Lineage");
 		add(
 			`Spawned by ${replaceTabs(ref.parentId ?? MAIN_AGENT_ID)}${children.length > 0 ? ` · ${children.length} children` : ""}`,
 		);
-		if (children.length > 0) addWrapped(children.map(child => child.id).join(", "), 1);
+		if (children.length > 0) add(theme.fg("dim", formatChildIds(children, width)));
 		add(theme.fg("dim", `Registered ${new Date(ref.createdAt).toISOString().slice(0, 16).replace("T", " ")}Z`));
 
 		section("Changes");
@@ -907,10 +1095,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	}
 
 	/**
-	 * One agent entry, 1-2 lines:
-	 * `❯ ⟳ Name  type  ↳ parent  ⧉ 2 ········ model ◒ level · age` — identity
-	 * left, metadata right-aligned (inlined when the terminal is too narrow) —
-	 * plus an indented dim task line when the agent's work is known.
+	 * One agent entry keeps identity/model metadata on one line when it fits,
+	 * then packs task and all five usage metrics together below. Narrow rows wrap
+	 * only those dense secondary fields; restored historical rows say `usage —`.
 	 */
 	#renderEntry(
 		ref: AgentRef,
@@ -922,7 +1109,11 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const max = Math.max(1, width);
 		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
 		const depth = this.#viewMode === "tree" ? (this.#treeDepthById.get(ref.id) ?? 0) : 0;
-		const branch = this.#viewMode === "tree" && depth > 0 ? `${"  ".repeat(depth - 1)}↳ ` : "";
+		const visibleDepth = Math.min(depth, Math.max(1, Math.floor(max / 2)));
+		const branch =
+			this.#viewMode === "tree" && depth > 0
+				? `${depth > visibleDepth ? "… " : ""}${"  ".repeat(Math.max(0, visibleDepth - 1))}↳ `
+				: "";
 		const id = replaceTabs(ref.id);
 		const styledId = selected ? theme.bold(theme.fg("accent", id)) : theme.bold(id);
 		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${branch}${styledId}`];
@@ -942,6 +1133,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const left = fields.join("  ");
 
 		const meta: string[] = [];
+		if (observed?.progress?.modelRole && this.#settings) {
+			meta.push(formatRoleBadge(observed.progress.modelRole, this.#settings));
+		}
 		const badge = modelBadge(ref, observed);
 		if (badge) meta.push(badge);
 		meta.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
@@ -949,18 +1143,24 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 		const leftWidth = visibleWidth(left);
 		const rightWidth = visibleWidth(right);
-		const line =
-			leftWidth + 2 + rightWidth <= max
-				? left + padding(max - leftWidth - rightWidth) + right
-				: truncateToWidth(`${left}  ${right}`.replace(/[\r\n]+/g, " "), max);
-		const entry = [line];
+		const entry: string[] = [];
+		const detailIndent = Math.min(max - 1, 4 + depth * 2);
+		if (leftWidth + 2 + rightWidth <= max) {
+			entry.push(left + padding(max - leftWidth - rightWidth) + right);
+		} else {
+			entry.push(truncateToWidth(left.replace(/[\r\n]+/g, " "), max));
+			entry.push(`${padding(Math.max(0, detailIndent))}${truncateToWidth(right, Math.max(1, max - detailIndent))}`);
+		}
 
+		const metrics = this.#metricsFor(ref, observed);
+		const usage = metrics ? theme.fg("dim", formatMetrics(metrics)) : theme.fg("dim", "usage —");
 		const task = observed?.description ?? observed?.progress?.task ?? ref.activity;
-		if (task) {
-			const indentWidth = Math.min(max - 1, 4 + depth * 2);
-			entry.push(
-				`${padding(Math.max(0, indentWidth))}${theme.fg("muted", sanitizeLine(task, Math.max(10, max - indentWidth)))}`,
-			);
+		const detailWidth = Math.max(1, max - detailIndent);
+		const details = task
+			? `${theme.fg("muted", sanitizeLine(task, detailWidth))}${theme.fg("dim", theme.sep.dot)}${usage}`
+			: usage;
+		for (const wrapped of wrapTextWithAnsi(details, detailWidth)) {
+			entry.push(`${padding(Math.max(0, detailIndent))}${wrapped}`);
 		}
 		if (!hovered) return entry;
 		return entry.map(lineRow => {
@@ -1014,6 +1214,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			return;
 		}
 		if (keyData === "t") {
+			this.#hoveredRow = null;
 			this.#viewMode = this.#viewMode === "roster" ? "tree" : "roster";
 			this.#refreshRows();
 			this.#requestRender();

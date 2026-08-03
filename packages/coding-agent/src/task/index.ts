@@ -860,6 +860,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					id: agentId,
 					agent: agentType,
 					agentSource,
+					modelRole: policy.modelRole,
 					status: "pending",
 					task: renderSubagentUserPrompt(assignment),
 					assignment,
@@ -1143,8 +1144,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// polling row reflects the resolved model, reasoning level,
 							// and running counters without reverting the "running"
 							// status back to the subagent's initial "pending" snapshot.
+							progress.modelRole = nextProgress.modelRole ?? progress.modelRole;
 							progress.resolvedModel = nextProgress.resolvedModel;
-							progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1187,6 +1188,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
+					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
 						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;

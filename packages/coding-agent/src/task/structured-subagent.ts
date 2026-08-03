@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelPatterns, resolveAgentModelSource, resolveExplicitModelRole } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -122,6 +122,8 @@ export interface EffectiveSubagentPolicy {
 	agent: AgentDefinition;
 	effectiveAgent: AgentDefinition;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -277,13 +279,18 @@ export async function resolveEffectiveSubagentPolicy(
 	}
 	const agentModelOverrides = request.session.settings.get("task.agentModelOverrides");
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
-	const modelOverride = resolveAgentModelPatterns({
-		settingsOverride: request.model ?? agentModelOverrides[agentName],
+	const modelResolution = {
+		requestModel: request.model,
+		settingsOverride: agentModelOverrides[agentName],
 		agentModel: effectiveAgent.model,
 		settings: request.session.settings,
 		activeModelPattern: parentActiveModelPattern,
 		fallbackModelPattern: request.session.getModelString?.(),
-	});
+	};
+	// Keep role identity from the same effective non-empty source that supplies
+	// model selection: caller request, settings override, then agent definition.
+	const modelRole = resolveExplicitModelRole(resolveAgentModelSource(modelResolution), request.session.settings);
+	const modelOverride = resolveAgentModelPatterns(modelResolution);
 	const isolationMode = request.session.settings.get("task.isolation.mode");
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && isolationMode === "none") {
@@ -298,6 +305,7 @@ export async function resolveEffectiveSubagentPolicy(
 		agent,
 		effectiveAgent,
 		modelOverride,
+		modelRole,
 		parentActiveModelPattern,
 		schema,
 		planMode,
@@ -393,6 +401,7 @@ function buildExecutorOptions(
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
+		modelRole: policy.modelRole,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
@@ -475,6 +484,7 @@ function buildFailureResult(
 			tokens: 0,
 			requests: 0,
 			modelOverride: policy.modelOverride,
+			modelRole: policy.modelRole,
 			error: message,
 		};
 	};

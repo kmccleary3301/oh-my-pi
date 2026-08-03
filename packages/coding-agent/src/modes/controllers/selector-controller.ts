@@ -2015,6 +2015,7 @@ export class SelectorController {
 
 		const hub = new AgentHubOverlayComponent({
 			observers,
+			settings: this.ctx.settings,
 			hubKeys,
 			expandKeys: this.ctx.keybindings.getKeys("app.tools.expand"),
 			onDone: done,
