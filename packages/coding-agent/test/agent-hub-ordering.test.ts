@@ -61,12 +61,12 @@ interface RenderedAgentRow {
 	selected: boolean;
 }
 
-const ROSTER_ENTRY_PATTERN = /^(❯| ) (\S+) (?:(?: {2})*↳ )?(\S+)/u;
+const ROSTER_ENTRY_PATTERN = /^(❯| ) (\S+) (?:(?:(?:│ {3}| {4})*)(?:├── |└── ))?(\S+)/u;
 
 function rosterCell(raw: string): string | undefined {
 	const line = Bun.stripANSI(raw);
 	if (!line.startsWith("│ ")) return undefined;
-	const divider = line.indexOf("│", 2);
+	const divider = line.indexOf("│", Math.max(2, Math.floor(line.length / 3)));
 	if (divider < 0) return undefined;
 	return line.slice(2, Math.max(2, divider - 1));
 }
@@ -751,6 +751,26 @@ describe("Agent hub row ordering", () => {
 			hub.dispose();
 			vi.useRealTimers();
 			setSystemTime();
+		}
+	});
+
+	it("renders parent lineage with bash-style tree connectors", () => {
+		geometry = stubStdoutGeometry(120);
+		geometry.setRows(32);
+		const agents = new AgentRegistry();
+		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", session: null });
+		agents.register({ id: "First", displayName: "First", kind: "sub", parentId: "Parent", session: null });
+		agents.register({ id: "Grandchild", displayName: "Grandchild", kind: "sub", parentId: "First", session: null });
+		agents.register({ id: "Last", displayName: "Last", kind: "sub", parentId: "Parent", session: null });
+		const hub = makeHub(agents);
+
+		try {
+			hub.handleInput("t");
+			expect(Bun.stripANSI(renderedRosterHeaderLineRaw(hub, "First", 120))).toContain("├── First");
+			expect(Bun.stripANSI(renderedRosterHeaderLineRaw(hub, "Grandchild", 120))).toContain("│   └── Grandchild");
+			expect(Bun.stripANSI(renderedRosterHeaderLineRaw(hub, "Last", 120))).toContain("└── Last");
+		} finally {
+			hub.dispose();
 		}
 	});
 

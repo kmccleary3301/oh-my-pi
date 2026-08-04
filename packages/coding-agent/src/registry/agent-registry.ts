@@ -30,6 +30,26 @@ export type AgentStatus = "running" | "idle" | "parked" | "aborted";
  */
 export type AgentKind = "main" | "sub" | "advisor";
 
+/** Persisted per-agent totals reconstructed from the child session transcript. */
+export interface AgentMetricsSummary {
+	tokens: number;
+	requests: number;
+	tools: number;
+	cost: number;
+	durationMs: number;
+	contextTokens?: number;
+	contextWindow?: number;
+}
+
+/** Historical identity and telemetry that remain available after the live session is disposed. */
+export interface AgentHistorySummary {
+	agent?: string;
+	modelRole?: string;
+	resolvedModel?: string;
+	metrics?: AgentMetricsSummary;
+	readOnly?: boolean;
+}
+
 export interface AgentRef {
 	id: string;
 	displayName: string;
@@ -43,6 +63,8 @@ export interface AgentRef {
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
+	/** Persisted identity and telemetry restored after the live observer is gone. */
+	history?: AgentHistorySummary;
 }
 
 export type AgentRefExpectation = AgentRef | AgentSession;
@@ -50,6 +72,7 @@ export type AgentRefExpectation = AgentRef | AgentSession;
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef }
+	| { type: "metadata_changed"; ref: AgentRef }
 	| { type: "removed"; ref: AgentRef };
 
 type RegistryListener = (event: RegistryEvent) => void;
@@ -68,6 +91,8 @@ export interface RegisterInput {
 	createdAt?: number;
 	/** Last transcript activity timestamp, when known from persisted history. */
 	lastActivity?: number;
+	/** Persisted identity and telemetry restored after the live observer is gone. */
+	history?: AgentHistorySummary;
 }
 
 export class AgentRegistry {
@@ -105,6 +130,7 @@ export class AgentRegistry {
 			createdAt: input.createdAt ?? now,
 			lastActivity: input.lastActivity ?? now,
 			activity: input.activity,
+			history: input.history,
 		};
 		this.#refs.set(ref.id, ref);
 		this.#emit({ type: "registered", ref });
@@ -121,6 +147,15 @@ export class AgentRegistry {
 		const current = this.#refs.get(input.id);
 		if (expected === null) return current ? undefined : this.register(input);
 		return current === expected && current.status === "parked" && !current.session ? current : undefined;
+	}
+
+	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
+	setHistory(id: string, history: AgentHistorySummary, expectedSessionFile?: string): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || (expectedSessionFile !== undefined && ref.sessionFile !== expectedSessionFile)) return false;
+		ref.history = { ...ref.history, ...history };
+		this.#emit({ type: "metadata_changed", ref });
+		return true;
 	}
 
 	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean {

@@ -207,6 +207,14 @@ export interface SessionInitEntry extends SessionEntryBase {
 	task: string;
 	/** Tools available to the agent */
 	tools: string[];
+	/** Agent definition name (for example `scout` or `reviewer`). */
+	agent?: string;
+	/** Semantic model role declared by the agent, retained even after concrete model resolution. */
+	modelRole?: string;
+	/** Initially resolved provider/model selector for historical display. */
+	resolvedModel?: string;
+	/** Whether the agent definition is read-only, allowing an exact zero-LoC attribution. */
+	readOnly?: boolean;
 	/** Output schema if structured output was requested. */
 	outputSchema?: unknown;
 	/** Enforcement policy recorded with the output schema for faithful revival. */

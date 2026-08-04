@@ -16,6 +16,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const AGENT_ID = "Worker";
@@ -51,13 +52,13 @@ function makeHub(focusAgent: (id: string) => Promise<void>) {
 	return { hub, doneCalls: () => doneCalls, done: done.promise, renderRequested: renderRequested.promise };
 }
 
-const ROSTER_ENTRY_PATTERN = /^(❯| ) (\S+) (?:(?: {2})*↳ )?(\S+)/u;
+const ROSTER_ENTRY_PATTERN = /^(❯| ) (\S+) (?:(?:(?:│ {3}| {4})*)(?:├── |└── ))?(\S+)/u;
 
 function renderedRosterEntry(hub: AgentHubOverlayComponent, id: string, width: number): string {
 	const cells = hub.render(width).map(raw => {
 		const line = Bun.stripANSI(raw);
 		if (!line.startsWith("│ ")) return undefined;
-		const divider = line.indexOf("│", 2);
+		const divider = line.indexOf("│", Math.max(2, Math.floor(line.length / 3)));
 		return divider < 0 ? undefined : line.slice(2, Math.max(2, divider - 1));
 	});
 	const start = cells.findIndex(cell => {
@@ -142,6 +143,34 @@ describe("Agent hub Enter activation", () => {
 		hub.dispose();
 	});
 
+	it("restores nested parent lineage after restart", async () => {
+		using tempDir = TempDir.createSync("@omp-agent-hub-persisted-tree-");
+		const sessionFile = path.join(tempDir.path(), "main.jsonl");
+		const parentSessionFile = path.join(tempDir.path(), "main", "Parent.jsonl");
+		const childSessionFile = path.join(tempDir.path(), "main", "Parent", "Child.jsonl");
+		await Bun.write(sessionFile, "");
+		await Bun.write(parentSessionFile, "");
+		await Bun.write(childSessionFile, "");
+		const agents = new AgentRegistry();
+		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
+			observers: new SessionObserverRegistry(),
+			hubKeys: [],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+			irc: new IrcBus(agents),
+			sessionFile,
+		});
+		await hub.persistedSubagentsReady;
+
+		expect(agents.get("Parent")?.parentId).toBe("Main");
+		expect(agents.get("Child")?.parentId).toBe("Parent");
+		hub.handleInput("t");
+		expect(Bun.stripANSI(renderedRosterEntry(hub, "Child", 120))).toContain("└── Child");
+		hub.dispose();
+	});
+
 	it("restores saved task metadata and timestamps for completed agents", async () => {
 		using tempDir = TempDir.createSync("@omp-agent-hub-persisted-metadata-");
 		const sessionFile = path.join(tempDir.path(), "main.jsonl");
@@ -188,6 +217,83 @@ describe("Agent hub Enter activation", () => {
 		expect(workerEntry).toContain("Inspect dependency boundaries and report unsafe coupling.");
 		expect(workerEntry.replace(/\s+/g, " ")).toContain("usage —");
 		expect(workerEntry).not.toContain("$0.000");
+		hub.dispose();
+	});
+
+	it("restores persisted model role, usage, spend, and tool totals", async () => {
+		using tempDir = TempDir.createSync("@omp-agent-hub-persisted-usage-");
+		const sessionFile = path.join(tempDir.path(), "main.jsonl");
+		const workerSessionFile = path.join(tempDir.path(), "main", "Worker.jsonl");
+		const createdAt = "2026-07-30T01:13:30.000Z";
+		const lastActivity = new Date("2026-07-30T01:15:00.000Z");
+		await Bun.write(sessionFile, "");
+		await Bun.write(
+			workerSessionFile,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "worker-session", timestamp: createdAt, cwd: TEST_CWD }),
+				JSON.stringify({
+					type: "model_change",
+					id: "model",
+					parentId: null,
+					timestamp: createdAt,
+					model: "openai-codex/gpt-5.6-luna",
+					// Historical concrete overrides did not persist a model-role field.
+				}),
+				JSON.stringify({
+					type: "session_init",
+					id: "init",
+					parentId: "model",
+					timestamp: createdAt,
+					systemPrompt: `base prompt\n\nROLE\n====\n${getBundledAgent("scout")?.systemPrompt}`,
+					task: "Inspect persisted telemetry.",
+					tools: ["read", "grep"],
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "assistant",
+					parentId: "init",
+					timestamp: lastActivity.toISOString(),
+					message: {
+						role: "assistant",
+						timestamp: lastActivity.getTime(),
+						content: [
+							{ type: "toolCall", id: "read-call", name: "read", arguments: { path: "src/a.ts" } },
+							{ type: "toolCall", id: "grep-call", name: "grep", arguments: { pattern: "needle" } },
+						],
+						usage: {
+							input: 100,
+							output: 25,
+							cacheRead: 200,
+							cacheWrite: 10,
+							totalTokens: 335,
+							cost: { input: 0.01, output: 0.1, cacheRead: 0.01, cacheWrite: 0.003, total: 0.123 },
+						},
+					},
+				}),
+			].join("\n"),
+		);
+		await fs.utimes(workerSessionFile, lastActivity, lastActivity);
+		const agents = new AgentRegistry();
+		const hub = new AgentHubOverlayComponent({
+			settings: Settings.isolated(),
+			observers: new SessionObserverRegistry(),
+			hubKeys: [],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+			irc: new IrcBus(agents),
+			sessionFile,
+		});
+		await hub.persistedSubagentsReady;
+
+		const workerEntry = renderedRosterEntry(hub, "Worker", 120).replace(/\s+/g, " ");
+		expect(workerEntry).toContain("SMOL");
+		expect(workerEntry).toContain("$0.123");
+		expect(workerEntry).toContain("1m30s");
+		expect(workerEntry).toContain("1 req");
+		expect(workerEntry).toContain("2 tools");
+		expect(workerEntry).toContain("135 tok");
+		expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("Read-only · 0 LoC");
 		hub.dispose();
 	});
 	it("avoids multi-second event-loop stalls while discovering agents from a large session", async () => {
