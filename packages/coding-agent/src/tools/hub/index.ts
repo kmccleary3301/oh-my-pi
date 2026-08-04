@@ -30,7 +30,7 @@ import type { RenderResultOptions } from "../../extensibility/custom-tools/types
 import { IrcBus } from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
 import hubDescription from "../../prompts/tools/hub.md" with { type: "text" };
-import type { AgentRegistry } from "../../registry/agent-registry";
+import { type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { ToolSession } from "..";
 import {
 	buildJobResult,
@@ -121,6 +121,7 @@ interface MessagingDeps {
 	registry: AgentRegistry;
 	senderId: string;
 	settings: ToolSession["settings"];
+	sessionFile?: string | null;
 }
 
 const PROGRESS_INTERVAL_MS = 500;
@@ -240,7 +241,14 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		const registry = this.session.agentRegistry;
 		const senderId = this.session.getAgentId?.() ?? null;
 		if (!registry || !senderId) return null;
-		return { registry, senderId, settings: this.session.settings };
+		return {
+			registry,
+			senderId,
+			settings: this.session.settings,
+			sessionFile:
+				registry.get(MAIN_AGENT_ID)?.sessionFile ??
+				(typeof this.session.getSessionFile === "function" ? this.session.getSessionFile() : null),
+		};
 	}
 
 	async execute(
