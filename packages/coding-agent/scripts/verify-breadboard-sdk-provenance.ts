@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { JSONC } from "bun";
 import {
-	DARWIN_PINNED_DIRECTORY_LIMITS,
+	PINNED_DIRECTORY_LIMITS,
 	openPinnedDirectory,
 	type PinnedDirectory,
-} from "../src/breadboard/lifecycle/darwin-pinned-directory";
+} from "../src/breadboard/lifecycle/pinned-directory";
 
 export interface BreadboardSdkProvenance {
 	readonly schemaVersion: "p30.breadboard-sdk-provenance.v1";
@@ -355,10 +355,10 @@ async function inspectPinnedBackendGit(
 			invariant(metadata.type === "regular", "backend tracked file type does not match");
 			invariant(((metadata.mode & 0o111) !== 0) === (entry.mode === "100755"), "backend worktree is dirty");
 			invariant(
-				metadata.size <= BigInt(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes),
+				metadata.size <= BigInt(PINNED_DIRECTORY_LIMITS.maxFileBytes),
 				"backend tracked file exceeds the verification limit",
 			);
-			const bytes = await tracked.read(DARWIN_PINNED_DIRECTORY_LIMITS.maxFileBytes);
+			const bytes = await tracked.read(PINNED_DIRECTORY_LIMITS.maxFileBytes);
 			invariant(bytes.equals(expectedBlob), "backend worktree is dirty");
 		} finally {
 			await tracked.close();
@@ -366,9 +366,9 @@ async function inspectPinnedBackendGit(
 	}
 	const trackedPaths = new Set(entries.map(entry => entry.path));
 	const leaves = await pinned.listLeaves({
-		maxEntries: Math.min(MAX_TREE_ENTRIES * 2, DARWIN_PINNED_DIRECTORY_LIMITS.maxEntries),
-		maxPathBytes: Math.min(MAX_TREE_PATH_BYTES, DARWIN_PINNED_DIRECTORY_LIMITS.maxRelativePathBytes),
-		maxTotalPathBytes: DARWIN_PINNED_DIRECTORY_LIMITS.maxTotalPathBytes,
+		maxEntries: Math.min(MAX_TREE_ENTRIES * 2, PINNED_DIRECTORY_LIMITS.maxEntries),
+		maxPathBytes: Math.min(MAX_TREE_PATH_BYTES, PINNED_DIRECTORY_LIMITS.maxRelativePathBytes),
+		maxTotalPathBytes: PINNED_DIRECTORY_LIMITS.maxTotalPathBytes,
 	});
 	const untracked = leaves.filter(
 		path => path !== ".git" && !path.startsWith(`.git${sep}`) && !trackedPaths.has(path),
