@@ -28,6 +28,12 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { formatAge, formatDuration, formatNumber, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import {
+	AgentActivityIndex,
+	type AgentActivityKind,
+	type AgentActivityRow,
+	activityRowsFromProgress,
+} from "../../activity";
 import type { KeyId } from "../../config/keybindings";
 import { getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
@@ -65,7 +71,11 @@ const SPLIT_MIN_WIDTH = 96;
 const DETAIL_MIN_WIDTH = 34;
 const ROSTER_MIN_WIDTH = 48;
 
+export type AgentHubSection = "agents" | "activity";
+
 type HubViewMode = "roster" | "tree";
+type ActivityFilter = "all" | "errors" | "responses" | "tools";
+type ActivityScope = "all" | "agent" | "subtree";
 
 type AgentMetrics = AgentMetricsSummary;
 
@@ -131,6 +141,26 @@ function statusText(status: AgentStatus, text: string): string {
 		case "aborted":
 			return theme.fg("error", text);
 	}
+}
+
+function activityGlyph(row: AgentActivityRow): string {
+	if (row.status === "error") return theme.fg("error", theme.status.error);
+	if (row.status === "aborted") return theme.fg("warning", theme.status.aborted);
+	if (row.status === "pending") return theme.fg("accent", theme.status.running);
+	switch (row.kind) {
+		case "response":
+			return theme.fg("success", "◆");
+		case "tool":
+			return theme.fg("success", theme.status.success);
+		case "irc":
+			return theme.fg("accent", "→");
+		case "lifecycle":
+			return theme.fg("muted", "○");
+	}
+}
+
+function activityClock(timestamp: number): string {
+	return new Date(timestamp).toISOString().slice(11, 19);
 }
 
 /** Model id + thinking level (`sonnet-4-6 ◒ high`), level colored per theme. */
@@ -310,6 +340,10 @@ export interface AgentHubDeps {
 	focusAgent?: (id: string) => Promise<void>;
 	/** Current main session file; used to seed parked historical subagents after restart. */
 	sessionFile?: string | null;
+	/** Initial top-level projection; slash commands deep-link into this surface. */
+	initialSection?: AgentHubSection;
+	/** Injectable unified activity source; production creates one from local or remote transcripts. */
+	activity?: AgentActivityIndex;
 
 	/** Collab guest: route actions/transcripts to the host instead of local sessions. */
 	remote?: AgentHubRemote;
@@ -333,6 +367,18 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	readonly persistedSubagentsReady: Promise<void>;
 	/** Prevent the async persisted-session scan from flashing a false empty state. */
 	#loadingPersistedSubagents = false;
+	#section: AgentHubSection;
+	#activity: AgentActivityIndex;
+	#manageActivityLive: boolean;
+	#activityRows: AgentActivityRow[] = [];
+	#selectedActivityRow = 0;
+	#activityFilter: ActivityFilter = "all";
+	#activityScope: ActivityScope = "all";
+	#activitySearch = "";
+	#activitySearchEditing = false;
+	#activityFollow = true;
+	#activitySyncGeneration = 0;
+	#activitySyncStamp = new Map<string, string>();
 
 	// Table state
 	#rows: AgentRef[] = [];
@@ -397,6 +443,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#requestRender = deps.requestRender;
 		this.#hubKeys = deps.hubKeys;
 		this.#remote = deps.remote;
+		this.#section = deps.initialSection ?? "agents";
+		this.#activity = deps.activity ?? new AgentActivityIndex({ remote: deps.remote });
+		this.#manageActivityLive = !deps.activity;
 		this.#loadingPersistedSubagents = !this.#remote && Boolean(deps.sessionFile?.endsWith(".jsonl"));
 		this.#ui =
 			deps.ui ??
@@ -414,6 +463,14 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 		this.#unsubscribers.push(this.#registry.onChange(() => this.#scheduleDataChange()));
 		this.#unsubscribers.push(this.#observers.onChange(() => this.#scheduleDataChange()));
+		if (!this.#manageActivityLive) {
+			this.#unsubscribers.push(
+				this.#activity.onChange(() => {
+					this.#refreshActivityRows();
+					this.#requestRender();
+				}),
+			);
+		}
 		this.#ageTimer = setInterval(() => {
 			if (this.#hasFallbackLiveSessions) {
 				this.#aggregate = this.#aggregateMetrics(this.#observedById, true);
@@ -465,7 +522,11 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 	override render(width: number): readonly string[] {
 		const termHeight = this.#ui.terminal?.rows || process.stdout.rows || 40;
-		const frame = this.#renderTable(width, termHeight).map(line => clampHubLine(line, width));
+		const frame = (
+			this.#section === "activity"
+				? this.#renderActivityTable(width, termHeight)
+				: this.#renderTable(width, termHeight)
+		).map(line => clampHubLine(line, width));
 		if (frame.length <= termHeight) return frame;
 
 		// A tiny terminal can leave less room than the fixed chrome needs. Keep
@@ -478,14 +539,26 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	handleInput(keyData: string): void {
 		if (routeSgrMouseInput(keyData, event => routeSelectListMouse(this, event, event.row))) return;
 
-		// The hub/observe keys always close the overlay (toggle semantics)
 		for (const key of this.#hubKeys) {
 			if (matchesKey(keyData, key)) {
 				this.#onDone();
 				return;
 			}
 		}
-		this.#handleTableInput(keyData);
+		if (this.#section === "activity" && this.#activitySearchEditing) {
+			this.#handleActivitySearchInput(keyData);
+			return;
+		}
+		if (keyData === "1") {
+			this.#switchSection("agents");
+			return;
+		}
+		if (keyData === "2") {
+			this.#switchSection("activity");
+			return;
+		}
+		if (this.#section === "activity") this.#handleActivityInput(keyData);
+		else this.#handleTableInput(keyData);
 	}
 
 	/**
@@ -507,13 +580,14 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	 * owns the alternate screen; the hub table stays mounted underneath and is
 	 * restored when the viewer closes. No-op without a real TUI (render-only test stub).
 	 */
-	openChat(id: string): void {
+	openChat(id: string, entryId?: string): void {
 		if (!this.#registry.get(id)) return;
 		if (typeof this.#ui.showOverlay !== "function") return;
 		this.#closeTranscriptOverlay();
 		this.#notice = undefined;
 		const viewer = new AgentTranscriptViewer({
 			agentId: id,
+			initialEntryId: entryId,
 			registry: this.#registry,
 			remote: this.#remote,
 			observers: this.#observers,
@@ -614,6 +688,77 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#statusCounts = { running: 0, idle: 0, parked: 0, aborted: 0 };
 		for (const ref of rosterRows) this.#statusCounts[ref.status]++;
 		this.#aggregate = this.#aggregateMetrics(this.#observedById);
+		this.#refreshActivityData(rosterRows);
+		this.#refreshActivityRows();
+	}
+
+	#refreshActivityData(refs: readonly AgentRef[]): void {
+		if (this.#manageActivityLive) {
+			const liveIds = new Set<string>();
+			for (const ref of refs) {
+				const observed = this.#observedById.get(ref.id);
+				if (observed?.progress) {
+					liveIds.add(ref.id);
+					this.#activity.setLive(ref.id, activityRowsFromProgress(observed.progress, observed.lastUpdate));
+				}
+			}
+			for (const ref of refs) {
+				if (!liveIds.has(ref.id)) this.#activity.setLive(ref.id, []);
+			}
+		}
+
+		const generation = ++this.#activitySyncGeneration;
+		const pending: Promise<void>[] = [];
+		for (const ref of refs) {
+			if (!this.#remote && !ref.sessionFile) continue;
+			const stamp = `${ref.sessionFile ?? ""}:${ref.lastActivity}`;
+			if (this.#activitySyncStamp.get(ref.id) === stamp) continue;
+			this.#activitySyncStamp.set(ref.id, stamp);
+			pending.push(this.#activity.sync(ref.id, ref.sessionFile));
+		}
+		if (pending.length === 0) return;
+		void Promise.all(pending).then(() => {
+			if (this.#disposed || generation !== this.#activitySyncGeneration) return;
+			this.#refreshActivityRows();
+			this.#requestRender();
+		});
+	}
+
+	#activityAgentIds(): ReadonlySet<string> | undefined {
+		if (this.#activityScope === "all") return undefined;
+		const selected = this.#rows[this.#selectedRow]?.id;
+		if (!selected) return new Set();
+		const ids = new Set([selected]);
+		if (this.#activityScope === "agent") return ids;
+		const queue = [selected];
+		for (let index = 0; index < queue.length; index++) {
+			for (const child of this.#childrenByParent.get(queue[index]!) ?? []) {
+				if (ids.has(child.id)) continue;
+				ids.add(child.id);
+				queue.push(child.id);
+			}
+		}
+		return ids;
+	}
+
+	#refreshActivityRows(): void {
+		const kinds: ReadonlySet<AgentActivityKind> | undefined =
+			this.#activityFilter === "responses"
+				? new Set(["response"])
+				: this.#activityFilter === "tools"
+					? new Set(["tool"])
+					: undefined;
+		let rows = this.#activity.query({
+			agentIds: this.#activityAgentIds(),
+			kinds,
+			search: this.#activitySearch,
+			limit: 2_000,
+		});
+		if (this.#activityFilter === "errors") rows = rows.filter(row => row.status === "error");
+		this.#activityRows = rows;
+		if (rows.length === 0) this.#selectedActivityRow = 0;
+		else if (this.#activityFollow) this.#selectedActivityRow = rows.length - 1;
+		else this.#selectedActivityRow = Math.min(this.#selectedActivityRow, rows.length - 1);
 	}
 
 	#metricsFor(ref: AgentRef, observed: ObservableSession | undefined): AgentMetrics | undefined {
@@ -772,6 +917,89 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	// Table view
 	// ========================================================================
 
+	#sectionTabs(): string {
+		const tab = (section: AgentHubSection, label: string): string =>
+			this.#section === section
+				? theme.bg("selectedBg", theme.bold(theme.fg("accent", ` ${label} `)))
+				: theme.fg("muted", ` ${label} `);
+		return `${tab("agents", "1 Agents")}${theme.fg("dim", theme.sep.dot)}${tab("activity", "2 Activity")}`;
+	}
+
+	#renderActivityTable(width: number, termHeight: number): string[] {
+		this.#hitRows.length = 0;
+		const innerWidth = Math.max(1, width - 4);
+		const contentRows = Math.max(1, termHeight - 4);
+		const body: string[] = [this.#sectionTabs()];
+		const selectedAgent = this.#rows[this.#selectedRow]?.id;
+		const scope =
+			this.#activityScope === "all"
+				? "all agents"
+				: this.#activityScope === "agent"
+					? (selectedAgent ?? "selected agent")
+					: `${selectedAgent ?? "selected"} subtree`;
+		const search = this.#activitySearchEditing
+			? theme.fg("accent", `search: ${this.#activitySearch}▌`)
+			: this.#activitySearch
+				? `search: ${this.#activitySearch}`
+				: "search: —";
+		body.push(
+			theme.fg(
+				"dim",
+				`${scope}${theme.sep.dot}${this.#activityFilter}${theme.sep.dot}${this.#activityFollow ? "following" : "paused"}${theme.sep.dot}${search}`,
+			),
+		);
+		if (contentRows >= 8) body.push("");
+
+		const budget = Math.max(0, contentRows - body.length);
+		if (this.#activityRows.length === 0 && budget > 0) {
+			body.push(theme.fg("muted", this.#activitySearch ? "No matching activity" : "No agent activity recorded yet"));
+		} else if (budget > 0) {
+			const selected = Math.min(this.#selectedActivityRow, this.#activityRows.length - 1);
+			const start = this.#activityFollow
+				? Math.max(0, this.#activityRows.length - budget)
+				: Math.max(0, Math.min(selected - Math.floor(budget / 2), this.#activityRows.length - budget));
+			const end = Math.min(this.#activityRows.length, start + budget);
+			if (start > 0) {
+				body.push(theme.fg("dim", `… ${start} earlier`));
+			}
+			for (let index = start + Number(start > 0); index < end; index++) {
+				this.#hitRows[1 + body.length] = index;
+				body.push(this.#formatActivityRow(this.#activityRows[index]!, index === selected, innerWidth));
+			}
+		}
+		while (body.length < contentRows) body.push("");
+
+		const lines = [topBorder(width, "Agent Hub")];
+		for (const line of body.slice(0, contentRows)) lines.push(row(line, width));
+		lines.push(divider(width));
+		lines.push(
+			row(
+				theme.fg(
+					"dim",
+					"1:agents  j/k:select  Enter:transcript  Space:follow  f:filter  s:scope  /:search  Esc:close",
+				),
+				width,
+			),
+		);
+		lines.push(bottomBorder(width));
+		return lines;
+	}
+
+	#formatActivityRow(activity: AgentActivityRow, selected: boolean, width: number): string {
+		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
+		const ref = this.#registry.get(activity.agentId);
+		const observed = this.#observedById.get(activity.agentId);
+		const role = observed?.progress?.modelRole ?? ref?.history?.modelRole;
+		const roleBadge = role && this.#settings ? `${formatRoleBadge(role, this.#settings)} ` : "";
+		const agent = truncateToWidth(replaceTabs(activity.agentId), Math.max(8, Math.min(18, Math.floor(width * 0.18))));
+		const title = activity.kind === "tool" ? (activity.toolName ?? activity.title) : activity.title;
+		const prefix =
+			`${cursor} ${theme.fg("dim", activityClock(activity.timestamp))} ${activityGlyph(activity)} ` +
+			`${roleBadge}${theme.bold(agent)} ${theme.fg(activity.kind === "response" ? "success" : "muted", title)}`;
+		const available = Math.max(1, width - visibleWidth(prefix) - visibleWidth(theme.sep.dot));
+		return `${prefix}${theme.fg("dim", theme.sep.dot)}${truncateToWidth(activity.summary, available)}`;
+	}
+
 	#renderTable(width: number, termHeight: number): string[] {
 		this.#hitRows.length = 0;
 		const contentRows = Math.max(1, termHeight - 4);
@@ -826,12 +1054,15 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#footer(showingNarrowDetails: boolean, availableWidth: number): string {
 		const nextView = this.#viewMode === "roster" ? "by parent" : "flat";
 		if (showingNarrowDetails) {
-			return theme.fg("dim", `Tab:roster  Enter:open  t:${nextView}  Esc:roster`);
+			return theme.fg("dim", `1:agents  2:activity  Tab:roster  Enter:open  Esc:roster`);
 		}
 		if (availableWidth < 96) {
-			return theme.fg("dim", `j/k:select  Enter:open  t:${nextView}  Tab:details  r/x:manage  Esc:close`);
+			return theme.fg("dim", `1:agents  2:activity  j/k:select  t:${nextView}  Tab:details  r/x:manage`);
 		}
-		return theme.fg("dim", `j/k/wheel:select  Enter/click:open  t:${nextView}  r:revive  x:kill  Esc:close`);
+		return theme.fg(
+			"dim",
+			`1:agents  2:activity  j/k/wheel:select  Enter:open  t:${nextView}  r/x:manage  Esc:close`,
+		);
 	}
 
 	#renderRosterPanel(width: number, rows: number, observedById: ReadonlyMap<string, ObservableSession>): RosterRender {
@@ -974,7 +1205,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 				: `${inactive("Flat")}${theme.fg("dim", "/")}${active("By parent")}`;
 		const counts = this.#statusSummary();
 		const header = `${theme.bold("Roster")}${theme.fg("dim", theme.sep.dot)}${projection}${counts ? theme.fg("dim", theme.sep.dot) + counts : ""}`;
-		const lines = wrapTextWithAnsi(header, Math.max(1, width));
+		const lines = [this.#sectionTabs(), ...wrapTextWithAnsi(header, Math.max(1, width))];
 
 		const metrics = this.#aggregate;
 		if (metrics.reportedAgents === 0) {
@@ -1054,23 +1285,17 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const add = (line = ""): void => {
 			if (lines.length < rows) lines.push(truncateToWidth(line, width));
 		};
-		const addWrapped = (text: string, maxRows = 2): void => {
-			for (const wrapped of wrapTextWithAnsi(sanitizeLine(text), Math.max(1, width)).slice(0, maxRows)) add(wrapped);
-		};
-		const section = (label: string): void => {
-			if (lines.length > 0) add();
-			add(theme.bold(theme.fg("accent", label)));
-		};
+		const label = (name: string, value: string): string =>
+			`${theme.bold(theme.fg("accent", name))} ${truncateToWidth(sanitizeLine(value), Math.max(1, width - name.length - 1))}`;
 
 		add(`${statusGlyph(ref.status)} ${theme.bold(replaceTabs(ref.displayName || ref.id))}`);
-		if (ref.displayName && ref.displayName !== ref.id) add(theme.fg("dim", ref.id));
-		const lifecycleDetails = [
+		const lifecycle = [
+			statusText(ref.status, ref.status),
 			metrics?.durationMs ? formatDuration(metrics.durationMs) : undefined,
 			`active ${formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))}`,
 		].filter(Boolean);
-		add(
-			`${statusText(ref.status, ref.status)}${theme.fg("dim", `${theme.sep.dot}${lifecycleDetails.join(theme.sep.dot)}`)}`,
-		);
+		add(lifecycle.join(theme.fg("dim", theme.sep.dot)));
+		add(`Registered ${formatAge(Math.max(1, Math.round((Date.now() - ref.createdAt) / 1000)))}`);
 		const modelDetails: string[] = [];
 		const modelRole = progress?.modelRole ?? ref.history?.modelRole;
 		if (modelRole && this.#settings) modelDetails.push(formatRoleBadge(modelRole, this.#settings));
@@ -1079,40 +1304,21 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		if (modelDetails.length > 0) add(modelDetails.join(theme.sep.dot));
 
 		const task = observed?.description ?? progress?.task ?? ref.activity;
-		if (task) {
-			section("Task");
-			addWrapped(task);
-		}
-
+		if (task) add(label("Task", task));
 		const current = progress?.currentTool
 			? `${progress.currentTool}${progress.currentToolArgs ? ` · ${progress.currentToolArgs}` : ""}`
-			: (progress?.lastIntent ?? ref.activity);
-		if (current) {
-			section("Current");
-			addWrapped(current);
-			if (progress?.retryState) {
-				add(theme.fg("warning", `retry ${progress.retryState.attempt}/${progress.retryState.maxAttempts}`));
-			}
+			: progress?.lastIntent;
+		if (current) add(label("Current", current));
+		add(label("Usage", metrics ? formatMetrics(metrics) : "—"));
+		if (metrics?.contextTokens !== undefined && metrics.contextWindow && rows >= 18) {
+			add(contextGauge(metrics.contextTokens, metrics.contextWindow));
 		}
-
-		section("Usage");
-		if (metrics) {
-			addWrapped(formatMetrics(metrics), 3);
-			if (metrics.contextTokens !== undefined && metrics.contextWindow) {
-				add(contextGauge(metrics.contextTokens, metrics.contextWindow));
-			}
-		} else {
-			add(theme.fg("dim", "usage —"));
-		}
-
-		section("Lineage");
 		add(
-			`Spawned by ${replaceTabs(ref.parentId ?? MAIN_AGENT_ID)}${children.length > 0 ? ` · ${children.length} children` : ""}`,
+			label(
+				"Lineage",
+				`${replaceTabs(ref.parentId ?? MAIN_AGENT_ID)}${children.length > 0 ? ` · ${children.length} children · ${formatChildIds(children, width)}` : ""}`,
+			),
 		);
-		if (children.length > 0) add(theme.fg("dim", formatChildIds(children, width)));
-		add(theme.fg("dim", `Registered ${new Date(ref.createdAt).toISOString().slice(0, 16).replace("T", " ")}Z`));
-
-		section("Changes");
 		add(
 			theme.fg(
 				"dim",
@@ -1121,6 +1327,19 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 					: "Shared workspace · per-agent LoC not attributable",
 			),
 		);
+
+		if (lines.length < rows) add();
+		if (lines.length < rows) add(theme.bold(theme.fg("accent", "Recent activity")));
+		const activityBudget = Math.max(0, rows - lines.length);
+		const activity = this.#activity.recent(ref.id, activityBudget);
+		if (activity.length === 0 && activityBudget > 0) add(theme.fg("muted", "No response or tool activity yet"));
+		else {
+			for (const event of activity) {
+				const title = event.kind === "tool" ? (event.toolName ?? event.title) : event.title;
+				const prefix = `${theme.fg("dim", activityClock(event.timestamp))} ${activityGlyph(event)} ${theme.fg("muted", title)} `;
+				add(`${prefix}${truncateToWidth(event.summary, Math.max(1, width - visibleWidth(prefix)))}`);
+			}
+		}
 
 		while (lines.length < rows) lines.push("");
 		return lines.slice(0, rows);
@@ -1200,7 +1419,15 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 	handleWheel(delta: -1 | 1): void {
 		this.#hoveredRow = null;
-		if (this.#rows.length > 0) {
+		if (this.#section === "activity") {
+			if (this.#activityRows.length > 0) {
+				this.#activityFollow = false;
+				this.#selectedActivityRow = Math.max(
+					0,
+					Math.min(this.#selectedActivityRow + delta, this.#activityRows.length - 1),
+				);
+			}
+		} else if (this.#rows.length > 0) {
 			this.#selectedRow = Math.max(0, Math.min(this.#selectedRow + delta, this.#rows.length - 1));
 		}
 		this.#requestRender();
@@ -1211,12 +1438,24 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	}
 
 	setHoverIndex(index: number | null): void {
+		if (this.#section === "activity") return;
 		if (index === this.#hoveredRow) return;
 		this.#hoveredRow = index;
 		this.#requestRender();
 	}
 
 	clickItem(index: number): void {
+		if (this.#section === "activity") {
+			if (index === this.#selectedActivityRow) {
+				const activity = this.#activityRows[index];
+				if (activity) this.openChat(activity.agentId, activity.entryId);
+				return;
+			}
+			this.#activityFollow = false;
+			this.#selectedActivityRow = index;
+			this.#requestRender();
+			return;
+		}
 		this.#hoveredRow = index;
 		if (index === this.#selectedRow) {
 			const selected = this.#rows[index];
@@ -1224,7 +1463,95 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			return;
 		}
 		this.#selectedRow = index;
+		this.#refreshActivityRows();
 		this.#requestRender();
+	}
+
+	#switchSection(section: AgentHubSection): void {
+		if (this.#section === section) return;
+		this.#section = section;
+		this.#hoveredRow = null;
+		this.#narrowDetailsOpen = false;
+		if (section === "activity") this.#refreshActivityRows();
+		this.#requestRender();
+	}
+
+	#handleActivitySearchInput(keyData: string): void {
+		if (matchesKey(keyData, "escape") || matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
+			this.#activitySearchEditing = false;
+		} else if (matchesKey(keyData, "backspace")) {
+			this.#activitySearch = this.#activitySearch.slice(0, -1);
+		} else if (keyData.length === 1 && keyData >= " " && keyData !== "\u007f") {
+			this.#activitySearch += keyData;
+		} else {
+			return;
+		}
+		this.#refreshActivityRows();
+		this.#requestRender();
+	}
+
+	#handleActivityInput(keyData: string): void {
+		if (matchesKey(keyData, "escape")) {
+			if (this.#activitySearch) {
+				this.#activitySearch = "";
+				this.#refreshActivityRows();
+				this.#requestRender();
+			} else {
+				this.#onDone();
+			}
+			return;
+		}
+		if (matchesKey(keyData, "left")) {
+			this.#switchSection("agents");
+			return;
+		}
+		if (keyData === "/") {
+			this.#activitySearchEditing = true;
+			this.#requestRender();
+			return;
+		}
+		if (keyData === " ") {
+			this.#activityFollow = !this.#activityFollow;
+			if (this.#activityFollow && this.#activityRows.length > 0) {
+				this.#selectedActivityRow = this.#activityRows.length - 1;
+			}
+			this.#requestRender();
+			return;
+		}
+		if (keyData === "f") {
+			const filters: ActivityFilter[] = ["all", "errors", "responses", "tools"];
+			this.#activityFilter = filters[(filters.indexOf(this.#activityFilter) + 1) % filters.length]!;
+			this.#refreshActivityRows();
+			this.#requestRender();
+			return;
+		}
+		if (keyData === "s") {
+			const scopes: ActivityScope[] = ["all", "agent", "subtree"];
+			this.#activityScope = scopes[(scopes.indexOf(this.#activityScope) + 1) % scopes.length]!;
+			this.#refreshActivityRows();
+			this.#requestRender();
+			return;
+		}
+		if (matchesKey(keyData, "j") || matchesSelectDown(keyData)) {
+			if (this.#activityRows.length > 0) {
+				this.#activityFollow = false;
+				this.#selectedActivityRow = Math.min(this.#selectedActivityRow + 1, this.#activityRows.length - 1);
+			}
+			this.#requestRender();
+			return;
+		}
+		if (matchesKey(keyData, "k") || matchesSelectUp(keyData)) {
+			if (this.#activityRows.length > 0) {
+				this.#activityFollow = false;
+				this.#selectedActivityRow = Math.max(this.#selectedActivityRow - 1, 0);
+			}
+			this.#requestRender();
+			return;
+		}
+		if (matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
+			const activity = this.#activityRows[this.#selectedActivityRow];
+			if (activity) this.openChat(activity.agentId, activity.entryId);
+		}
 	}
 
 	#handleTableInput(keyData: string): void {
@@ -1249,6 +1576,10 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			this.#requestRender();
 			return;
 		}
+		if (matchesKey(keyData, "right")) {
+			this.#switchSection("activity");
+			return;
+		}
 		if (matchesKey(keyData, "left")) {
 			if (this.#narrowDetailsOpen && !this.#lastRenderWasSplit) {
 				this.#narrowDetailsOpen = false;
@@ -1269,6 +1600,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			if (this.#rows.length > 0) {
 				this.#selectedRow = Math.min(this.#selectedRow + 1, this.#rows.length - 1);
 			}
+			this.#refreshActivityRows();
 			this.#requestRender();
 			return;
 		}
@@ -1276,6 +1608,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			if (this.#rows.length > 0) {
 				this.#selectedRow = Math.max(this.#selectedRow - 1, 0);
 			}
+			this.#refreshActivityRows();
 			this.#requestRender();
 			return;
 		}

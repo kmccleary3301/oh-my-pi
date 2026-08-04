@@ -177,6 +177,12 @@ export class TranscriptContainer
 	// Finalized blocks wholly before this boundary are immutable on-screen history;
 	// their previous contribution can be replayed without calling render().
 	#committedRows = 0;
+
+	/** Row where a rendered child begins, used by transcript deep-links. */
+	getChildStartRow(child: Component): number | undefined {
+		const segment = this.#segments.find(candidate => candidate.component === child);
+		return segment ? segment.startRow + segment.sep : undefined;
+	}
 	// Stable-prefix floor accumulated across renders since the last
 	// getRenderStablePrefixRows() read (see RenderStablePrefix: reading
 	// consumes the report and re-bases the baseline). Out-of-band renders

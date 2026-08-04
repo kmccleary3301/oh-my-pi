@@ -15,6 +15,7 @@ import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
+import { AgentActivityIndex, type AgentActivityRow } from "../src/activity";
 
 interface GeometryStub {
 	setRows(n: number): void;
@@ -818,6 +819,71 @@ describe("Agent hub row ordering", () => {
 
 			hub.handleInput("\x1b");
 			expect(Bun.stripANSI(hub.render(80).join("\n"))).toContain("Roster");
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("renders and operates the unified Activity view with transcript deep-links", () => {
+		geometry = stubStdoutGeometry(120);
+		geometry.setRows(28);
+		const agents = new AgentRegistry();
+		agents.register({ id: "Worker", displayName: "Worker", kind: "sub", parentId: "Main", session: null });
+		const activity = new AgentActivityIndex();
+		activity.setLive("Worker", [
+			{
+				id: "tool-error",
+				agentId: "Worker",
+				timestamp: 1_000,
+				kind: "tool",
+				title: "read",
+				summary: "src/auth.ts",
+				status: "error",
+				toolName: "read",
+				source: "live",
+			},
+			{
+				id: "response",
+				agentId: "Worker",
+				timestamp: 2_000,
+				kind: "response",
+				title: "Response",
+				summary: "Reviewed the authentication boundary",
+				status: "success",
+				entryId: "entry-42",
+				source: "transcript",
+			},
+		] satisfies AgentActivityRow[]);
+		const hub = makeHub(agents, { activity, initialSection: "activity" });
+
+		try {
+			const initial = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(initial).toContain("2 Activity");
+			expect(initial).toContain("src/auth.ts");
+			expect(initial).toContain("Reviewed the authentication boundary");
+
+			hub.handleInput("f");
+			const errors = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(errors).toContain("errors");
+			expect(errors).toContain("src/auth.ts");
+			expect(errors).not.toContain("Reviewed the authentication boundary");
+
+			hub.handleInput("f");
+			hub.handleInput("/");
+			for (const key of "authentication") hub.handleInput(key);
+			hub.handleInput("\r");
+			const searched = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(searched).toContain("responses");
+			expect(searched).toContain("authentication");
+			expect(searched).not.toContain("src/auth.ts");
+
+			const open = vi.spyOn(hub, "openChat");
+			hub.handleInput("\r");
+			expect(open).toHaveBeenCalledWith("Worker", "entry-42");
+			hub.handleInput(" ");
+			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("paused");
+			hub.handleInput("1");
+			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("Roster");
 		} finally {
 			hub.dispose();
 		}

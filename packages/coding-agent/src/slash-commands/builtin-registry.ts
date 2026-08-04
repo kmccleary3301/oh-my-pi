@@ -1527,6 +1527,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "hub",
+		description: "Open the live Agent Hub",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showAgentHub({ initialSection: "activity" });
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "branch",
 		description: "Create a new branch from a previous message",
 		handleTui: (_command, runtime) => {
