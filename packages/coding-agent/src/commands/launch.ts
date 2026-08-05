@@ -100,7 +100,7 @@ export default class Index extends Command {
 		}),
 		resume: Flags.string({
 			char: "r",
-			description: "Resume a session; interactive BreadBoard mode requires its full canonical ID",
+			description: "Resume a session (by ID prefix, path, or picker if omitted)",
 		}),
 		"session-dir": Flags.string({
 			description: "Directory for session storage and lookup",
@@ -186,7 +186,6 @@ export default class Index extends Command {
 
 	static examples = [
 		`# Interactive mode\n  ${APP_NAME}`,
-		`# Attach to an exact BreadBoard session\n  ${APP_NAME} --resume 00000000-0000-4000-8000-000000000000`,
 		`# Interactive mode with initial prompt\n  ${APP_NAME} "List all .ts files in src/"`,
 		`# Include files in initial message\n  ${APP_NAME} @prompt.md @image.png "What color is the sky?"`,
 		`# Non-interactive mode (process and exit)\n  ${APP_NAME} -p "List all .ts files in src/"`,
