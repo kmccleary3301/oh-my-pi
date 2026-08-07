@@ -4516,6 +4516,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"goal.gates": {
+		type: "array",
+		default: [],
+		ui: {
+			tab: "tasks",
+			group: "Modes",
+			label: "Goal Completion Gates",
+			description:
+				"Verifier commands that must exit 0 before a goal may be completed. Each entry: {id, label, command, required, timeoutMs}",
+		},
+	},
+
 	"title.refreshOnReplan": {
 		type: "boolean",
 		default: true,

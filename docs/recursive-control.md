@@ -92,7 +92,24 @@ Canonical preview, shadow evaluation, promotion, and rollback must go through OM
 
 The reusable `QualityGateRunner` executes host-owned verifiers and records evidence. If a required gate already failed and the workspace fingerprint has not changed, the next attempt is skipped rather than paying to rerun the same check.
 
-The runner is intentionally separate from goal/loop admission in this first campaign. The next integration should adapt it to existing OMP goals using OMP's Git and process helpers.
+The runner is wired into goal completion. Configure `goal.gates` with verifier commands and
+a goal cannot be marked complete until every required gate exits `0`:
+
+```jsonc
+"goal.gates": [
+  { "id": "tests", "label": "Unit tests", "command": "bun test", "timeoutMs": 600000 },
+  { "id": "lint", "command": "bun run check", "required": false }
+]
+```
+
+Gates default to `required: true`. When a required gate does not pass, `goal complete` is
+rejected with the failing gate's output and the goal stays active, so the agent keeps
+working instead of declaring victory. A gate that already failed on an unchanged workspace
+is reported as `skipped` — that suppresses redundant compute but is still not a pass.
+
+The workspace fingerprint covers `HEAD`, porcelain status, and the tracked diff. Content
+edits to untracked files are not captured, and outside a git worktree suppression is
+disabled entirely rather than risking a goal that can never complete.
 
 ## Safety and ownership
 

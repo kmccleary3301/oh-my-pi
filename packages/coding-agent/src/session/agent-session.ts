@@ -140,6 +140,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
+import { createGoalCompletionGateEvaluator } from "../goals/completion-gates";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -1338,6 +1339,10 @@ export class AgentSession {
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#todo.syncFromBranch();
+		const goalCompletionGates = createGoalCompletionGateEvaluator({
+			cwd: this.sessionManager.getCwd(),
+			readGates: () => this.settings.get("goal.gates"),
+		});
 		this.#goalRuntime = new GoalRuntime({
 			getState: () => this.#goalModeState,
 			setState: state => {
@@ -1375,6 +1380,7 @@ export class AgentSession {
 					{ deliverAs: message.deliverAs },
 				);
 			},
+			evaluateCompletionGates: async signal => await goalCompletionGates(signal),
 		});
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
 			this.#recordSessionExit(reason);

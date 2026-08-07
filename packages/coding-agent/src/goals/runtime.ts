@@ -2,6 +2,8 @@ import { escapeXmlText, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import goalBudgetLimitPrompt from "../prompts/goals/goal-budget-limit.md" with { type: "text" };
 import goalContinuationPrompt from "../prompts/goals/goal-continuation.md" with { type: "text" };
 import goalModeActivePrompt from "../prompts/goals/goal-mode-active.md" with { type: "text" };
+import type { GoalCompletionGateReport } from "./completion-gates";
+import { formatGoalGateFailure } from "./completion-gates";
 import type { Goal, GoalBudgetSteering, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "./state";
 
 export interface GoalRuntimeHost {
@@ -15,6 +17,11 @@ export interface GoalRuntimeHost {
 		content: string;
 		deliverAs?: "steer" | "followUp" | "nextTurn";
 	}): Promise<void>;
+	/**
+	 * Evaluate host-owned evidence gates before a goal may be completed.
+	 * Omitted when no gates are configured; completion is then unguarded as before.
+	 */
+	evaluateCompletionGates?(signal?: AbortSignal): Promise<GoalCompletionGateReport>;
 	now?(): number;
 }
 
@@ -482,6 +489,12 @@ export class GoalRuntime {
 			}
 			if (state.goal.status === "dropped") {
 				throw new Error("cannot complete a dropped goal");
+			}
+			// Evidence gate runs before any state mutation: a rejected completion must
+			// leave the goal exactly as it was so the agent keeps working on it.
+			const gateReport = await this.#host.evaluateCompletionGates?.();
+			if (gateReport && !gateReport.passed) {
+				throw new Error(formatGoalGateFailure(gateReport.results));
 			}
 			state.enabled = false;
 			state.goal.status = "complete";
