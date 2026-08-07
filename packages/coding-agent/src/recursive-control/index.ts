@@ -5,6 +5,7 @@ export * from "./config";
 export * from "./context-workspace";
 export * from "./contracts";
 export * from "./improvement-ledger";
+export * from "./mode";
 export * from "./quality-gates";
 export * from "./runtime";
 export * from "./state-store";

@@ -29,6 +29,32 @@ omp.improvements  auditable proposals and measured outcomes
 
 When disabled, the namespace remains syntactically available so persistent kernels do not need to restart, but every call fails closed with a clear feature-gate error.
 
+## Work modes
+
+`recursive.mode` selects how much of the ordinary tool slate the root keeps:
+
+| Mode | Root slate | Use |
+|---|---|---|
+| `hybrid` (default) | ordinary OMP tools **plus** `omp.*` | normal use |
+| `strict` | eval-centric slate only (`recursive.strictTools`, always including `eval`) | experiment |
+
+Strict mode forces every action through the control plane. Prime's own research reports
+mixed outcomes for eval-only roots, so it is explicit, model-aware, and reversible:
+
+```
+/recursive mode strict
+/recursive mode hybrid
+```
+
+`recursive.strictModels` gates which models may run strict, and it **ships empty on
+purpose** — no model has been benchmarked on an eval-only slate here, so claiming a
+capability list would be unfounded. Add a model id, or set `recursive.strictAllowAnyModel`
+to experiment. A refused strict request degrades to hybrid with a stated reason rather than
+failing the session.
+
+Entering strict captures the current slate and leaving restores exactly that slate, so the
+mode cannot silently discard a user's tool configuration. `/recursive off` also restores it.
+
 ## Context as data
 
 Use `omp.context.list()` or `omp.context.search()` to obtain bounded references. Read only the slices needed for the current decision:

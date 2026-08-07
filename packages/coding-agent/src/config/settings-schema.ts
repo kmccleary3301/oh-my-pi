@@ -3618,6 +3618,49 @@ export const SETTINGS_SCHEMA = {
 				"Expose bounded context, retained agents, exact JSON state, budgets, and improvement proposals through omp.* inside eval",
 		},
 	},
+	"recursive.mode": {
+		type: "string",
+		default: "hybrid",
+		enum: ["hybrid", "strict"],
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Work Mode",
+			description:
+				"hybrid keeps the ordinary tool slate alongside omp.*; strict narrows the root slate to eval so the model must drive work through the control plane (experiment)",
+		},
+	},
+	"recursive.strictTools": {
+		type: "array",
+		default: ["eval"],
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Strict Root Tools",
+			description: "Root tool slate used in strict mode. eval is always included",
+		},
+	},
+	"recursive.strictModels": {
+		type: "array",
+		default: [],
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Strict Mode Models",
+			description:
+				"Model ids allowed to run strict mode. Intentionally empty: no model has been benchmarked on an eval-only slate yet",
+		},
+	},
+	"recursive.strictAllowAnyModel": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Strict Mode Any Model",
+			description: "Bypass the strict-mode model allowlist for experiments",
+		},
+	},
 	"recursive.context.maxItems": {
 		type: "number",
 		default: 50,
