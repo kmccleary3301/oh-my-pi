@@ -40,6 +40,8 @@ import type { InteractiveModeContext } from "../../modes/types";
 import { computeContextBreakdown, renderContextUsage } from "../../modes/utils/context-usage";
 import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
+import { AgentRegistry } from "../../registry/agent-registry";
+import { buildAgentUsageTree, formatAgentUsageTree } from "../../registry/agent-usage-tree";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
@@ -312,6 +314,35 @@ export class CommandController {
 			}
 			if (normalizedPremiumRequests > 0) {
 				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
+			}
+		}
+
+		// Session statistics fold in direct task results but never a grandchild's
+		// spend, so a recursive run looks far cheaper than it was. Report the
+		// reconstructed lineage tree whenever this session actually has descendants.
+		{
+			const rootId = this.ctx.session.getAgentId() ?? "Main";
+			const tree = buildAgentUsageTree(AgentRegistry.global(), this.ctx.session, rootId);
+			if (tree.descendantCount > 0) {
+				info += `\n${theme.bold("Agent Tree")}\n`;
+				info += `${theme.fg("dim", "Descendants:")} ${tree.descendantCount}\n`;
+				info += `${theme.fg("dim", "Own:")} ${tree.own.totalTokens.toLocaleString()} tokens\n`;
+				info += `${theme.fg("dim", "Descendant:")} ${tree.descendants.totalTokens.toLocaleString()} tokens\n`;
+				info += `${theme.fg("dim", "Total:")} ${tree.total.totalTokens.toLocaleString()} tokens\n`;
+				if (tree.total.cost > 0) {
+					info += `${theme.fg("dim", "Tree Cost:")} ${tree.total.cost.toFixed(4)}\n`;
+				}
+				if (tree.total.premiumRequests > 0) {
+					info += `${theme.fg("dim", "Tree Premium:")} ${tree.total.premiumRequests.toLocaleString()}\n`;
+				}
+				const usingSubscription = model ? this.ctx.session.modelRegistry.isUsingOAuth(model) : false;
+				if (usingSubscription && tree.total.cost > 0) {
+					info += `${theme.fg("dim", "Subscription-backed: cost is catalog-equivalent, not billed.")}\n`;
+				}
+				info += `\n`;
+				for (const line of formatAgentUsageTree(tree)) {
+					info += `${theme.fg("dim", line)}\n`;
+				}
 			}
 		}
 

@@ -6,6 +6,8 @@
  * owned by OMP.
  */
 
+import type { AgentUsageNode, AgentUsageTotals } from "../registry/agent-usage-tree";
+
 export const RECURSIVE_CONTROL_VERSION = 1 as const;
 
 export type RecursiveJsonPrimitive = string | number | boolean | null;
@@ -125,26 +127,13 @@ export interface RetainedAgentObservation {
 	transcript?: RecursiveContextSlice;
 }
 
-export interface RecursiveUsageTotals {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	totalTokens: number;
-	cost: number;
-	requests: number;
-	tools: number;
-	durationMs: number;
-}
-
-export interface RecursiveUsageNode {
-	agentId: string;
-	status: string;
-	own: RecursiveUsageTotals;
-	descendants: RecursiveUsageTotals;
-	total: RecursiveUsageTotals;
-	children: RecursiveUsageNode[];
-}
+/**
+ * The eval-facing usage shapes are exactly the host agent-usage tree, aliased so
+ * the two surfaces cannot drift. `omp.budget` and `/session` report identical
+ * numbers from one builder.
+ */
+export type RecursiveUsageTotals = AgentUsageTotals;
+export type RecursiveUsageNode = AgentUsageNode;
 
 export interface RecursiveBudgetSnapshot {
 	version: typeof RECURSIVE_CONTROL_VERSION;

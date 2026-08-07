@@ -78,6 +78,10 @@ Session and project scopes are supported. Writes are private, atomic, and confli
 
 `omp.budget.status()` reports root and descendant usage together. Configured token, cost, wall-time, and handle limits are host-owned and checked before new retained-agent admission.
 
+The same tree is available without enabling recursive control. `/session` prints an **Agent Tree** section whenever the current session has descendants, showing own, descendant, and total tokens plus each agent's status and model. Session statistics alone fold in direct task results but never a grandchild's spend, so root-only counts understate any recursive run; the tree is reconstructed from Agent Registry lineage and is the only complete rollup.
+
+Cost carries a deliberate caveat: for subscription-backed providers the reported figure is a catalog-equivalent estimate, not an amount billed, and `premiumRequests` is the separate subscription meter. Neither is presented as money charged.
+
 ## Improvement Ledger
 
 The model can propose improvements to memory, skills, agent definitions, rules, or supplemental policy. The ledger records evidence, base fingerprints, validation plans, revisions, and measured outcomes. It does not apply changes.
