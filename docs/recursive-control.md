@@ -170,6 +170,13 @@ one. The verdict is conservative by construction:
 - success unchanged and nothing regressed → `collect-more-data`, because harmless is not an improvement
 - success rose → `promote`, with any secondary regressions recorded on the outcome
 
+The evaluator is pure and collects nothing itself. Metaharness supplies the samples: it
+already runs arms, already tags them `baseline` vs `variant`, and already stores per-task
+outcomes, so `shadowEvaluateExperiment(store, experimentId)` in `@oh-my-pi/pi-metaharness`
+turns a recorded experiment into a verdict. Only decided trials count — a trial still
+running is dropped rather than scored as a failure, which would penalise whichever arm is
+simply slower to finish.
+
 ### Measured promotion
 
 Reaching `applied-project` or `promoted` requires all of:
