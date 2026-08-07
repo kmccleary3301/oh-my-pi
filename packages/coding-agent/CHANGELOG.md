@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in, OMP-native recursive-control plane for persistent eval runtimes. `recursive.enabled` exposes a bounded `omp` namespace for context-as-data queries, retained task-agent handles, native tool calls, JSON-only session/project control state, root-plus-descendant budget accounting, and auditable improvement proposals. The implementation remains disabled by default, reuses OMP's existing sessions/tools/Agent Registry/worktrees/permissions, and does not launch Prime Agent or any nested harness.
+
 ## [17.2.10] - 2026-08-06
 
 ### Breaking Changes

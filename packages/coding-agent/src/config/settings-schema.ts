@@ -3605,6 +3605,88 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Prime-derived recursive control plane. Disabled by default; when disabled
+	// the eval prelude remains present but every omp.* call fails closed.
+	"recursive.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Control",
+			description:
+				"Expose bounded context, retained agents, exact JSON state, budgets, and improvement proposals through omp.* inside eval",
+		},
+	},
+	"recursive.context.maxItems": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Context Items",
+			description: "Maximum references returned by one omp.context list or search call",
+		},
+	},
+	"recursive.context.maxChars": {
+		type: "number",
+		default: 8192,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Context Characters",
+			description: "Maximum text returned by one omp.context read or agent observation",
+		},
+	},
+	"recursive.context.materializeMaxChars": {
+		type: "number",
+		default: 262144,
+	},
+	"recursive.maxHandles": {
+		type: "number",
+		default: 8,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Agent Handles",
+			description: "Maximum retained eval-created agents owned by one session",
+		},
+	},
+	"recursive.maxTotalTokens": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Token Limit",
+			description: "Maximum root-plus-descendant tokens; 0 disables this limit",
+		},
+	},
+	"recursive.maxCostUsd": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Cost Limit",
+			description: "Maximum root-plus-descendant API cost in USD; 0 disables this limit",
+		},
+	},
+	"recursive.maxWallTimeMs": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Recursive Wall-Time Limit",
+			description: "Maximum recursive runtime in milliseconds; 0 disables this limit",
+		},
+	},
+	"recursive.state.maxBytes": {
+		type: "number",
+		default: 262144,
+	},
+
 	// Runtime knobs (consumed by eval backends and the /python slash command)
 	"python.kernelMode": {
 		type: "enum",
