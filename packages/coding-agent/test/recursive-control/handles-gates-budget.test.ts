@@ -68,6 +68,7 @@ const config: RecursiveControlConfig = {
 	contextMaxChars: 1024,
 	contextMaterializeMaxChars: 4096,
 	maxHandles: 1,
+	wakeIntervalMs: 30_000,
 	maxTotalTokens: 100,
 	maxCostUsd: 1,
 	maxWallTimeMs: null,

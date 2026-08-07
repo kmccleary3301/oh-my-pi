@@ -31,6 +31,12 @@ export interface ResidentSessionSchedule {
 	wakeAt: string;
 	/** Optional repeat interval; a due record reschedules by this many ms. */
 	everyMs?: number;
+	/**
+	 * Message delivered to the retained agent when the wake fires. A schedule with no
+	 * prompt is a due-time marker only: `claimDue` still reports it, but there is
+	 * nothing to say to the agent, so nothing is sent.
+	 */
+	prompt?: string;
 }
 
 export interface ResidentSessionRecord {
@@ -269,7 +275,9 @@ export class ResidentSessionRegistry {
 				const updated: ResidentSessionRecord = {
 					...rest,
 					...(everyMs !== undefined
-						? { schedule: { wakeAt: new Date(nowMs + everyMs).toISOString(), everyMs } }
+						? // Carry the whole schedule forward; rebuilding it from wakeAt/everyMs
+							// alone would silently drop the prompt on every repeat.
+							{ schedule: { ...record.schedule, wakeAt: new Date(nowMs + everyMs).toISOString() } }
 						: {}),
 					updatedAt: new Date(nowMs).toISOString(),
 				};

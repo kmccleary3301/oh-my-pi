@@ -348,9 +348,11 @@ function residentSchedule(value: unknown): ResidentSessionSchedule | null {
 	if (value === undefined || value === null) return null;
 	const record = asRecord(value, "schedule");
 	const everyMs = optionalNumber(record.everyMs, "schedule.everyMs");
+	const prompt = optionalString(record.prompt, "schedule.prompt")?.trim();
 	return {
 		wakeAt: requiredString(record.wakeAt, "schedule.wakeAt"),
 		...(everyMs !== undefined ? { everyMs } : {}),
+		...(prompt ? { prompt } : {}),
 	};
 }
 
@@ -414,6 +416,7 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 					"resident.detach",
 					"resident.schedule",
 					"resident.claimDue",
+					"resident.tick",
 					"resident.forget",
 				],
 			};
@@ -558,9 +561,12 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 		case "resident.get":
 			result = await runtime.resident.get(requiredString(params.handle, "handle"));
 			break;
-		case "resident.register":
-			result = await runtime.resident.register(residentRegister(params));
+		case "resident.register": {
+			const registered = await runtime.resident.register(residentRegister(params));
+			if (registered.schedule) runtime.wakes.arm();
+			result = registered;
 			break;
+		}
 		case "resident.attach":
 			result = await runtime.resident.attach(
 				requiredString(params.handle, "handle"),
@@ -578,11 +584,18 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 				passivate: params.passivate === true,
 			});
 			break;
-		case "resident.schedule":
-			result = await runtime.resident.schedule(
+		case "resident.schedule": {
+			const scheduled = await runtime.resident.schedule(
 				requiredString(params.handle, "handle"),
 				residentSchedule(params.schedule),
 			);
+			// Arming here keeps the poll loop off until a schedule actually exists.
+			if (scheduled.schedule) runtime.wakes.arm();
+			result = scheduled;
+			break;
+		}
+		case "resident.tick":
+			result = await runtime.wakes.tick();
 			break;
 		case "resident.claimDue":
 			result = await runtime.resident.claimDue();

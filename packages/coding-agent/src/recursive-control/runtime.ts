@@ -7,6 +7,7 @@ import { resolveRecursiveControlConfig } from "./config";
 import { ContextWorkspace } from "./context-workspace";
 import { ImprovementLedger } from "./improvement-ledger";
 import { ResidentSessionRegistry } from "./resident-sessions";
+import { ResidentWakeScheduler } from "./resident-wakes";
 import { RecursiveStateStore } from "./state-store";
 
 interface RuntimeRecord {
@@ -54,6 +55,7 @@ export class RecursiveControlRuntime {
 	readonly budget: RecursiveBudgetLedger;
 	readonly resident: ResidentSessionRegistry;
 	#disposed = false;
+	readonly wakes: ResidentWakeScheduler;
 
 	constructor(session: ToolSession, config: RecursiveControlConfig) {
 		if (!config.enabled)
@@ -73,6 +75,23 @@ export class RecursiveControlRuntime {
 		this.improvements = new ImprovementLedger(session);
 		this.budget = new RecursiveBudgetLedger(session, config, this.agents);
 		this.resident = new ResidentSessionRegistry(session);
+		this.wakes = new ResidentWakeScheduler(
+			this.resident,
+			{
+				send: async (handle, message) => {
+					await this.agents.send({ handle, message });
+				},
+				status: handle => {
+					// A handle dropped from the manager is gone, not idle.
+					try {
+						return this.agents.status(handle).status;
+					} catch {
+						return undefined;
+					}
+				},
+			},
+			{ intervalMs: config.wakeIntervalMs },
+		);
 		this.agents.setAdmissionCheck(() => this.budget.assertCanSpawn());
 	}
 
@@ -87,6 +106,7 @@ export class RecursiveControlRuntime {
 	async dispose(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.wakes.dispose();
 		await this.agents.dispose();
 	}
 }

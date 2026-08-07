@@ -3661,6 +3661,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Bypass the strict-mode model allowlist for experiments",
 		},
 	},
+	"recursive.wakeIntervalMs": {
+		type: "number",
+		default: 30000,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Resident Wake Poll",
+			description:
+				"How often to check for due resident-session wakes. Polling runs only while at least one schedule exists",
+		},
+	},
 	"recursive.context.maxItems": {
 		type: "number",
 		default: 50,

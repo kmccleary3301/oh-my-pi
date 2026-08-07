@@ -6,6 +6,7 @@ export interface RecursiveControlConfig {
 	contextMaxChars: number;
 	contextMaterializeMaxChars: number;
 	maxHandles: number;
+	wakeIntervalMs: number;
 	maxTotalTokens: number | null;
 	maxCostUsd: number | null;
 	maxWallTimeMs: number | null;
@@ -30,6 +31,7 @@ export function resolveRecursiveControlConfig(session: ToolSession): RecursiveCo
 			262_144,
 		),
 		maxHandles: positiveInteger(session.settings.get("recursive.maxHandles"), 8),
+		wakeIntervalMs: positiveInteger(session.settings.get("recursive.wakeIntervalMs"), 30_000),
 		maxTotalTokens: optionalPositive(session.settings.get("recursive.maxTotalTokens")),
 		maxCostUsd: optionalPositive(session.settings.get("recursive.maxCostUsd")),
 		maxWallTimeMs: optionalPositive(session.settings.get("recursive.maxWallTimeMs")),

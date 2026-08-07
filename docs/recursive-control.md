@@ -120,6 +120,30 @@ owner's lease is still live — two processes driving one agent would interleave
 single transcript. Repeating schedules roll forward as they are claimed, so one due check
 cannot fire the same wake twice.
 
+### Scheduled wakes
+
+A schedule may carry a `prompt`. When the wake fires, that prompt is delivered to the
+retained agent as a message — this is what makes a schedule a heartbeat rather than a
+stored timestamp:
+
+```js
+await omp.resident.schedule(handle, { wakeAt, everyMs: 300_000, prompt: "status?" });
+```
+
+Polling is lazily armed: nothing runs until a schedule exists, and the loop stops on its
+own once the last one-shot wake has fired. `recursive.wakeIntervalMs` (default 30s) sets
+the poll period, and `omp.resident.tick()` runs one poll immediately.
+
+A claimed wake is consumed whether or not it delivers. Re-firing because the agent was
+gone would spam a dead handle, so each attempt reports why it skipped:
+
+| Reason | Meaning |
+|---|---|
+| `no-prompt` | schedule is a due-time marker only |
+| `unknown-handle` | the agent manager no longer knows this handle |
+| `terminal` | the agent already finished, failed, or was released |
+| `delivery-failed` | send threw; the error is reported, not raised |
+
 ## Exact control state
 
 `omp.state` stores bounded JSON values outside the active context:

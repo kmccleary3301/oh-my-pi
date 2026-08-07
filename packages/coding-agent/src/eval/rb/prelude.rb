@@ -647,6 +647,7 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     def detach(handle, passivate: false) = __omp_recursive_call("resident.detach", { "handle" => handle, "passivate" => passivate })
     def schedule(handle, schedule = nil) = __omp_recursive_call("resident.schedule", { "handle" => handle, "schedule" => schedule })
     def claim_due = __omp_recursive_call("resident.claimDue", {})
+    def tick = __omp_recursive_call("resident.tick", {})
     def forget(handle) = __omp_recursive_call("resident.forget", { "handle" => handle })
   end
 

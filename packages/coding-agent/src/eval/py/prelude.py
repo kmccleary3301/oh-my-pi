@@ -854,6 +854,9 @@ if "__omp_prelude_loaded__" not in globals():
         def claim_due(self):
             return _recursive_call("resident.claimDue")
 
+        def tick(self):
+            return _recursive_call("resident.tick")
+
         def forget(self, handle):
             return _recursive_call("resident.forget", handle=handle)
 

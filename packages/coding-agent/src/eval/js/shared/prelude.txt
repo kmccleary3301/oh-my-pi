@@ -294,6 +294,7 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			detach: (handle, options = {}) => __recursiveCall("resident.detach", { handle, ...options }),
 			schedule: (handle, schedule) => __recursiveCall("resident.schedule", { handle, schedule }),
 			claimDue: () => __recursiveCall("resident.claimDue"),
+			tick: () => __recursiveCall("resident.tick"),
 			forget: handle => __recursiveCall("resident.forget", { handle }),
 		},
 	};

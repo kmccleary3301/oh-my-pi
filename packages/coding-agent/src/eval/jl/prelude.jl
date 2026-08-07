@@ -842,6 +842,7 @@ function Base.getproperty(::OmpRecursiveNamespace, sym::Symbol)
             detach = (handle, passivate=false) -> __omp_recursive_call("resident.detach", Dict("handle" => handle, "passivate" => passivate)),
             schedule = (handle, schedule=nothing) -> __omp_recursive_call("resident.schedule", Dict("handle" => handle, "schedule" => schedule)),
             claim_due = () -> __omp_recursive_call("resident.claimDue", Dict()),
+            tick = () -> __omp_recursive_call("resident.tick", Dict()),
             forget = handle -> __omp_recursive_call("resident.forget", Dict("handle" => handle)),
         )
     elseif sym === :capabilities

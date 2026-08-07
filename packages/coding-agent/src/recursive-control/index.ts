@@ -8,6 +8,7 @@ export * from "./improvement-ledger";
 export * from "./mode";
 export * from "./quality-gates";
 export * from "./resident-sessions";
+export * from "./resident-wakes";
 export * from "./runtime";
 export * from "./shadow-evaluation";
 export * from "./state-store";
