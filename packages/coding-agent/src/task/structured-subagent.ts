@@ -110,6 +110,8 @@ export interface StructuredSubagentRequest {
 	enableLsp?: boolean;
 	/** Explicitly pass false for plan mode or invocation kinds that must not use IRC. */
 	enableIrc?: boolean;
+	/** Called after OMP reserves the stable agent id and before child execution begins. */
+	onReserved?: (id: string) => void;
 	/** `0` disables executor wall-clock timeout. Undefined inherits settings. */
 	maxRuntimeMs?: number;
 	signal?: AbortSignal;
@@ -557,6 +559,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
+		request.onReserved?.(id);
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;

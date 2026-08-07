@@ -581,4 +581,31 @@ describe("structured subagent primitive", () => {
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+
+	it("invokes onReserved with the stable agent id before subprocess execution begins", async () => {
+		mockDiscovery();
+		const events: string[] = [];
+		const reserved = Promise.withResolvers<string>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			events.push(`run:${options.id}`);
+			return { ...result(), id: options.id };
+		});
+
+		const settled = await runStructuredSubagent(
+			request({
+				retainArtifacts: true,
+				onReserved: id => {
+					events.push(`reserved:${id}`);
+					reserved.resolve(id);
+				},
+			}),
+		);
+
+		const reservedId = await reserved.promise;
+		expect(reservedId.length).toBeGreaterThan(0);
+		expect(events[0]).toBe(`reserved:${reservedId}`);
+		expect(events[1]).toBe(`run:${reservedId}`);
+		expect(settled.result.id).toBe(reservedId);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
 });
