@@ -806,8 +806,12 @@ function Base.getproperty(::OmpRecursiveImprovements, sym::Symbol)
         return id -> __omp_recursive_call("improvements.get", Dict("id" => id))
     elseif sym === :outcomes
         return proposal_id -> __omp_recursive_call("improvements.outcomes", Dict("proposalId" => proposal_id))
+    elseif sym === :preview
+        return (id, current_base_fingerprint=nothing) -> __omp_recursive_call("improvements.preview", Dict("id" => id, "currentBaseFingerprint" => current_base_fingerprint))
+    elseif sym === :evaluate_shadow
+        return (; kwargs...) -> __omp_recursive_call("improvements.evaluateShadow", Dict(string(k) => v for (k, v) in kwargs))
     elseif sym === :transition
-        return (id, status, expected_revision) -> __omp_recursive_call("improvements.transition", Dict("id" => id, "status" => status, "expectedRevision" => expected_revision))
+        return (id, status, expected_revision, promotion=nothing) -> __omp_recursive_call("improvements.transition", Dict("id" => id, "status" => status, "expectedRevision" => expected_revision, "promotion" => promotion))
     elseif sym === :record_outcome
         return (outcome, expected_revision) -> __omp_recursive_call("improvements.recordOutcome", merge(Dict(string(k) => v for (k, v) in outcome), Dict("expectedRevision" => expected_revision)))
     end

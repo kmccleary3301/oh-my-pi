@@ -817,8 +817,14 @@ if "__omp_prelude_loaded__" not in globals():
         def outcomes(self, proposal_id):
             return _recursive_call("improvements.outcomes", proposalId=proposal_id)
 
-        def transition(self, proposal_id, status, expected_revision):
-            return _recursive_call("improvements.transition", id=proposal_id, status=status, expectedRevision=expected_revision)
+        def preview(self, proposal_id, current_base_fingerprint=None):
+            return _recursive_call("improvements.preview", id=proposal_id, currentBaseFingerprint=current_base_fingerprint)
+
+        def evaluate_shadow(self, **runs):
+            return _recursive_call("improvements.evaluateShadow", **runs)
+
+        def transition(self, proposal_id, status, expected_revision, promotion=None):
+            return _recursive_call("improvements.transition", id=proposal_id, status=status, expectedRevision=expected_revision, promotion=promotion)
 
         def record_outcome(self, expected_revision, **outcome):
             return _recursive_call("improvements.recordOutcome", expectedRevision=expected_revision, **outcome)

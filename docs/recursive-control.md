@@ -112,7 +112,39 @@ Cost carries a deliberate caveat: for subscription-backed providers the reported
 
 The model can propose improvements to memory, skills, agent definitions, rules, or supplemental policy. The ledger records evidence, base fingerprints, validation plans, revisions, and measured outcomes. It does not apply changes.
 
-Canonical preview, shadow evaluation, promotion, and rollback must go through OMP's existing asset stores and metaharness. A model cannot self-authorize a global harness mutation.
+Canonical apply and rollback still go through OMP's existing asset stores. A model cannot self-authorize a global harness mutation.
+
+### Preview
+
+`omp.improvements.preview(id, currentBaseFingerprint)` is a read: it returns the proposal, its
+outcomes, whether the base moved since the proposal was written, and the list of blockers still
+standing between it and promotion. Omitting the fingerprint does not assume freshness — it is
+reported as its own blocker.
+
+### Shadow evaluation
+
+`omp.improvements.evaluateShadow({ baseline, candidate, holdoutRunIds })` derives a
+recommendation from measured runs instead of accepting an asserted one. Success rate is the
+primary metric; cost, wall time, tokens, and interventions can block a promotion but never buy
+one. The verdict is conservative by construction:
+
+- fewer than three runs per arm, or no success signal → `collect-more-data`
+- success rate fell → `reject`
+- success unchanged, with a secondary regression → `reject`
+- holdout runs declared but no candidate covered them → `collect-more-data`
+- success unchanged and nothing regressed → `collect-more-data`, because harmless is not an improvement
+- success rose → `promote`, with any secondary regressions recorded on the outcome
+
+### Measured promotion
+
+Reaching `applied-project` or `promoted` requires all of:
+
+- a recorded outcome recommending `promote`
+- `project` or `user` scope; a session-scoped proposal cannot silently widen
+- a reviewer different from the proposal's author, so the ledger is not a rubber stamp
+- a rollback artifact with a URI and a fingerprint
+
+The reviewer and rollback are stored on the proposal as `promotion`, alongside the timestamp.
 
 ## Quality gates
 

@@ -277,8 +277,11 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			list: (options = {}) => __recursiveCall("improvements.list", options),
 			get: id => __recursiveCall("improvements.get", { id }),
 			outcomes: proposalId => __recursiveCall("improvements.outcomes", { proposalId }),
-			transition: (id, status, expectedRevision) =>
-				__recursiveCall("improvements.transition", { id, status, expectedRevision }),
+			preview: (id, currentBaseFingerprint) =>
+				__recursiveCall("improvements.preview", { id, currentBaseFingerprint }),
+			evaluateShadow: (runs = {}) => __recursiveCall("improvements.evaluateShadow", runs),
+			transition: (id, status, expectedRevision, promotion) =>
+				__recursiveCall("improvements.transition", { id, status, expectedRevision, promotion }),
 			recordOutcome: (outcome, expectedRevision) =>
 				__recursiveCall("improvements.recordOutcome", { ...outcome, expectedRevision }),
 		},

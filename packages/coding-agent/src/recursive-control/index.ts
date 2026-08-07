@@ -8,4 +8,5 @@ export * from "./improvement-ledger";
 export * from "./mode";
 export * from "./quality-gates";
 export * from "./runtime";
+export * from "./shadow-evaluation";
 export * from "./state-store";

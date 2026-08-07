@@ -626,8 +626,12 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     def list(status: nil) = __omp_recursive_call("improvements.list", status.nil? ? {} : { "status" => status })
     def get(id) = __omp_recursive_call("improvements.get", { "id" => id })
     def outcomes(proposal_id) = __omp_recursive_call("improvements.outcomes", { "proposalId" => proposal_id })
-    def transition(id, status, expected_revision:)
-      __omp_recursive_call("improvements.transition", { "id" => id, "status" => status, "expectedRevision" => expected_revision })
+    def preview(id, current_base_fingerprint: nil)
+      __omp_recursive_call("improvements.preview", { "id" => id, "currentBaseFingerprint" => current_base_fingerprint })
+    end
+    def evaluate_shadow(**runs) = __omp_recursive_call("improvements.evaluateShadow", runs.transform_keys(&:to_s))
+    def transition(id, status, expected_revision:, promotion: nil)
+      __omp_recursive_call("improvements.transition", { "id" => id, "status" => status, "expectedRevision" => expected_revision, "promotion" => promotion })
     end
     def record_outcome(expected_revision:, **outcome)
       __omp_recursive_call("improvements.recordOutcome", outcome.transform_keys(&:to_s).merge("expectedRevision" => expected_revision))

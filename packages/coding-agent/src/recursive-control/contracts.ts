@@ -7,6 +7,7 @@
  */
 
 import type { AgentUsageNode, AgentUsageTotals } from "../registry/agent-usage-tree";
+import type { ImprovementMetricDeltas, ImprovementRecommendation } from "./shadow-evaluation";
 
 export const RECURSIVE_CONTROL_VERSION = 1 as const;
 
@@ -208,21 +209,43 @@ export interface ImprovementProposal extends ImprovementProposalInput {
 	updatedAt: string;
 	createdBy: string;
 	outcomeIds: string[];
+	/** Set once the proposal is promoted beyond session scope. */
+	promotion?: ImprovementPromotion;
+}
+
+/**
+ * Evidence required before a proposal may leave the session scope. A promotion is
+ * an action taken by someone other than the proposer, with a way back.
+ */
+export interface ImprovementPromotionInput {
+	/** Actor accountable for the promotion. Must differ from the proposal's author. */
+	reviewer: string;
+	/** Artifact needed to undo the change; promotion without a way back is not allowed. */
+	rollback: { uri: string; fingerprint: string };
+	note?: string;
+}
+
+export interface ImprovementPromotion extends ImprovementPromotionInput {
+	at: string;
+}
+
+/** What a proposal still needs before it can be promoted. */
+export interface ImprovementPreview {
+	proposal: ImprovementProposal;
+	outcomes: ImprovementOutcome[];
+	/** True when the base moved after the proposal was written, so the patch may not apply. */
+	stale: boolean;
+	/** Empty means the proposal is promotable now. */
+	blockers: string[];
 }
 
 export interface ImprovementOutcomeInput {
 	proposalId: string;
 	baselineRuns: string[];
 	candidateRuns: string[];
-	metrics: {
-		successDelta?: number;
-		costDeltaUsd?: number;
-		wallTimeDeltaMs?: number;
-		tokenDelta?: number;
-		interventionDelta?: number;
-	};
+	metrics: ImprovementMetricDeltas;
 	regressions?: Array<{ metric: string; delta: number; note?: string }>;
-	recommendation: "promote" | "reject" | "collect-more-data";
+	recommendation: ImprovementRecommendation;
 }
 
 export interface ImprovementOutcome extends ImprovementOutcomeInput {

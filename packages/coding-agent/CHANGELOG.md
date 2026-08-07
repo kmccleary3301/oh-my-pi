@@ -8,6 +8,8 @@
 - Surfaced total-tree agent usage outside eval. `/session` now reports own, descendant, and total tokens plus the agent lineage whenever the session has descendants, so recursive and subagent-heavy runs no longer look cheaper than they were. Subscription-backed cost is labeled catalog-equivalent rather than billed.
 - Added evidence-gated goal completion. `goal.gates` configures verifier commands that must exit `0` before `goal complete` is accepted; a failing gate rejects the completion with its output and leaves the goal active. A gate that already failed on an unchanged workspace is reported as skipped rather than rerun, and skipped never counts as passed.
 - Added `recursive.mode` with `hybrid` (ordinary tools plus `omp.*`) and `strict` (eval-centric root slate) work modes, selectable via `/recursive mode`. Strict mode is gated by the `recursive.strictModels` allowlist, which ships empty pending benchmark evidence, with `recursive.strictAllowAnyModel` as an explicit override. Entering strict captures the existing tool slate and leaving restores it.
+- Added Improvement Ledger preview and shadow evaluation. `omp.improvements.preview` reports base staleness and the blockers remaining before promotion without mutating anything, and `omp.improvements.evaluateShadow` derives a promote/reject/collect-more-data recommendation from measured baseline and candidate runs rather than accepting an asserted one.
+- Gated improvement promotion on measured, reviewed evidence. Reaching `applied-project` or `promoted` now additionally requires project or user scope, a reviewer other than the proposal's author, and a rollback artifact, all recorded on the proposal.
 
 ## [17.2.10] - 2026-08-06
 

@@ -81,8 +81,12 @@ describe("recursive state and Improvement Ledger", () => {
 		expect(await ledger.outcomes(proposal.id)).toHaveLength(1);
 		const refreshed = await ledger.get(proposal.id);
 		expect(refreshed).not.toBeNull();
-		const applied = await ledger.transition(proposal.id, "applied-project", refreshed!.revision);
+		const applied = await ledger.transition(proposal.id, "applied-project", refreshed!.revision, {
+			reviewer: "Reviewer",
+			rollback: { uri: "skill://reviewer@sha256:base", fingerprint: "sha256:base" },
+		});
 		expect(applied.status).toBe("applied-project");
+		expect(applied.promotion?.reviewer).toBe("Reviewer");
 	});
 
 	test("rejects outcomes before validation and non-finite metrics", async () => {

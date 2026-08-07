@@ -4,6 +4,9 @@ import { normalizeRecursiveJson, recursiveId } from "./canonical";
 import type {
 	ImprovementOutcome,
 	ImprovementOutcomeInput,
+	ImprovementPreview,
+	ImprovementPromotion,
+	ImprovementPromotionInput,
 	ImprovementProposal,
 	ImprovementProposalInput,
 	ImprovementScope,
@@ -174,7 +177,37 @@ export class ImprovementLedger {
 		});
 	}
 
-	async transition(id: string, status: ImprovementStatus, expectedRevision: number): Promise<ImprovementProposal> {
+	/**
+	 * Non-mutating read of what promoting this proposal would take.
+	 *
+	 * `currentBaseFingerprint` is supplied by the caller because the ledger cannot
+	 * resolve arbitrary `baseUri` schemes; omitting it leaves staleness unknown, which
+	 * is reported as a blocker rather than assumed fresh.
+	 */
+	async preview(id: string, currentBaseFingerprint?: string): Promise<ImprovementPreview> {
+		const file = await this.#load();
+		const proposal = file.proposals[id];
+		if (!proposal) throw new Error(`Unknown improvement proposal: ${id}`);
+		const outcomes = proposal.outcomeIds.flatMap(outcomeId => {
+			const outcome = file.outcomes[outcomeId];
+			return outcome ? [outcome] : [];
+		});
+		const observed = currentBaseFingerprint?.trim();
+		const stale = observed !== undefined && observed !== proposal.baseFingerprint;
+		const blockers: string[] = [];
+		if (stale) blockers.push(`base ${proposal.baseUri} changed since the proposal was written`);
+		if (observed === undefined) blockers.push("base freshness unverified: no current fingerprint supplied");
+		if (!hasPromoteOutcome(file, proposal)) blockers.push("no recorded outcome recommends promote");
+		if (!proposal.promotion) blockers.push("no independent reviewer or rollback artifact recorded");
+		return { proposal, outcomes, stale, blockers };
+	}
+
+	async transition(
+		id: string,
+		status: ImprovementStatus,
+		expectedRevision: number,
+		promotion?: ImprovementPromotionInput,
+	): Promise<ImprovementProposal> {
 		return await withSerializedPath(this.#filePath, async () => {
 			const file = await this.#load();
 			const current = file.proposals[id];
@@ -187,14 +220,44 @@ export class ImprovementLedger {
 			if (!TRANSITIONS[current.status].includes(status)) {
 				throw new Error(`Invalid improvement transition ${current.status} -> ${status}`);
 			}
-			if ((status === "applied-project" || status === "promoted") && !hasPromoteOutcome(file, current)) {
-				throw new Error(`Improvement transition to ${status} requires a recorded promote outcome`);
+			const now = new Date().toISOString();
+			let recorded: ImprovementPromotion | undefined = current.promotion;
+			if (status === "applied-project" || status === "promoted") {
+				if (!hasPromoteOutcome(file, current)) {
+					throw new Error(`Improvement transition to ${status} requires a recorded promote outcome`);
+				}
+				// Measured promotion is scoped: a session-scoped proposal has not been
+				// evaluated against the project and must not silently widen.
+				if (status === "applied-project" && current.scope === "session") {
+					throw new Error("Improvement transition to applied-project requires project or user scope");
+				}
+				const supplied = promotion ?? current.promotion;
+				if (!supplied) {
+					throw new Error(`Improvement transition to ${status} requires a reviewer and a rollback artifact`);
+				}
+				const reviewer = requiredText(supplied.reviewer, "promotion.reviewer");
+				// Self-promotion turns the ledger into a rubber stamp.
+				if (reviewer === current.createdBy) {
+					throw new Error(
+						`Improvement promotion reviewer must differ from the proposal author ${current.createdBy}`,
+					);
+				}
+				recorded = {
+					reviewer,
+					rollback: {
+						uri: requiredText(supplied.rollback?.uri, "promotion.rollback.uri"),
+						fingerprint: requiredText(supplied.rollback?.fingerprint, "promotion.rollback.fingerprint"),
+					},
+					...(supplied.note?.trim() ? { note: supplied.note.trim() } : {}),
+					at: current.promotion?.at ?? now,
+				};
 			}
 			const updated: ImprovementProposal = {
 				...current,
 				status,
 				revision: current.revision + 1,
-				updatedAt: new Date().toISOString(),
+				updatedAt: now,
+				...(recorded ? { promotion: recorded } : {}),
 			};
 			file.proposals[id] = updated;
 			await writePrivateJson(this.#filePath, file);

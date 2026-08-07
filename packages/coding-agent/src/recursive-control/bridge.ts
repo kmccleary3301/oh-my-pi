@@ -2,6 +2,7 @@ import type { ToolSession } from "../tools";
 import { normalizeRecursiveJson } from "./canonical";
 import type {
 	ImprovementOutcomeInput,
+	ImprovementPromotionInput,
 	ImprovementProposalInput,
 	ImprovementStatus,
 	RecursiveContextListRequest,
@@ -19,6 +20,8 @@ import type {
 } from "./contracts";
 import { RECURSIVE_CONTROL_VERSION } from "./contracts";
 import { getRecursiveControlRuntime } from "./runtime";
+import type { ShadowEvaluationInput, ShadowSample } from "./shadow-evaluation";
+import { evaluateShadowRuns } from "./shadow-evaluation";
 
 export const EVAL_RECURSIVE_BRIDGE_NAME = "__recursive__";
 
@@ -292,6 +295,54 @@ function improvementOutcome(params: Record<string, unknown>): ImprovementOutcome
 	};
 }
 
+function shadowSamples(value: unknown, label: string): ShadowSample[] {
+	if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+	return value.map((item, index) => {
+		const record = asRecord(item, `${label}[${index}]`);
+		if (typeof record.success !== "boolean") throw new Error(`${label}[${index}].success must be a boolean`);
+		const costUsd = optionalNumber(record.costUsd, `${label}[${index}].costUsd`);
+		const wallTimeMs = optionalNumber(record.wallTimeMs, `${label}[${index}].wallTimeMs`);
+		const tokens = optionalNumber(record.tokens, `${label}[${index}].tokens`);
+		const interventions = optionalNumber(record.interventions, `${label}[${index}].interventions`);
+		return {
+			runId: requiredString(record.runId, `${label}[${index}].runId`),
+			success: record.success,
+			...(costUsd !== undefined ? { costUsd } : {}),
+			...(wallTimeMs !== undefined ? { wallTimeMs } : {}),
+			...(tokens !== undefined ? { tokens } : {}),
+			...(interventions !== undefined ? { interventions } : {}),
+		};
+	});
+}
+
+function improvementShadowInput(params: Record<string, unknown>): ShadowEvaluationInput {
+	const holdoutRunIds = optionalStringArray(params.holdoutRunIds, "holdoutRunIds");
+	const minRunsPerArm = optionalNumber(params.minRunsPerArm, "minRunsPerArm");
+	const regressionTolerance = optionalNumber(params.regressionTolerance, "regressionTolerance");
+	return {
+		baseline: shadowSamples(params.baseline ?? [], "baseline"),
+		candidate: shadowSamples(params.candidate ?? [], "candidate"),
+		...(holdoutRunIds ? { holdoutRunIds } : {}),
+		...(minRunsPerArm !== undefined ? { minRunsPerArm } : {}),
+		...(regressionTolerance !== undefined ? { regressionTolerance } : {}),
+	};
+}
+
+function improvementPromotion(value: unknown): ImprovementPromotionInput | undefined {
+	if (value === undefined || value === null) return undefined;
+	const record = asRecord(value, "promotion");
+	const rollback = asRecord(record.rollback, "promotion.rollback");
+	const note = optionalString(record.note, "promotion.note")?.trim();
+	return {
+		reviewer: requiredString(record.reviewer, "promotion.reviewer"),
+		rollback: {
+			uri: requiredString(rollback.uri, "promotion.rollback.uri"),
+			fingerprint: requiredString(rollback.fingerprint, "promotion.rollback.fingerprint"),
+		},
+		...(note ? { note } : {}),
+	};
+}
+
 /** Dispatch one JSON-safe recursive-control request from an eval runtime. */
 export async function runRecursiveBridge(value: unknown, options: RecursiveBridgeOptions): Promise<RecursiveJsonValue> {
 	const { method, params } = parseRequest(value);
@@ -326,6 +377,8 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 					"improvements.list",
 					"improvements.get",
 					"improvements.outcomes",
+					"improvements.preview",
+					"improvements.evaluateShadow",
 					"improvements.transition",
 					"improvements.recordOutcome",
 				],
@@ -439,6 +492,15 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 		case "improvements.outcomes":
 			result = await runtime.improvements.outcomes(requiredString(params.proposalId, "proposalId"));
 			break;
+		case "improvements.preview":
+			result = await runtime.improvements.preview(
+				requiredString(params.id, "id"),
+				optionalString(params.currentBaseFingerprint, "currentBaseFingerprint"),
+			);
+			break;
+		case "improvements.evaluateShadow":
+			result = evaluateShadowRuns(improvementShadowInput(params));
+			break;
 		case "improvements.transition":
 			result = await runtime.improvements.transition(
 				requiredString(params.id, "id"),
@@ -447,6 +509,7 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 						throw new Error("status is required");
 					})(),
 				requiredPositiveInteger(params.expectedRevision, "expectedRevision"),
+				improvementPromotion(params.promotion),
 			);
 			break;
 		case "improvements.recordOutcome":
