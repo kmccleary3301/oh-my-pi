@@ -10,6 +10,7 @@
 - Added `recursive.mode` with `hybrid` (ordinary tools plus `omp.*`) and `strict` (eval-centric root slate) work modes, selectable via `/recursive mode`. Strict mode is gated by the `recursive.strictModels` allowlist, which ships empty pending benchmark evidence, with `recursive.strictAllowAnyModel` as an explicit override. Entering strict captures the existing tool slate and leaving restores it.
 - Added Improvement Ledger preview and shadow evaluation. `omp.improvements.preview` reports base staleness and the blockers remaining before promotion without mutating anything, and `omp.improvements.evaluateShadow` derives a promote/reject/collect-more-data recommendation from measured baseline and candidate runs rather than accepting an asserted one.
 - Gated improvement promotion on measured, reviewed evidence. Reaching `applied-project` or `promoted` now additionally requires project or user scope, a reviewer other than the proposal's author, and a rollback artifact, all recorded on the proposal.
+- Added durable resident sessions. `omp.resident` persists a retained agent's identity, ownership lease, and wake schedule with the rest of the project's recursive-control state, so an agent can be detached, passivated, and later attached from a different process. Leases are exclusive, only the holder may renew or reschedule, and a lapsed lease is reported as `expired` rather than `detached` so a recovering process can tell an unclean shutdown from a clean handover.
 
 ## [17.2.10] - 2026-08-06
 

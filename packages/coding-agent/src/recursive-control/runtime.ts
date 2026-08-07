@@ -6,6 +6,7 @@ import type { RecursiveControlConfig } from "./config";
 import { resolveRecursiveControlConfig } from "./config";
 import { ContextWorkspace } from "./context-workspace";
 import { ImprovementLedger } from "./improvement-ledger";
+import { ResidentSessionRegistry } from "./resident-sessions";
 import { RecursiveStateStore } from "./state-store";
 
 interface RuntimeRecord {
@@ -51,6 +52,7 @@ export class RecursiveControlRuntime {
 	readonly state: RecursiveStateStore;
 	readonly improvements: ImprovementLedger;
 	readonly budget: RecursiveBudgetLedger;
+	readonly resident: ResidentSessionRegistry;
 	#disposed = false;
 
 	constructor(session: ToolSession, config: RecursiveControlConfig) {
@@ -70,6 +72,7 @@ export class RecursiveControlRuntime {
 		this.state = new RecursiveStateStore(session, { maxValueBytes: config.stateMaxBytes });
 		this.improvements = new ImprovementLedger(session);
 		this.budget = new RecursiveBudgetLedger(session, config, this.agents);
+		this.resident = new ResidentSessionRegistry(session);
 		this.agents.setAdmissionCheck(() => this.budget.assertCanSpawn());
 	}
 

@@ -832,6 +832,18 @@ function Base.getproperty(::OmpRecursiveNamespace, sym::Symbol)
         return (status = () -> __omp_recursive_call("budget.status"),)
     elseif sym === :improvements
         return OmpRecursiveImprovements()
+    elseif sym === :resident
+        return (
+            list = () -> __omp_recursive_call("resident.list", Dict()),
+            get = handle -> __omp_recursive_call("resident.get", Dict("handle" => handle)),
+            register = (; kwargs...) -> __omp_recursive_call("resident.register", Dict(string(k) => v for (k, v) in kwargs)),
+            attach = (handle, lease_ms=nothing) -> __omp_recursive_call("resident.attach", Dict("handle" => handle, "leaseMs" => lease_ms)),
+            renew = (handle, lease_ms=nothing) -> __omp_recursive_call("resident.renew", Dict("handle" => handle, "leaseMs" => lease_ms)),
+            detach = (handle, passivate=false) -> __omp_recursive_call("resident.detach", Dict("handle" => handle, "passivate" => passivate)),
+            schedule = (handle, schedule=nothing) -> __omp_recursive_call("resident.schedule", Dict("handle" => handle, "schedule" => schedule)),
+            claim_due = () -> __omp_recursive_call("resident.claimDue", Dict()),
+            forget = handle -> __omp_recursive_call("resident.forget", Dict("handle" => handle)),
+        )
     elseif sym === :capabilities
         return () -> __omp_recursive_call("capabilities")
     end

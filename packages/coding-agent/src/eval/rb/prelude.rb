@@ -638,8 +638,20 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     end
   end
 
+  class OmpRecursiveResident
+    def list = __omp_recursive_call("resident.list", {})
+    def get(handle) = __omp_recursive_call("resident.get", { "handle" => handle })
+    def register(**entry) = __omp_recursive_call("resident.register", entry.transform_keys(&:to_s))
+    def attach(handle, lease_ms: nil) = __omp_recursive_call("resident.attach", { "handle" => handle, "leaseMs" => lease_ms })
+    def renew(handle, lease_ms: nil) = __omp_recursive_call("resident.renew", { "handle" => handle, "leaseMs" => lease_ms })
+    def detach(handle, passivate: false) = __omp_recursive_call("resident.detach", { "handle" => handle, "passivate" => passivate })
+    def schedule(handle, schedule = nil) = __omp_recursive_call("resident.schedule", { "handle" => handle, "schedule" => schedule })
+    def claim_due = __omp_recursive_call("resident.claimDue", {})
+    def forget(handle) = __omp_recursive_call("resident.forget", { "handle" => handle })
+  end
+
   class OmpRecursiveNamespace
-    attr_reader :context, :tools, :agents, :state, :budget, :improvements
+    attr_reader :context, :tools, :agents, :state, :budget, :improvements, :resident
     def initialize
       @context = OmpRecursiveContext.new
       @tools = OmpRecursiveTools.new
@@ -647,6 +659,7 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
       @state = OmpRecursiveState.new
       @budget = OmpRecursiveBudget.new
       @improvements = OmpRecursiveImprovements.new
+      @resident = OmpRecursiveResident.new
     end
     def capabilities = __omp_recursive_call("capabilities")
   end

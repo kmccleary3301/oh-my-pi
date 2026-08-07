@@ -85,6 +85,41 @@ The handle is a projection over OMP's existing Task runtime, Agent Registry, lif
 
 The implementation returns a stable admission handle as soon as OMP reserves the child agent ID. The child's first turn continues in the background, and the caller can immediately inspect, message, wait for, cancel, or release the retained agent.
 
+## Durable resident sessions
+
+Retained handles live in the spawning process. `omp.resident` persists the identity,
+ownership lease, and wake schedule of a retained agent alongside the rest of the project's
+recursive-control state, so a later process can find an agent it did not spawn.
+
+It owns records and leases, not processes; reviving execution stays with the existing agent
+lifecycle manager.
+
+```js
+await omp.resident.register({ handle, agentId, sessionId, label: "indexer", leaseMs: 60_000 });
+await omp.resident.detach(handle);            // give up ownership, keep the agent
+await omp.resident.attach(handle);            // pick it up from another process
+await omp.resident.detach(handle, { passivate: true });  // deliberately unload
+await omp.resident.schedule(handle, { wakeAt, everyMs });
+await omp.resident.claimDue();                // records whose wake time arrived
+```
+
+A record is in exactly one state:
+
+| State | Meaning |
+|---|---|
+| `active` | an owner holds a live lease |
+| `detached` | released cleanly; free to attach |
+| `passivated` | deliberately unloaded to free resources; free to attach |
+| `expired` | the owner's lease lapsed without renewal; free to attach |
+
+`expired` is kept distinct from `detached` on purpose: it is the signal that the previous
+owner did not shut down cleanly, which is exactly what a recovering process needs to know.
+
+Only the lease holder may renew, detach, or reschedule, and `attach` is refused while another
+owner's lease is still live — two processes driving one agent would interleave turns on a
+single transcript. Repeating schedules roll forward as they are claimed, so one due check
+cannot fire the same wake twice.
+
 ## Exact control state
 
 `omp.state` stores bounded JSON values outside the active context:

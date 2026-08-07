@@ -19,6 +19,7 @@ import type {
 	RetainedAgentWaitUntil,
 } from "./contracts";
 import { RECURSIVE_CONTROL_VERSION } from "./contracts";
+import type { ResidentSessionRegisterInput, ResidentSessionSchedule } from "./resident-sessions";
 import { getRecursiveControlRuntime } from "./runtime";
 import type { ShadowEvaluationInput, ShadowSample } from "./shadow-evaluation";
 import { evaluateShadowRuns } from "./shadow-evaluation";
@@ -343,6 +344,30 @@ function improvementPromotion(value: unknown): ImprovementPromotionInput | undef
 	};
 }
 
+function residentSchedule(value: unknown): ResidentSessionSchedule | null {
+	if (value === undefined || value === null) return null;
+	const record = asRecord(value, "schedule");
+	const everyMs = optionalNumber(record.everyMs, "schedule.everyMs");
+	return {
+		wakeAt: requiredString(record.wakeAt, "schedule.wakeAt"),
+		...(everyMs !== undefined ? { everyMs } : {}),
+	};
+}
+
+function residentRegister(params: Record<string, unknown>): ResidentSessionRegisterInput {
+	const label = optionalString(params.label, "label")?.trim();
+	const leaseMs = optionalNumber(params.leaseMs, "leaseMs");
+	const schedule = residentSchedule(params.schedule);
+	return {
+		handle: requiredString(params.handle, "handle"),
+		agentId: requiredString(params.agentId, "agentId"),
+		sessionId: requiredString(params.sessionId, "sessionId"),
+		...(label ? { label } : {}),
+		...(leaseMs !== undefined ? { leaseMs } : {}),
+		...(schedule ? { schedule } : {}),
+	};
+}
+
 /** Dispatch one JSON-safe recursive-control request from an eval runtime. */
 export async function runRecursiveBridge(value: unknown, options: RecursiveBridgeOptions): Promise<RecursiveJsonValue> {
 	const { method, params } = parseRequest(value);
@@ -381,6 +406,15 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 					"improvements.evaluateShadow",
 					"improvements.transition",
 					"improvements.recordOutcome",
+					"resident.list",
+					"resident.get",
+					"resident.register",
+					"resident.attach",
+					"resident.renew",
+					"resident.detach",
+					"resident.schedule",
+					"resident.claimDue",
+					"resident.forget",
 				],
 			};
 			break;
@@ -517,6 +551,45 @@ export async function runRecursiveBridge(value: unknown, options: RecursiveBridg
 				improvementOutcome(params),
 				requiredPositiveInteger(params.expectedRevision, "expectedRevision"),
 			);
+			break;
+		case "resident.list":
+			result = await runtime.resident.list();
+			break;
+		case "resident.get":
+			result = await runtime.resident.get(requiredString(params.handle, "handle"));
+			break;
+		case "resident.register":
+			result = await runtime.resident.register(residentRegister(params));
+			break;
+		case "resident.attach":
+			result = await runtime.resident.attach(
+				requiredString(params.handle, "handle"),
+				optionalNumber(params.leaseMs, "leaseMs"),
+			);
+			break;
+		case "resident.renew":
+			result = await runtime.resident.renew(
+				requiredString(params.handle, "handle"),
+				optionalNumber(params.leaseMs, "leaseMs"),
+			);
+			break;
+		case "resident.detach":
+			result = await runtime.resident.detach(requiredString(params.handle, "handle"), {
+				passivate: params.passivate === true,
+			});
+			break;
+		case "resident.schedule":
+			result = await runtime.resident.schedule(
+				requiredString(params.handle, "handle"),
+				residentSchedule(params.schedule),
+			);
+			break;
+		case "resident.claimDue":
+			result = await runtime.resident.claimDue();
+			break;
+		case "resident.forget":
+			await runtime.resident.forget(requiredString(params.handle, "handle"));
+			result = { ok: true };
 			break;
 		default:
 			throw new Error(`Unknown recursive bridge method: ${method}`);

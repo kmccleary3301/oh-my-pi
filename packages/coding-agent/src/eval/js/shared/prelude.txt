@@ -285,6 +285,17 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			recordOutcome: (outcome, expectedRevision) =>
 				__recursiveCall("improvements.recordOutcome", { ...outcome, expectedRevision }),
 		},
+		resident: {
+			list: () => __recursiveCall("resident.list"),
+			get: handle => __recursiveCall("resident.get", { handle }),
+			register: entry => __recursiveCall("resident.register", entry),
+			attach: (handle, leaseMs) => __recursiveCall("resident.attach", { handle, leaseMs }),
+			renew: (handle, leaseMs) => __recursiveCall("resident.renew", { handle, leaseMs }),
+			detach: (handle, options = {}) => __recursiveCall("resident.detach", { handle, ...options }),
+			schedule: (handle, schedule) => __recursiveCall("resident.schedule", { handle, schedule }),
+			claimDue: () => __recursiveCall("resident.claimDue"),
+			forget: handle => __recursiveCall("resident.forget", { handle }),
+		},
 	};
 
 	const display = value => {

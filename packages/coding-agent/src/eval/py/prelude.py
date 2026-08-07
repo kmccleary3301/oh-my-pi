@@ -829,6 +829,34 @@ if "__omp_prelude_loaded__" not in globals():
         def record_outcome(self, expected_revision, **outcome):
             return _recursive_call("improvements.recordOutcome", expectedRevision=expected_revision, **outcome)
 
+    class _RecursiveResident:
+        def list(self):
+            return _recursive_call("resident.list")
+
+        def get(self, handle):
+            return _recursive_call("resident.get", handle=handle)
+
+        def register(self, **entry):
+            return _recursive_call("resident.register", **entry)
+
+        def attach(self, handle, lease_ms=None):
+            return _recursive_call("resident.attach", handle=handle, leaseMs=lease_ms)
+
+        def renew(self, handle, lease_ms=None):
+            return _recursive_call("resident.renew", handle=handle, leaseMs=lease_ms)
+
+        def detach(self, handle, passivate=False):
+            return _recursive_call("resident.detach", handle=handle, passivate=passivate)
+
+        def schedule(self, handle, schedule=None):
+            return _recursive_call("resident.schedule", handle=handle, schedule=schedule)
+
+        def claim_due(self):
+            return _recursive_call("resident.claimDue")
+
+        def forget(self, handle):
+            return _recursive_call("resident.forget", handle=handle)
+
     class _OmpRecursiveNamespace:
         context = _RecursiveContext()
         tools = _RecursiveTools()
@@ -836,6 +864,7 @@ if "__omp_prelude_loaded__" not in globals():
         state = _RecursiveState()
         budget = _RecursiveBudget()
         improvements = _RecursiveImprovements()
+        resident = _RecursiveResident()
 
         def capabilities(self):
             return _recursive_call("capabilities")
