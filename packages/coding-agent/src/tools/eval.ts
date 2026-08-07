@@ -164,6 +164,7 @@ export interface EvalToolDescriptionOptions {
 	js?: boolean;
 	rb?: boolean;
 	jl?: boolean;
+	recursive?: boolean;
 	/**
 	 * Parent spawn policy (`getSessionSpawns`). `true`/omitted means unrestricted,
 	 * `false`/`""` hides `agent()`, and a comma list drives the advertised default.
@@ -176,12 +177,14 @@ export function getEvalToolDescription(options: EvalToolDescriptionOptions = {})
 	const js = options.js ?? true;
 	const rb = options.rb ?? false;
 	const jl = options.jl ?? false;
+	const recursive = options.recursive ?? false;
 	const spawnPolicy = resolveSpawnPolicy(options.spawns ?? true);
 	return prompt.render(evalDescription, {
 		py,
 		js,
 		rb,
 		jl,
+		recursive,
 		spawns: spawnPolicy.enabled,
 		spawnDefaultAgent: spawnPolicy.defaultAgent,
 		spawnAllowedAgentsText: spawnPolicy.allowedPromptText,
@@ -301,6 +304,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			js: backends.js,
 			rb: backends.ruby,
 			jl: backends.julia,
+			recursive: this.session.settings.get("recursive.enabled") === true,
 			spawns: sessionSpawns,
 		});
 	}

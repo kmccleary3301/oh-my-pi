@@ -548,4 +548,107 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
   def budget
     $__omp_budget ||= OmpBudget.new
   end
+
+  def __omp_recursive_call(method, params = {})
+    OmpBridge.call("__recursive__", { "method" => method, "params" => params })
+  end
+
+  class OmpRecursiveContext
+    def list(**options) = __omp_recursive_call("context.list", options)
+    def search(query, **options) = __omp_recursive_call("context.search", { "query" => query }.merge(options.transform_keys(&:to_s)))
+    def read(ref, **options) = __omp_recursive_call("context.read", { "ref" => ref }.merge(options.transform_keys(&:to_s)))
+    def materialize(refs, **options) = __omp_recursive_call("context.materialize", { "refs" => refs.to_a }.merge(options.transform_keys(&:to_s)))
+  end
+
+  class OmpRecursiveTools
+    def call(name, args = {}) = __omp_recursive_call("tools.call", { "name" => name.to_s, "args" => args })
+    def method_missing(name, *args, **kwargs)
+      return super unless args.length <= 1
+      call(name, args.first || kwargs)
+    end
+    def respond_to_missing?(_name, _private = false) = true
+  end
+
+  class OmpRetainedAgent
+    attr_reader :handle
+    def initialize(value)
+      @value = value
+      @handle = value.fetch("handle")
+    end
+    def status = (@value = __omp_recursive_call("agents.status", { "handle" => @handle }))
+    alias refresh status
+    def send(message, delivery: "when-idle") = (@value = __omp_recursive_call("agents.send", { "handle" => @handle, "message" => message, "delivery" => delivery }))
+    def observe(max_chars: nil)
+      params = { "handle" => @handle }
+      params["maxChars"] = max_chars unless max_chars.nil?
+      __omp_recursive_call("agents.observe", params)
+    end
+    def wait(until_state: "terminal", timeout_ms: nil)
+      params = { "handle" => @handle, "until" => until_state }
+      params["timeoutMs"] = timeout_ms unless timeout_ms.nil?
+      @value = __omp_recursive_call("agents.wait", params)
+    end
+    def cancel = (@value = __omp_recursive_call("agents.cancel", { "handle" => @handle }))
+    def release = (@value = __omp_recursive_call("agents.release", { "handle" => @handle }))
+    def to_h = @value.dup
+    def inspect = "#<retained-agent #{@handle} status=#{@value['status']}>"
+  end
+
+  class OmpRecursiveAgents
+    def spawn(prompt, **options)
+      OmpRetainedAgent.new(__omp_recursive_call("agents.spawn", { "prompt" => prompt }.merge(options.transform_keys(&:to_s))))
+    end
+    def list = __omp_recursive_call("agents.list")
+  end
+
+  class OmpRecursiveState
+    def get(key, scope: "session") = __omp_recursive_call("state.get", { "key" => key, "scope" => scope })
+    def list(scope: "session") = __omp_recursive_call("state.list", { "scope" => scope })
+    def put(key, value, scope: "session", expected_fingerprint: nil)
+      params = { "key" => key, "value" => value, "scope" => scope }
+      params["expectedFingerprint"] = expected_fingerprint unless expected_fingerprint.nil?
+      __omp_recursive_call("state.put", params)
+    end
+    def delete(key, scope: "session", expected_fingerprint: nil)
+      params = { "key" => key, "scope" => scope }
+      params["expectedFingerprint"] = expected_fingerprint unless expected_fingerprint.nil?
+      __omp_recursive_call("state.delete", params)
+    end
+    def export(scope: "session") = __omp_recursive_call("state.export", { "scope" => scope })
+  end
+
+  class OmpRecursiveBudget
+    def status = __omp_recursive_call("budget.status")
+  end
+
+  class OmpRecursiveImprovements
+    def propose(**proposal) = __omp_recursive_call("improvements.propose", proposal.transform_keys(&:to_s))
+    def list(status: nil) = __omp_recursive_call("improvements.list", status.nil? ? {} : { "status" => status })
+    def get(id) = __omp_recursive_call("improvements.get", { "id" => id })
+    def outcomes(proposal_id) = __omp_recursive_call("improvements.outcomes", { "proposalId" => proposal_id })
+    def transition(id, status, expected_revision:)
+      __omp_recursive_call("improvements.transition", { "id" => id, "status" => status, "expectedRevision" => expected_revision })
+    end
+    def record_outcome(expected_revision:, **outcome)
+      __omp_recursive_call("improvements.recordOutcome", outcome.transform_keys(&:to_s).merge("expectedRevision" => expected_revision))
+    end
+  end
+
+  class OmpRecursiveNamespace
+    attr_reader :context, :tools, :agents, :state, :budget, :improvements
+    def initialize
+      @context = OmpRecursiveContext.new
+      @tools = OmpRecursiveTools.new
+      @agents = OmpRecursiveAgents.new
+      @state = OmpRecursiveState.new
+      @budget = OmpRecursiveBudget.new
+      @improvements = OmpRecursiveImprovements.new
+    end
+    def capabilities = __omp_recursive_call("capabilities")
+  end
+
+  def omp
+    $__omp_recursive_namespace ||= OmpRecursiveNamespace.new
+  end
+
 end

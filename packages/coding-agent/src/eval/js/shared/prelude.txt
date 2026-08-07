@@ -206,6 +206,84 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		hard: async () => Boolean((await __budgetSnap()).hard),
 	};
 
+	const __recursiveCall = async (method, params = {}) =>
+		globalThis.__omp_call_tool__("__recursive__", { method, params });
+
+	const __retainedAgent = value => {
+		if (!value || typeof value !== "object" || typeof value.handle !== "string") return value;
+		const wrapper = { ...value };
+		const update = async request => {
+			const next = await request;
+			if (next && typeof next === "object") Object.assign(wrapper, next);
+			return wrapper;
+		};
+		Object.defineProperties(wrapper, {
+			refresh: { value: () => update(__recursiveCall("agents.status", { handle: wrapper.handle })) },
+			send: {
+				value: (message, options = {}) =>
+					update(__recursiveCall("agents.send", { handle: wrapper.handle, message, ...options })),
+			},
+			observe: { value: (options = {}) => __recursiveCall("agents.observe", { handle: wrapper.handle, ...options }) },
+			wait: { value: (options = {}) => update(__recursiveCall("agents.wait", { handle: wrapper.handle, ...options })) },
+			cancel: { value: () => update(__recursiveCall("agents.cancel", { handle: wrapper.handle })) },
+			release: { value: () => update(__recursiveCall("agents.release", { handle: wrapper.handle })) },
+		});
+		return wrapper;
+	};
+
+	const recursiveTools = new Proxy(
+		{ call: (name, args = {}) => __recursiveCall("tools.call", { name, args }) },
+		{
+			get(target, prop) {
+				if (typeof prop !== "string") return undefined;
+				if (prop in target) return target[prop];
+				return async (args = {}) => __recursiveCall("tools.call", { name: prop, args });
+			},
+		},
+	);
+
+	const omp = {
+		capabilities: () => __recursiveCall("capabilities"),
+		context: {
+			list: (options = {}) => __recursiveCall("context.list", options),
+			search: (query, options = {}) => __recursiveCall("context.search", { query, ...options }),
+			read: (ref, options = {}) => __recursiveCall("context.read", { ref, ...options }),
+			materialize: (refs, options = {}) => __recursiveCall("context.materialize", { refs, ...options }),
+		},
+		tools: recursiveTools,
+		agents: {
+			spawn: async (prompt, options = {}) => __retainedAgent(await __recursiveCall("agents.spawn", { prompt, ...options })),
+			list: () => __recursiveCall("agents.list"),
+			status: handle => __recursiveCall("agents.status", { handle: typeof handle === "string" ? handle : handle.handle }),
+			send: (handle, message, options = {}) =>
+				__recursiveCall("agents.send", { handle: typeof handle === "string" ? handle : handle.handle, message, ...options }),
+			observe: (handle, options = {}) =>
+				__recursiveCall("agents.observe", { handle: typeof handle === "string" ? handle : handle.handle, ...options }),
+			wait: (handle, options = {}) =>
+				__recursiveCall("agents.wait", { handle: typeof handle === "string" ? handle : handle.handle, ...options }),
+			cancel: handle => __recursiveCall("agents.cancel", { handle: typeof handle === "string" ? handle : handle.handle }),
+			release: handle => __recursiveCall("agents.release", { handle: typeof handle === "string" ? handle : handle.handle }),
+		},
+		state: {
+			get: (key, options = {}) => __recursiveCall("state.get", { key, ...options }),
+			list: (options = {}) => __recursiveCall("state.list", options),
+			put: (key, value, options = {}) => __recursiveCall("state.put", { key, value, ...options }),
+			delete: (key, options = {}) => __recursiveCall("state.delete", { key, ...options }),
+			export: (options = {}) => __recursiveCall("state.export", options),
+		},
+		budget: { status: () => __recursiveCall("budget.status") },
+		improvements: {
+			propose: proposal => __recursiveCall("improvements.propose", proposal),
+			list: (options = {}) => __recursiveCall("improvements.list", options),
+			get: id => __recursiveCall("improvements.get", { id }),
+			outcomes: proposalId => __recursiveCall("improvements.outcomes", { proposalId }),
+			transition: (id, status, expectedRevision) =>
+				__recursiveCall("improvements.transition", { id, status, expectedRevision }),
+			recordOutcome: (outcome, expectedRevision) =>
+				__recursiveCall("improvements.recordOutcome", { ...outcome, expectedRevision }),
+		},
+	};
+
 	const display = value => {
 		globalThis.__omp_display__(value);
 	};
@@ -287,6 +365,7 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	globalThis.log = log;
 	globalThis.phase = phase;
 	globalThis.budget = budget;
+	globalThis.omp = omp;
 	globalThis.__pool = __pool;
 	globalThis.read = read;
 	globalThis.write = write;

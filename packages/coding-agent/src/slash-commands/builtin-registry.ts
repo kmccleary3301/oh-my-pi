@@ -39,6 +39,7 @@ import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-targets";
+import { disposeRecursiveControlForSettings } from "../recursive-control/runtime";
 import type { AgentSession, FreshSessionResult } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
@@ -397,6 +398,38 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "disposition", description: "Set a finding disposition with rationale" },
 		],
 		handle: handleSecurityCommand,
+	},
+	{
+		name: "recursive",
+		description: "Control the OMP-native recursive eval namespace",
+		allowArgs: true,
+		acpInputHint: "[on|off|status]",
+		subcommands: [
+			{ name: "on", description: "Enable omp.context, omp.agents, omp.state, and related eval APIs" },
+			{ name: "off", description: "Disable recursive-control bridge calls" },
+			{ name: "status", description: "Show recursive-control configuration" },
+		],
+		getTuiAutocompleteDescription: runtime =>
+			runtime.ctx.settings.get("recursive.enabled") ? "Recursive control: on" : "Recursive control: off",
+		handle: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase() || "status";
+			if (arg === "status") {
+				const enabled = runtime.settings.get("recursive.enabled") === true;
+				const maxHandles = runtime.settings.get("recursive.maxHandles");
+				const maxTokens = runtime.settings.get("recursive.maxTotalTokens");
+				await runtime.output(
+					`Recursive control: ${enabled ? "on" : "off"}\nRetained handles: ${maxHandles}\nTotal token limit: ${maxTokens || "unlimited"}`,
+				);
+				return commandConsumed();
+			}
+			if (arg !== "on" && arg !== "off") return usage("Usage: /recursive [on|off|status]", runtime);
+			const enabled = arg === "on";
+			runtime.settings.set("recursive.enabled", enabled);
+			if (!enabled) await disposeRecursiveControlForSettings(runtime.settings);
+			await runtime.notifyConfigChanged?.();
+			await runtime.output(`Recursive control: ${enabled ? "on" : "off"}`);
+			return commandConsumed();
+		},
 	},
 	{
 		name: "settings",

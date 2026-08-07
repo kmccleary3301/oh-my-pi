@@ -1,5 +1,7 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { EVAL_RECURSIVE_BRIDGE_NAME, runRecursiveBridge } from "../../recursive-control/bridge";
+import type { RecursiveJsonValue } from "../../recursive-control/contracts";
 import type { ToolSession } from "../../tools";
 import { ToolError } from "../../tools/tool-errors";
 import { EVAL_AGENT_BRIDGE_NAME, runEvalAgent } from "../agent-bridge";
@@ -17,6 +19,7 @@ interface ToolBridgeOptions {
 }
 
 type ToolValue =
+	| RecursiveJsonValue
 	| string
 	| EvalBudgetResult
 	| EvalConcurrencyResult
@@ -119,6 +122,13 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	}
 	if (name === EVAL_CONCURRENCY_BRIDGE_NAME) {
 		return runEvalConcurrency(args, options);
+	}
+	if (name === EVAL_RECURSIVE_BRIDGE_NAME) {
+		return await runRecursiveBridge(args, {
+			session: options.session,
+			...(options.signal ? { signal: options.signal } : {}),
+			invokeTool: async (toolName, toolArgs) => await callSessionTool(toolName, toolArgs, options),
+		});
 	}
 	const tool = getTool(options.session, name);
 	const normalizedArgs = normalizeArgs(args);

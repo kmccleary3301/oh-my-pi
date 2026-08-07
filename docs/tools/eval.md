@@ -9,7 +9,7 @@
 - Backend enablement: `packages/coding-agent/src/tools/eval-backends.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/eval.md`
 - Shared contracts: `packages/coding-agent/src/eval/backend.ts`, `types.ts`, `executor-base.ts`, `kernel-base.ts`
-- Host bridges: `packages/coding-agent/src/eval/agent-bridge.ts`, `completion-bridge.ts`, `concurrency-bridge.ts`, `budget-bridge.ts`
+- Host bridges: `packages/coding-agent/src/eval/agent-bridge.ts`, `completion-bridge.ts`, `concurrency-bridge.ts`, `budget-bridge.ts`, and `packages/coding-agent/src/recursive-control/bridge.ts`
 - JavaScript: `packages/coding-agent/src/eval/js/`
 - Python: `packages/coding-agent/src/eval/py/`
 - Ruby: `packages/coding-agent/src/eval/rb/`
@@ -158,6 +158,21 @@ Runs one subagent through `runStructuredSubagent(...)`:
 - Spawn policy, discovered-agent availability, the `task.maxRecursionDepth` gate (default `2`; negative values disable the cap), hard turn budget, subagent failure, strict schema failure, and isolation-apply failure are enforced as cell errors.
 
 `parallel(thunks)` runs zero-argument callables in a bounded pool and preserves input order. `pipeline(items, ...stages)` applies each stage as a barriered wave. Pool width is read live from `task.maxConcurrency`; `0` means all items at once. The lowest-index failure is propagated.
+
+### `omp` recursive-control namespace
+
+When `recursive.enabled=true`, every backend also exposes `omp`. It projects OMP's existing canonical state and execution primitives into the persistent programming environment:
+
+- `omp.context`: bounded list/search/read/materialize over conversation entries, registered agents, and internal resources.
+- `omp.tools`: active native tool invocation through the same eval host bridge.
+- `omp.agents`: OMP task agents retained after their initial yield, with status, send, observe, wait, cancel, and release operations.
+- `omp.state`: private, atomic, JSON-only session/project control state with fingerprinted compare-and-swap.
+- `omp.budget`: aggregate root-plus-descendant token, cost, wall-time, and handle accounting.
+- `omp.improvements`: proposal/outcome ledger; it cannot directly modify canonical prompts, memory, skills, rules, or agent definitions.
+
+Unlike the one-shot `agent()` helper, `omp.agents.spawn()` uses `keepAlive=true` and returns a session-owned stable admission handle as soon as OMP reserves the child agent ID. The first turn continues in the background. It still runs through OMP's Task runtime, Agent Registry, lifecycle revival, Hub messaging, and `agent://` history. Handles are released on session change or disposal.
+
+The feature is disabled by default. The prelude keeps the namespace defined so a retained kernel need not restart when the setting changes; calls fail closed while disabled. See `docs/recursive-control.md`.
 
 ## Side effects and cancellation
 

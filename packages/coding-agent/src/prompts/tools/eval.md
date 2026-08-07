@@ -24,6 +24,16 @@ completion(prompt, model?="default"|"smol"|"slow", system?=None, schema?=None) �
     Run a subagent → final output. `agent` selects a discovered agent; omit it to use `{{spawnDefaultAgent}}`.{{#if spawnAllowedAgentsText}} Allowed agents: {{spawnAllowedAgentsText}}.{{/if}} `schema` overrides agent/session schemas; `schemaMode`/`schema_mode`: "permissive" | "strict". Effective schemas return parsed data. `isolated` requests a worktree; `apply`/`merge` control its changes. Background via `local://` files named in the prompt. `handle` → { text, output, handle: "agent://<id>", id, agent }, parsed `data` when structured.
 {{#if js}}    JS: ONE trailing object — agent(prompt, { agent, label, schema, schemaMode, isolated, apply, merge, handle }).{{/if}}
 {{/if}}
+{{#if recursive}}
+`omp` is the host-owned recursive control namespace. All calls preserve OMP permissions, tracing, sessions, and canonical state:
+- `omp.context.list/search/read/materialize` — bounded references into conversation, agents, and internal resources.
+- `omp.tools.<name>(args)` / `omp.tools.call(name, args)` — invoke an active OMP tool from code.
+- `omp.agents.spawn(prompt, ...)` — start an OMP task agent, return its stable admission handle while the first turn runs, then `send/observe/wait/cancel/release` it.
+- `omp.state.get/list/put/delete/export` — exact JSON-only session/project control state outside active context.
+- `omp.budget.status()` — root-plus-descendant usage, cost, time, and admission violations.
+- `omp.improvements.propose/list/get/outcomes/...` — auditable proposals only; it cannot directly mutate canonical prompts, skills, rules, memory, or agents.
+Keep large text behind references. Read bounded slices and materialize artifacts only when needed.
+{{/if}}
 parallel(thunks) → list     pipeline(items, ...stages) → list
 log(message) → None         phase(title) → None
 budget → {{#if py}}`budget.total` (ceiling or None), `budget.spent()`, `budget.remaining()`{{/if}}{{#if js}}`await budget.total()`, `await budget.spent()`, `await budget.remaining()`{{/if}}{{#if rb}}`budget.total`, `budget.spent`, `budget.remaining`{{/if}}{{#if jl}}`budget.total`, `budget.spent()`, `budget.remaining()`{{/if}}; ceiling `+Nk` advisory, `+Nk!` hard.

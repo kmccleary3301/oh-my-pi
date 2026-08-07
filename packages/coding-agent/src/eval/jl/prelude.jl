@@ -734,3 +734,104 @@ function Base.getproperty(::OmpBudgetProxy, sym::Symbol)
 end
 
 const budget = OmpBudgetProxy()
+
+
+function __omp_recursive_call(method::AbstractString, params=Dict{String, Any}())
+    return __omp_call_bridge("__recursive__", Dict("method" => String(method), "params" => params))
+end
+
+struct OmpRecursiveContext end
+function Base.getproperty(::OmpRecursiveContext, sym::Symbol)
+    if sym === :list
+        return (; kwargs...) -> __omp_recursive_call("context.list", Dict(string(k) => v for (k, v) in kwargs))
+    elseif sym === :search
+        return (query; kwargs...) -> __omp_recursive_call("context.search", merge(Dict("query" => query), Dict(string(k) => v for (k, v) in kwargs)))
+    elseif sym === :read
+        return (ref; kwargs...) -> __omp_recursive_call("context.read", merge(Dict("ref" => ref), Dict(string(k) => v for (k, v) in kwargs)))
+    elseif sym === :materialize
+        return (refs; kwargs...) -> __omp_recursive_call("context.materialize", merge(Dict("refs" => collect(refs)), Dict(string(k) => v for (k, v) in kwargs)))
+    end
+    error("Unknown recursive context method: $sym")
+end
+
+struct OmpRecursiveTools end
+function Base.getproperty(::OmpRecursiveTools, sym::Symbol)
+    if sym === :call
+        return (name, args=Dict{String, Any}()) -> __omp_recursive_call("tools.call", Dict("name" => string(name), "args" => args))
+    end
+    return (args=Dict{String, Any}()) -> __omp_recursive_call("tools.call", Dict("name" => string(sym), "args" => args))
+end
+
+struct OmpRecursiveAgents end
+function Base.getproperty(::OmpRecursiveAgents, sym::Symbol)
+    if sym === :spawn
+        return (prompt; kwargs...) -> __omp_recursive_call("agents.spawn", merge(Dict("prompt" => prompt), Dict(string(k) => v for (k, v) in kwargs)))
+    elseif sym === :list
+        return () -> __omp_recursive_call("agents.list")
+    elseif sym in (:status, :cancel, :release)
+        return handle -> __omp_recursive_call("agents.$(sym)", Dict("handle" => handle isa AbstractDict ? handle["handle"] : handle))
+    elseif sym === :send
+        return (handle, message; delivery="when-idle") -> __omp_recursive_call("agents.send", Dict("handle" => handle isa AbstractDict ? handle["handle"] : handle, "message" => message, "delivery" => delivery))
+    elseif sym === :observe
+        return (handle; kwargs...) -> __omp_recursive_call("agents.observe", merge(Dict("handle" => handle isa AbstractDict ? handle["handle"] : handle), Dict(string(k) => v for (k, v) in kwargs)))
+    elseif sym === :wait
+        return (handle; kwargs...) -> __omp_recursive_call("agents.wait", merge(Dict("handle" => handle isa AbstractDict ? handle["handle"] : handle), Dict(string(k) => v for (k, v) in kwargs)))
+    end
+    error("Unknown recursive agent method: $sym")
+end
+
+struct OmpRecursiveState end
+function Base.getproperty(::OmpRecursiveState, sym::Symbol)
+    if sym === :get
+        return (key; scope="session") -> __omp_recursive_call("state.get", Dict("key" => key, "scope" => scope))
+    elseif sym === :list
+        return (; scope="session") -> __omp_recursive_call("state.list", Dict("scope" => scope))
+    elseif sym === :put
+        return (key, value; scope="session", kwargs...) -> __omp_recursive_call("state.put", merge(Dict("key" => key, "value" => value, "scope" => scope), Dict(string(k) => v for (k, v) in kwargs)))
+    elseif sym === :delete
+        return (key; scope="session", kwargs...) -> __omp_recursive_call("state.delete", merge(Dict("key" => key, "scope" => scope), Dict(string(k) => v for (k, v) in kwargs)))
+    elseif sym === :export
+        return (; scope="session") -> __omp_recursive_call("state.export", Dict("scope" => scope))
+    end
+    error("Unknown recursive state method: $sym")
+end
+
+struct OmpRecursiveImprovements end
+function Base.getproperty(::OmpRecursiveImprovements, sym::Symbol)
+    if sym === :propose
+        return proposal -> __omp_recursive_call("improvements.propose", proposal)
+    elseif sym === :list
+        return (; kwargs...) -> __omp_recursive_call("improvements.list", Dict(string(k) => v for (k, v) in kwargs))
+    elseif sym === :get
+        return id -> __omp_recursive_call("improvements.get", Dict("id" => id))
+    elseif sym === :outcomes
+        return proposal_id -> __omp_recursive_call("improvements.outcomes", Dict("proposalId" => proposal_id))
+    elseif sym === :transition
+        return (id, status, expected_revision) -> __omp_recursive_call("improvements.transition", Dict("id" => id, "status" => status, "expectedRevision" => expected_revision))
+    elseif sym === :record_outcome
+        return (outcome, expected_revision) -> __omp_recursive_call("improvements.recordOutcome", merge(Dict(string(k) => v for (k, v) in outcome), Dict("expectedRevision" => expected_revision)))
+    end
+    error("Unknown recursive improvement method: $sym")
+end
+
+struct OmpRecursiveNamespace end
+function Base.getproperty(::OmpRecursiveNamespace, sym::Symbol)
+    if sym === :context
+        return OmpRecursiveContext()
+    elseif sym === :tools
+        return OmpRecursiveTools()
+    elseif sym === :agents
+        return OmpRecursiveAgents()
+    elseif sym === :state
+        return OmpRecursiveState()
+    elseif sym === :budget
+        return (status = () -> __omp_recursive_call("budget.status"),)
+    elseif sym === :improvements
+        return OmpRecursiveImprovements()
+    elseif sym === :capabilities
+        return () -> __omp_recursive_call("capabilities")
+    end
+    error("Unknown omp recursive namespace: $sym")
+end
+
+const omp = OmpRecursiveNamespace()

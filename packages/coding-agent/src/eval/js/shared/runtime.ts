@@ -69,6 +69,7 @@ const PRELUDE_GLOBAL_KEYS = [
 	"log",
 	"phase",
 	"budget",
+	"omp",
 	"__pool",
 	"read",
 	"write",

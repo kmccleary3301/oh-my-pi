@@ -671,3 +671,167 @@ if "__omp_prelude_loaded__" not in globals():
                 return "<budget unavailable>"
 
     budget = _Budget()
+
+
+    def _recursive_call(method, **params):
+        """Call the host-owned recursive-control bridge."""
+        return _bridge_call("__recursive__", {"method": method, "params": params})
+
+    class _RecursiveContext:
+        def list(self, **options):
+            return _recursive_call("context.list", **options)
+
+        def search(self, query, **options):
+            return _recursive_call("context.search", query=query, **options)
+
+        def read(self, ref, **options):
+            return _recursive_call("context.read", ref=ref, **options)
+
+        def materialize(self, refs, **options):
+            return _recursive_call("context.materialize", refs=list(refs), **options)
+
+    class _RecursiveTools:
+        def call(self, name, args=None):
+            return _recursive_call("tools.call", name=name, args=args or {})
+
+        def __getattr__(self, name):
+            return lambda **args: self.call(name, args)
+
+    class _RetainedAgentHandle:
+        def __init__(self, value):
+            self._value = dict(value)
+
+        @property
+        def handle(self):
+            return self._value["handle"]
+
+        @property
+        def agent_id(self):
+            return self._value.get("agentId")
+
+        def status(self):
+            self._value = _recursive_call("agents.status", handle=self.handle)
+            return dict(self._value)
+
+        def send(self, message, delivery="when-idle"):
+            self._value = _recursive_call("agents.send", handle=self.handle, message=message, delivery=delivery)
+            return dict(self._value)
+
+        def observe(self, max_chars=None):
+            params = {"handle": self.handle}
+            if max_chars is not None:
+                params["maxChars"] = max_chars
+            return _recursive_call("agents.observe", **params)
+
+        def wait(self, until="terminal", timeout_ms=None):
+            params = {"handle": self.handle, "until": until}
+            if timeout_ms is not None:
+                params["timeoutMs"] = timeout_ms
+            self._value = _recursive_call("agents.wait", **params)
+            return dict(self._value)
+
+        def cancel(self):
+            self._value = _recursive_call("agents.cancel", handle=self.handle)
+            return dict(self._value)
+
+        def release(self):
+            self._value = _recursive_call("agents.release", handle=self.handle)
+            return dict(self._value)
+
+        def to_dict(self):
+            return dict(self._value)
+
+        def __getitem__(self, key):
+            return self._value[key]
+
+        def __repr__(self):
+            return f"<retained-agent {self.handle} status={self._value.get('status')}>"
+
+    class _RecursiveAgents:
+        def spawn(self, prompt, **options):
+            return _RetainedAgentHandle(_recursive_call("agents.spawn", prompt=prompt, **options))
+
+        def list(self):
+            return _recursive_call("agents.list")
+
+        def status(self, handle):
+            return _recursive_call("agents.status", handle=getattr(handle, "handle", handle))
+
+        def send(self, handle, message, delivery="when-idle"):
+            return _recursive_call("agents.send", handle=getattr(handle, "handle", handle), message=message, delivery=delivery)
+
+        def observe(self, handle, max_chars=None):
+            params = {"handle": getattr(handle, "handle", handle)}
+            if max_chars is not None:
+                params["maxChars"] = max_chars
+            return _recursive_call("agents.observe", **params)
+
+        def wait(self, handle, until="terminal", timeout_ms=None):
+            params = {"handle": getattr(handle, "handle", handle), "until": until}
+            if timeout_ms is not None:
+                params["timeoutMs"] = timeout_ms
+            return _recursive_call("agents.wait", **params)
+
+        def cancel(self, handle):
+            return _recursive_call("agents.cancel", handle=getattr(handle, "handle", handle))
+
+        def release(self, handle):
+            return _recursive_call("agents.release", handle=getattr(handle, "handle", handle))
+
+    class _RecursiveState:
+        def get(self, key, scope="session"):
+            return _recursive_call("state.get", key=key, scope=scope)
+
+        def list(self, scope="session"):
+            return _recursive_call("state.list", scope=scope)
+
+        def put(self, key, value, scope="session", expected_fingerprint=None):
+            params = {"key": key, "value": value, "scope": scope}
+            if expected_fingerprint is not None:
+                params["expectedFingerprint"] = expected_fingerprint
+            return _recursive_call("state.put", **params)
+
+        def delete(self, key, scope="session", expected_fingerprint=None):
+            params = {"key": key, "scope": scope}
+            if expected_fingerprint is not None:
+                params["expectedFingerprint"] = expected_fingerprint
+            return _recursive_call("state.delete", **params)
+
+        def export(self, scope="session"):
+            return _recursive_call("state.export", scope=scope)
+
+    class _RecursiveBudget:
+        def status(self):
+            return _recursive_call("budget.status")
+
+    class _RecursiveImprovements:
+        def propose(self, **proposal):
+            return _recursive_call("improvements.propose", **proposal)
+
+        def list(self, status=None):
+            return _recursive_call("improvements.list", **({"status": status} if status is not None else {}))
+
+        def get(self, proposal_id):
+            return _recursive_call("improvements.get", id=proposal_id)
+
+        def outcomes(self, proposal_id):
+            return _recursive_call("improvements.outcomes", proposalId=proposal_id)
+
+        def transition(self, proposal_id, status, expected_revision):
+            return _recursive_call("improvements.transition", id=proposal_id, status=status, expectedRevision=expected_revision)
+
+        def record_outcome(self, expected_revision, **outcome):
+            return _recursive_call("improvements.recordOutcome", expectedRevision=expected_revision, **outcome)
+
+    class _OmpRecursiveNamespace:
+        context = _RecursiveContext()
+        tools = _RecursiveTools()
+        agents = _RecursiveAgents()
+        state = _RecursiveState()
+        budget = _RecursiveBudget()
+        improvements = _RecursiveImprovements()
+
+        def capabilities(self):
+            return _recursive_call("capabilities")
+
+    omp = _OmpRecursiveNamespace()
