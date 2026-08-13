@@ -1821,6 +1821,9 @@ export async function runRootCommand(
 	// Will be re-initialized with user preferences later
 	await logger.time("initTheme:initial", initTheme);
 
+	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
+	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
+
 	if (parsedArgs.version) {
 		writeStartupNotice(parsedArgs, `${VERSION}\n`);
 		process.exit(0);
@@ -1939,8 +1942,6 @@ export async function runRootCommand(
 	);
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
-	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
-	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 	const home = os.homedir();
 	const pluginPreloadPromise =
 		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
