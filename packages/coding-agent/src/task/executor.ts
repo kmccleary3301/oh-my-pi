@@ -358,6 +358,8 @@ export interface ExecutorOptions {
 	description?: string;
 	index: number;
 	id: string;
+	/** Stable execution generation; callers may provide a native id, otherwise one is generated per run. */
+	runId?: string;
 	parentToolCallId?: string;
 	/**
 	 * Spawn runs as a detached background job (parent turn not blocked on it).
@@ -925,6 +927,7 @@ interface RunMonitorArgs {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	runId?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	eventBus?: EventBus;
@@ -1019,6 +1022,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+		runId,
 	} = args;
 	const startTime = Date.now();
 
@@ -1252,20 +1256,33 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const emitProgressNow = () => {
 		refreshRecentOutput();
 		progress.durationMs = Date.now() - startTime;
+		progress.usage = hasUsage
+			? {
+					...accumulatedUsage,
+					cost: { ...accumulatedUsage.cost },
+				}
+			: undefined;
 		onProgress?.({ ...progress });
 		const activityGist =
 			progress.lastIntent ?? (progress.currentTool ? `running ${progress.currentTool}` : undefined);
 		if (activityGist) AgentRegistry.global().setActivity(id, activityGist);
 		if (args.eventBus) {
 			args.eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+				id,
 				index,
 				agent: agent.name,
 				agentSource: agent.source,
 				task,
+				runId,
 				parentToolCallId: args.parentToolCallId,
 				detached: args.detached,
 				assignment,
-				progress: { ...progress },
+				progress: {
+					...progress,
+					usage: progress.usage ? { ...progress.usage, cost: { ...progress.usage.cost } } : undefined,
+				},
+				usage: progress.usage,
+				runHandles: args.sessionFile ? { sessionFile: args.sessionFile } : undefined,
 				sessionFile: args.sessionFile,
 			});
 		}
@@ -2119,6 +2136,7 @@ interface FinalizeRunArgs {
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	outputSchema?: unknown;
+	runId?: string;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	signal?: AbortSignal;
@@ -2229,11 +2247,15 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	monitor.scheduleProgress(true);
 
-	// Emit lifecycle end event after finalization so yield status is reflected
 	if (args.eventBus) {
+		const runHandles = {
+			...(args.sessionFile ? { sessionFile: args.sessionFile } : {}),
+			...(outputPath ? { outputPath } : {}),
+		};
 		args.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id,
 			agent: agent.name,
+			runId: args.runId,
 			parentToolCallId: args.parentToolCallId,
 			detached: args.detached,
 			agentSource: agent.source,
@@ -2241,11 +2263,16 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 			status: progress.status as "completed" | "failed" | "aborted",
 			sessionFile: args.sessionFile,
 			index,
+			usage: monitor.hasUsage()
+				? { ...monitor.accumulatedUsage, cost: { ...monitor.accumulatedUsage.cost } }
+				: undefined,
+			runHandles: Object.keys(runHandles).length > 0 ? runHandles : undefined,
 		});
 	}
 
 	return {
 		index,
+		runId: args.runId,
 		id,
 		agent: agent.name,
 		agentSource: agent.source,
@@ -2288,6 +2315,7 @@ export interface IrcWakeTurnMonitorOptions {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	runId?: string;
 	eventBus?: EventBus;
 	parentToolCallId?: string;
 	/** Fallback session file when the registry ref carries none. */
@@ -2324,6 +2352,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				.filter(Boolean)
 				.join("\n\n") || "IRC follow-up";
 		const turnStartTime = Date.now();
+		const runId = options.runId ?? `${id}:${crypto.randomUUID()}`;
 		const sessionFile = AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined;
 		const turnMonitor = createSubagentRunMonitor({
 			index,
@@ -2332,6 +2361,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			task: ircTask,
 			description: options.description,
 			modelOverride: options.modelOverride,
+			runId,
 			modelRole: options.modelRole,
 			eventBus: options.eventBus,
 			parentToolCallId: options.parentToolCallId,
@@ -2345,6 +2375,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		if (options.eventBus) {
 			options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 				id,
+				runId,
 				agent: agent.name,
 				parentToolCallId: options.parentToolCallId,
 				detached: true,
@@ -2390,6 +2421,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					agent,
 					task: ircTask,
 					modelOverride: options.modelOverride,
+					runId,
 					modelRole: options.modelRole,
 					outputSchema: options.outputSchema,
 					outputSchemaMode: options.outputSchemaMode,
@@ -2534,6 +2566,7 @@ export interface FollowUpTurnOptions {
 	/** The follow-up message; sent as the turn's user prompt. */
 	message: string;
 	index?: number;
+	runId?: string;
 	description?: string;
 	/** Explicit pre-expansion model role alias retained from the original run. */
 	modelRole?: string;
@@ -2565,6 +2598,7 @@ export interface FollowUpTurnOptions {
 export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Promise<SingleResult> {
 	const { id, agent, message, signal } = options;
 	const index = options.index ?? 0;
+	const runId = options.runId ?? `${id}:${crypto.randomUUID()}`;
 	const startTime = Date.now();
 	const session = await AgentLifecycleManager.global().ensureLive(id);
 	const ref = AgentRegistry.global().get(id);
@@ -2577,6 +2611,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		task: message,
 		description: options.description,
 		modelRole: options.modelRole,
+		runId,
 		signal,
 		onProgress: options.onProgress,
 		eventBus: options.eventBus,
@@ -2587,10 +2622,16 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		softRequestBudgetNotice: false,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
 	});
+	const registry = AgentRegistry.global();
+	registry.setCancellation(id, runId, () => {
+		monitor.requestAbort("signal");
+		return monitor.abortActiveSession();
+	});
 
 	if (options.eventBus) {
 		options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id,
+			runId,
 			agent: agent.name,
 			parentToolCallId: options.parentToolCallId,
 			detached: true,
@@ -2613,6 +2654,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		} catch {
 			// Ignore abort cleanup timeouts; the session stays adopted either way.
 		}
+		registry.clearCancellation(id, runId);
 		unsubscribe();
 		const active = monitor.takeActiveSession();
 		if (active) monitor.captureSalvage(active);
@@ -2627,6 +2669,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		agent,
 		task: message,
 		modelRole: options.modelRole,
+		runId,
 		outputSchema: options.outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,
@@ -2660,6 +2703,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		signal,
 		onProgress,
 	} = options;
+	const runId = options.runId ?? `${id}:${crypto.randomUUID()}`;
 	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
 	const startTime = Date.now();
 	// Set by the session's onFirstChatDispatch hook the first time the agent
@@ -2682,6 +2726,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			truncated: false,
 			durationMs: 0,
 			tokens: 0,
+			runId,
 			requests: 0,
 			modelOverride,
 			modelRole,
@@ -2793,12 +2838,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		signal,
 		onProgress,
 		eventBus: options.eventBus,
+		runId,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,
 		sessionFile: subtaskSessionFile,
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+	});
+	const registry = AgentRegistry.global();
+	registry.setCancellation(id, runId, () => {
+		monitor.requestAbort("signal");
+		return monitor.abortActiveSession();
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -3178,6 +3229,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 					id,
 					agent: agent.name,
+					runId,
 					parentToolCallId: options.parentToolCallId,
 					detached: options.detached,
 					agentSource: agent.source,
@@ -3465,6 +3517,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	};
 
 	const done = await runSubagent();
+	registry.clearCancellation(id, runId);
 	monitor.finish();
 
 	const result = await finalizeRunResult({
@@ -3473,6 +3526,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		index,
 		id,
 		agent,
+		runId,
 		task,
 		assignment,
 		modelOverride,

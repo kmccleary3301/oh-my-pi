@@ -15,7 +15,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { MAX_CONTEXT_WINDOW_TOKENS, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { parseModelPattern, parseModelString } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -3840,11 +3840,11 @@ describe("AgentSession retry fallback", () => {
 			throw new Error("Expected override models to resolve");
 		}
 		expect(primaryModel.contextWindow).toBe(4000);
-		expect(fallbackModel.contextWindow).toBe(1_000_000);
+		expect(fallbackModel.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 
 		// ~15k estimated tokens: over the primary's 4000 window (80% => 3200) but
-		// far under the fallback's (800k), so it sits on the fallback without
-		// compaction and only overflows once the window shrinks on revert.
+		// far under the fallback's capped 300k window, so it sits on the fallback
+		// without compaction and only overflows once the window shrinks on revert.
 		const bigText = "lorem ipsum ".repeat(5000);
 		const requestedModels: string[] = [];
 		const mock = createMockModel();
@@ -3958,12 +3958,12 @@ describe("AgentSession retry fallback", () => {
 		if (!primaryModel || !smallFallback || !largeFallback) {
 			throw new Error("Expected override models to resolve");
 		}
-		expect(primaryModel.contextWindow).toBe(1_000_000);
+		expect(primaryModel.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 		expect(smallFallback.contextWindow).toBe(4000);
-		expect(largeFallback.contextWindow).toBe(1_000_000);
+		expect(largeFallback.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 
-		// ~15k estimated tokens in the initial prompt: fits the 1M primary and the
-		// 1M large fallback, but far exceeds the 4000-window small fallback
+		// ~15k estimated tokens in the initial prompt: fits the capped 300k
+		// primary and large fallback, but far exceeds the 4000-window small fallback
 		// (80% => 3200), so the small fallback cannot legally receive the request.
 		const bigText = "lorem ipsum ".repeat(5000);
 		const requestedModels: string[] = [];

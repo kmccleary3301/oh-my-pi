@@ -22,6 +22,7 @@ import {
 import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
+	RpcCapabilities,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -155,6 +156,31 @@ function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
 		value.maxReassembledFrameBytes === MAX_RPC_REASSEMBLED_BYTES
 	);
 }
+/**
+ * Commands introduced with the negotiated v2 dialect must fail locally when a
+ * peer only exposed the v1 transport. Keeping this gate in the client avoids
+ * sending a command that a conservative/older dispatcher cannot understand.
+ */
+const RPC_COMMAND_MIN_PROTOCOL: Partial<Record<RpcCommand["type"], RpcProtocolVersion>> = {
+	cancel_task: 2,
+	checkpoint: 2,
+	rewind: 2,
+	get_messages_page: 2,
+};
+
+function requiredRpcProtocol(command: string): RpcProtocolVersion {
+	return RPC_COMMAND_MIN_PROTOCOL[command as RpcCommand["type"]] ?? 1;
+}
+
+function enforceRpcProtocol(command: string, protocolVersion: RpcProtocolVersion): void {
+	const required = requiredRpcProtocol(command);
+	if (protocolVersion >= required) return;
+	throw new RpcCommandError(
+		`Command "${command}" requires negotiated RPC protocol v${required}`,
+		command,
+		"unsupported_protocol",
+	);
+}
 
 function isAgentEvent(value: unknown): value is AgentEvent {
 	if (!isRecord(value)) return false;
@@ -259,6 +285,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
+	#capabilities: RpcCapabilities | undefined;
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
 	#abortController = new AbortController();
 
@@ -283,6 +310,7 @@ export class RpcClient {
 		// Mint a fresh controller so a previous stop()'s abort does not
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
+		this.#capabilities = undefined;
 		this.#protocolVersion = 1;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
@@ -619,6 +647,45 @@ export class RpcClient {
 		};
 	}
 
+	async getCapabilities(): Promise<RpcCapabilities> {
+		return this.#fetchCapabilities();
+	}
+
+	async #fetchCapabilities(): Promise<RpcCapabilities> {
+		if (this.#capabilities) return this.#capabilities;
+		const response = await this.#send({ type: "get_capabilities" });
+		const capabilities = this.#getData<RpcCapabilities>(response);
+		if (capabilities?.runtime !== "omp") {
+			throw new RpcCommandError("RPC runtime is not OMP", "get_capabilities", "unsupported_runtime");
+		}
+		if (capabilities.protocolVersion !== this.#protocolVersion) {
+			throw new RpcCommandError(
+				"RPC capability contract does not match negotiated protocol",
+				"get_capabilities",
+				"protocol_mismatch",
+			);
+		}
+		this.#capabilities = capabilities;
+		return capabilities;
+	}
+
+	async #requireCapability(command: string, supported: (capabilities: RpcCapabilities) => boolean): Promise<void> {
+		enforceRpcProtocol(command, this.#protocolVersion);
+		const capabilities = await this.#fetchCapabilities();
+		if (!supported(capabilities)) {
+			throw new RpcCommandError(`RPC capability is unavailable: ${command}`, command, "unsupported_capability");
+		}
+	}
+
+	/**
+	 * Cancel one exact child task/run; this never aborts the parent session.
+	 */
+	async cancelTask(taskId: string, runId?: string): Promise<{ taskId: string; runId?: string; cancelled: true }> {
+		await this.#requireCapability("cancel_task", capabilities => capabilities.tasks.targetedCancellation);
+		const response = await this.#send({ type: "cancel_task", taskId, runId });
+		return this.#getData(response);
+	}
+
 	/**
 	 * Enable or disable fast mode for the active model family.
 	 */
@@ -632,6 +699,7 @@ export class RpcClient {
 	 * "progress" emits lifecycle/progress frames; "events" additionally emits raw subagent session events.
 	 */
 	async setSubagentSubscription(level: RpcSubagentSubscriptionLevel): Promise<RpcSubagentSubscriptionLevel> {
+		await this.#requireCapability("set_subagent_subscription", capabilities => capabilities.tasks.lifecycle);
 		const response = await this.#send({ type: "set_subagent_subscription", level });
 		return this.#getData<{ level: RpcSubagentSubscriptionLevel }>(response).level;
 	}
@@ -640,6 +708,7 @@ export class RpcClient {
 	 * Return the RPC server's current subagent snapshot.
 	 */
 	async getSubagents(): Promise<RpcSubagentSnapshot[]> {
+		await this.#requireCapability("get_subagents", capabilities => capabilities.tasks.lifecycle);
 		const response = await this.#send({ type: "get_subagents" });
 		return this.#getData<{ subagents: RpcSubagentSnapshot[] }>(response).subagents;
 	}
@@ -652,6 +721,7 @@ export class RpcClient {
 		sessionFile?: string;
 		fromByte?: number;
 	}): Promise<RpcSubagentMessagesResult> {
+		await this.#requireCapability("get_subagent_messages", capabilities => capabilities.tasks.replaySelectors);
 		const response = await this.#send({
 			type: "get_subagent_messages",
 			subagentId: selector.subagentId,
@@ -731,6 +801,19 @@ export class RpcClient {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		const response = await this.#send({ type: "compact", customInstructions });
+		return this.#getData(response);
+	}
+	/** Create a native checkpoint using the OMP session primitive. */
+	async checkpoint(goal: string): Promise<{ goal: string; startedAt: string }> {
+		await this.#requireCapability("checkpoint", capabilities => capabilities.sessions.nativeCheckpoint);
+		const response = await this.#send({ type: "checkpoint", goal });
+		return this.#getData(response);
+	}
+
+	/** Rewind the active native checkpoint using the OMP session primitive. */
+	async rewind(report: string): Promise<{ report: string; rewound: boolean }> {
+		await this.#requireCapability("rewind", capabilities => capabilities.sessions.nativeCheckpoint);
+		const response = await this.#send({ type: "rewind", report });
 		return this.#getData(response);
 	}
 

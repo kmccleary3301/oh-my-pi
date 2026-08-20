@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Capped model context-window metadata at 300,000 tokens across built-in, custom, discovered, and extension-projected models.
+
 ## [17.3.7] - 2026-08-17
 
 ### Changed

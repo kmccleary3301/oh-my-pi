@@ -114,6 +114,16 @@ import { settings } from "./settings";
 // requests; the pi-ai provider resolves it just-in-time per request.
 setCodexAttestationProvider(generateCodexAttestation);
 
+/** Maximum context window OMP exposes to model selection and runtime state. */
+export const MAX_CONTEXT_WINDOW_TOKENS = 300_000;
+
+function capModelContextWindow(model: Model<Api>): Model<Api> {
+	if (model.contextWindow === null || model.contextWindow <= MAX_CONTEXT_WINDOW_TOKENS) {
+		return model;
+	}
+	return { ...model, contextWindow: MAX_CONTEXT_WINDOW_TOKENS };
+}
+
 /** Result of loading custom models config. */
 interface CustomModelsResult {
 	models?: CustomModelOverlay[];
@@ -339,7 +349,7 @@ export class ModelRegistry {
 			providerConfig => providerConfig.provider === model.provider && providerConfig.discovery.type === "llama.cpp",
 		);
 		if (!llamaCppDiscoveryConfig) {
-			return model;
+			return capModelContextWindow(model);
 		}
 		this.#ensureFullSnapshot();
 		const runtimeMetadata = await discoverLlamaCppModelRuntimeMetadata(
@@ -348,7 +358,7 @@ export class ModelRegistry {
 			llamaCppDiscoveryConfig.discovery.timeoutMs,
 		);
 		if (runtimeMetadata === undefined) {
-			return this.find(model.provider, model.id) ?? model;
+			return capModelContextWindow(this.find(model.provider, model.id) ?? model);
 		}
 		const { contextWindow, maxTokens, input } = runtimeMetadata;
 		const current = this.find(model.provider, model.id) ?? model;
@@ -396,14 +406,19 @@ export class ModelRegistry {
 			this.#unprojectedModels = this.#unprojectedModels.map(candidate =>
 				candidate.provider === unprojected.provider && candidate.id === unprojected.id ? patchedBase : candidate,
 			);
-			this.#models = this.#applyRuntimeModelModifiers(this.#unprojectedModels);
-			return resolveProviderModelReference(current.provider, current.id, this.#models) ?? patchedBase;
+			this.#models = this.#applyHardcodedModelPolicies(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+			return (
+				resolveProviderModelReference(current.provider, current.id, this.#models) ??
+				capModelContextWindow(patchedBase)
+			);
 		}
 		const patched = applyModelPatch(current, patch, "merge");
-		this.#models = this.#models.map(candidate =>
-			candidate.provider === current.provider && candidate.id === current.id ? patched : candidate,
+		this.#models = this.#applyHardcodedModelPolicies(
+			this.#models.map(candidate =>
+				candidate.provider === current.provider && candidate.id === current.id ? patched : candidate,
+			),
 		);
-		return patched;
+		return capModelContextWindow(patched);
 	}
 
 	/**
@@ -579,7 +594,9 @@ export class ModelRegistry {
 		const withConfigModels = this.#mergeCustomModels(resolvedDefaults, select(this.#customModelOverlays));
 		const combined = this.#mergeCustomModels(withConfigModels, select(this.#runtimeModelOverlays));
 		const withModelOverrides = this.#applyModelOverrides(collapseBuiltModelVariants(combined), this.#modelOverrides);
-		return this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		return this.#applyHardcodedModelPolicies(
+			this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withModelOverrides)),
+		);
 	}
 
 	#composeStaticModels(providerFilter?: ReadonlySet<string>): Model<Api>[] {
@@ -588,14 +605,15 @@ export class ModelRegistry {
 		const projectFullCatalog = providerFilter !== undefined && this.#runtimeModelModifiers.size > 0;
 		const unprojected = this.#composeUnprojectedStaticModels(projectFullCatalog ? undefined : providerFilter);
 		const projected = this.#applyRuntimeModelModifiers(unprojected);
-		const selected = projectFullCatalog ? projected.filter(model => providerFilter.has(model.provider)) : projected;
+		const capped = this.#applyHardcodedModelPolicies(projected);
+		const selected = projectFullCatalog ? capped.filter(model => providerFilter.has(model.provider)) : capped;
 		return this.#internStaticModels(selected);
 	}
 
 	#ensureFullSnapshot(): Model<Api>[] {
 		if (!this.#hasFullSnapshot) {
 			this.#unprojectedModels = this.#composeUnprojectedStaticModels();
-			this.#models = this.#internStaticModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+			this.#models = this.#applyHardcodedModelPolicies(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
 			this.#hasFullSnapshot = true;
 			this.#providerLookupSnapshots.clear();
 		}
@@ -1066,8 +1084,10 @@ export class ModelRegistry {
 		const withConfigModels = this.#mergeCustomModels(resolved, this.#customModelOverlays);
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(collapseBuiltModelVariants(combined), this.#modelOverrides);
-		this.#unprojectedModels = this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withModelOverrides));
-		this.#models = this.#applyRuntimeModelModifiers(this.#unprojectedModels);
+		this.#unprojectedModels = this.#applyHardcodedModelPolicies(
+			this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withModelOverrides)),
+		);
+		this.#models = this.#applyHardcodedModelPolicies(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
 	}
 
 	#configuredDiscoveryCacheProviderId(providerConfig: DiscoveryProviderConfig): string {
@@ -1562,17 +1582,7 @@ export class ModelRegistry {
 			if (model.provider === "ollama-cloud" && model.omitMaxOutputTokens !== true) {
 				model = applyModelOverride(model, { omitMaxOutputTokens: true });
 			}
-			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
-				return model;
-			}
-			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
-			if (!overrides) {
-				return applyModelOverride(model, { contextWindow: 1_000_000 });
-			}
-			return applyModelOverride(model, {
-				contextWindow: overrides.contextWindow ?? 1_000_000,
-				...overrides,
-			});
+			return capModelContextWindow(model);
 		});
 	}
 

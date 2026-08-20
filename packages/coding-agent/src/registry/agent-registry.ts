@@ -86,6 +86,11 @@ export interface AgentRef {
 	history?: AgentHistorySummary;
 }
 
+interface AgentCancellation {
+	runId: string;
+	cancel: () => Promise<void> | void;
+}
+
 export type AgentRefExpectation = AgentRef | AgentSession;
 
 export type RegistryEvent =
@@ -130,6 +135,7 @@ export class AgentRegistry {
 	}
 
 	readonly #refs = new Map<string, AgentRef>();
+	readonly #cancellations = new Map<string, AgentCancellation>();
 	readonly #listeners = new Set<RegistryListener>();
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
@@ -156,6 +162,7 @@ export class AgentRegistry {
 			activity: input.activity,
 			history: input.history,
 		};
+		this.#cancellations.delete(ref.id);
 		this.#refs.set(ref.id, ref);
 		this.#emit({ type: "registered", ref });
 		return ref;
@@ -182,6 +189,37 @@ export class AgentRegistry {
 		) as AgentHistorySummary;
 		ref.history = { ...ref.history, ...definedHistory };
 		this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+	/** Install the cancellation hook for one execution generation. */
+	setCancellation(
+		id: string,
+		runId: string,
+		cancel: () => Promise<void> | void,
+		expected?: AgentRefExpectation,
+	): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		this.#cancellations.set(id, { runId, cancel });
+		return true;
+	}
+
+	/** Remove a cancellation hook only when it still belongs to this generation. */
+	clearCancellation(id: string, runId: string, expected?: AgentRefExpectation): void {
+		const ref = this.#refs.get(id);
+		const cancellation = this.#cancellations.get(id);
+		if (!ref || !cancellation || cancellation.runId !== runId || !this.#matchesExpected(ref, expected)) return;
+		this.#cancellations.delete(id);
+	}
+
+	/** Cancel a live execution generation without requiring provider streaming to have begun. */
+	cancel(id: string, runId: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		const cancellation = this.#cancellations.get(id);
+		if (!ref || (ref.status !== "running" && ref.status !== "idle") || !cancellation || cancellation.runId !== runId)
+			return false;
+		if (!this.#matchesExpected(ref, expected)) return false;
+		cancellation.cancel();
 		return true;
 	}
 
@@ -257,6 +295,7 @@ export class AgentRegistry {
 	unregister(id: string, expected?: AgentRefExpectation): boolean {
 		const ref = this.#refs.get(id);
 		if (!ref || !this.#matchesExpected(ref, expected)) return false;
+		this.#cancellations.delete(id);
 		this.#refs.delete(id);
 		this.#emit({ type: "removed", ref });
 		return true;

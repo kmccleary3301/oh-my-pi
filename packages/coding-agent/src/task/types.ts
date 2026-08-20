@@ -66,16 +66,44 @@ export const TASK_SUBAGENT_LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
 
 /** Payload emitted on TASK_SUBAGENT_PROGRESS_CHANNEL */
 export interface SubagentProgressPayload {
+	/** Authoritative child id; also mirrored by `progress.id` for compatibility. */
+	id?: string;
 	index: number;
 	agent: string;
 	agentSource: AgentSource;
 	task: string;
+	parentId?: string;
 	parentToolCallId?: string;
 	assignment?: string;
 	progress: AgentProgress;
 	sessionFile?: string;
+	/** Stable execution generation; a later run for the same id must change it. */
+	runId?: string;
+	usage?: Usage;
+	attempt?: number;
+	workflow?: {
+		name?: string;
+		phaseIndex?: number;
+		phaseTitle?: string;
+		agentIndex?: number;
+	};
+	/** Execution handles known before terminal completion (typically sessionFile). */
+	runHandles?: SubagentRunHandles;
 	/** See {@link SubagentLifecyclePayload.detached}. */
 	detached?: boolean;
+}
+
+/** Handles retained for replaying or inspecting a settled task. */
+export interface SubagentRunHandles {
+	sessionFile?: string;
+	transcript?: string;
+	outputPath?: string;
+	patchPath?: string;
+	worktreePath?: string;
+	branchName?: string;
+	branch?: string;
+	jobId?: string;
+	[key: string]: unknown;
 }
 
 /** Payload emitted on TASK_SUBAGENT_EVENT_CHANNEL */
@@ -92,8 +120,22 @@ export interface SubagentLifecyclePayload {
 	description?: string;
 	status: "started" | "completed" | "failed" | "aborted";
 	sessionFile?: string;
+	/** Stable execution generation; a later run for the same id must change it. */
+	runId?: string;
 	parentToolCallId?: string;
 	index: number;
+	parentId?: string;
+	usage?: Usage;
+	attempt?: number;
+	workflow?: {
+		name?: string;
+		phaseIndex?: number;
+		phaseTitle?: string;
+		agentIndex?: number;
+	};
+	runHandles?: SubagentRunHandles;
+	startedAt?: number;
+	finishedAt?: number;
 	/**
 	 * Spawn runs as a detached background job: the parent turn keeps working
 	 * while this agent runs. Sync task spawns (parent blocked on the call) and
@@ -428,6 +470,8 @@ export interface AgentProgress {
 	cost: number;
 	durationMs: number;
 	modelOverride?: string | string[];
+	/** Latest cumulative provider usage for this run, when available. */
+	usage?: Usage;
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
@@ -473,6 +517,8 @@ export interface AgentProgress {
 /** Result from a single agent execution */
 export interface SingleResult {
 	index: number;
+	/** Stable execution generation for this task invocation. */
+	runId?: string;
 	id: string;
 	agent: string;
 	agentSource: AgentSource;

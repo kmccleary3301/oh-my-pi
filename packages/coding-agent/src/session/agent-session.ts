@@ -323,7 +323,7 @@ import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
+import type { BranchSummaryEntry, NewSessionOptions, SessionEntry } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -457,6 +457,40 @@ function cloneMessageEndNotification(message: AgentMessage): AgentMessage {
 }
 
 const INTERRUPTED_THINKING_MIN_CHARS = 60;
+
+export type RpcCheckpointMode = "agent" | "snapshot";
+
+export type RpcCheckpointErrorCode = "checkpoint_missing" | "checkpoint_stale" | "checkpoint_mismatch";
+
+export class RpcCheckpointError extends Error {
+	readonly code: RpcCheckpointErrorCode;
+
+	constructor(code: RpcCheckpointErrorCode, message: string) {
+		super(message);
+		this.name = "RpcCheckpointError";
+		this.code = code;
+	}
+}
+
+interface RpcSnapshotCheckpointData {
+	kind: "omp-native-checkpoint";
+	goal: string;
+	startedAt: string;
+	sessionId: string;
+}
+
+export interface RpcCheckpointResult {
+	goal: string;
+	startedAt: string;
+	checkpointId?: string;
+	sessionId?: string;
+}
+
+interface RpcSnapshotRewindOptions {
+	mode: "snapshot";
+	checkpointId?: string;
+	sessionId?: string;
+}
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -4985,6 +5019,102 @@ export class AgentSession {
 			this.#pendingRewindReport = undefined;
 		}
 	}
+	/**
+	 * Create a native checkpoint from the RPC transport. Agent mode mirrors the
+	 * model-facing checkpoint tool; snapshot mode records a non-LLM branch marker.
+	 */
+	createRpcCheckpoint(goal: string, mode: RpcCheckpointMode = "agent"): RpcCheckpointResult {
+		const normalizedGoal = goal.trim();
+		if (normalizedGoal.length === 0) {
+			throw new Error("Checkpoint goal cannot be empty.");
+		}
+		const startedAt = new Date().toISOString();
+		if (mode === "snapshot") {
+			const sessionId = this.sessionManager.getSessionId();
+			const checkpointId = this.sessionManager.appendCustomEntry("omp-native-checkpoint", {
+				kind: "omp-native-checkpoint",
+				goal: normalizedGoal,
+				startedAt,
+				sessionId,
+			} satisfies RpcSnapshotCheckpointData);
+			return { goal: normalizedGoal, startedAt, checkpointId, sessionId };
+		}
+		if (this.#checkpointState) {
+			throw new Error("Checkpoint already active.");
+		}
+		const message: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: `rpc-checkpoint-${Snowflake.next()}`,
+			toolName: "checkpoint",
+			content: [{ type: "text", text: `Checkpoint: ${normalizedGoal}\nFinish exploration and formulate findings.` }],
+			details: { goal: normalizedGoal, startedAt },
+			isError: false,
+			timestamp: Date.now(),
+		};
+		this.agent.appendMessage(message);
+		const checkpointEntryId = this.#appendSessionMessage(message);
+		this.#checkpointState = {
+			checkpointMessageCount: this.agent.state.messages.length,
+			checkpointEntryId,
+			startedAt,
+		};
+		this.#pendingRewindReport = undefined;
+		this.#lastCompletedRewind = undefined;
+		return { goal: normalizedGoal, startedAt };
+	}
+
+	/**
+	 * Complete a native checkpoint. Snapshot mode requires an exact marker on
+	 * the current branch and never falls back to the session root.
+	 */
+	async rewindRpcCheckpoint(
+		report: string,
+		options?: RpcSnapshotRewindOptions,
+	): Promise<{ report: string; rewound: boolean }> {
+		const normalizedReport = report.trim();
+		if (normalizedReport.length === 0) {
+			throw new Error("Report cannot be empty.");
+		}
+		if (options?.mode === "snapshot") {
+			const checkpointId = options.checkpointId?.trim();
+			if (!checkpointId) {
+				throw new RpcCheckpointError("checkpoint_missing", "Snapshot rewind requires checkpointId.");
+			}
+			const sessionId = this.sessionManager.getSessionId();
+			if (options.sessionId !== sessionId) {
+				throw new RpcCheckpointError("checkpoint_mismatch", "Snapshot checkpoint belongs to another session.");
+			}
+			const entry = this.sessionManager
+				.getBranch()
+				.find((candidate): candidate is Extract<SessionEntry, { type: "custom" }> => {
+					if (candidate.id !== checkpointId || candidate.type !== "custom") return false;
+					const data = candidate.data;
+					return (
+						typeof data === "object" &&
+						data !== null &&
+						(data as Partial<RpcSnapshotCheckpointData>).kind === "omp-native-checkpoint" &&
+						(data as Partial<RpcSnapshotCheckpointData>).sessionId === sessionId
+					);
+				});
+			if (!entry) {
+				throw new RpcCheckpointError(
+					"checkpoint_stale",
+					`Snapshot checkpoint is missing from the current branch: ${checkpointId}`,
+				);
+			}
+			const data = entry.data as RpcSnapshotCheckpointData;
+			await this.#applySnapshotRewind(normalizedReport, checkpointId, data.startedAt, sessionId);
+			return { report: normalizedReport, rewound: true };
+		}
+		if (!this.#checkpointState) {
+			throw new RpcCheckpointError(
+				"checkpoint_missing",
+				"No active checkpoint. Create a checkpoint before calling rewind.",
+			);
+		}
+		await this.#applyRewind(normalizedReport, this.agent.state.messages);
+		return { report: normalizedReport, rewound: true };
+	}
 
 	/**
 	 * Inject the plan mode context message into the conversation history.
@@ -7129,21 +7259,52 @@ export class AgentSession {
 		return undefined;
 	}
 
+	async #applySnapshotRewind(
+		report: string,
+		checkpointId: string,
+		startedAt: string,
+		sessionId: string,
+	): Promise<void> {
+		this.#bash.withBranchTransition(() => {
+			try {
+				this.sessionManager.branchWithSummary(checkpointId, report, {
+					kind: "omp-native-snapshot-rewind",
+					checkpointId,
+					startedAt,
+					sessionId,
+				});
+			} catch {
+				throw new RpcCheckpointError(
+					"checkpoint_stale",
+					`Snapshot checkpoint is no longer available: ${checkpointId}`,
+				);
+			}
+		});
+		this.sessionManager.appendCustomEntry("omp-native-rewind", {
+			kind: "omp-native-snapshot-rewind",
+			checkpointId,
+			report,
+			startedAt,
+			rewoundAt: new Date().toISOString(),
+			sessionId,
+		});
+	}
+
 	async #applyRewind(report: string, activeMessages?: AgentMessage[]): Promise<void> {
 		const checkpointState = this.#checkpointState;
 		if (!checkpointState) {
-			return;
+			throw new RpcCheckpointError("checkpoint_missing", "No active checkpoint.");
 		}
 		this.#bash.withBranchTransition(() => {
 			try {
 				this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
 					startedAt: checkpointState.startedAt,
 				});
-			} catch (error) {
-				logger.warn("Rewind branch checkpoint missing, falling back to root", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-				this.sessionManager.branchWithSummary(null, report, { startedAt: checkpointState.startedAt });
+			} catch {
+				throw new RpcCheckpointError(
+					"checkpoint_stale",
+					`Checkpoint is no longer available: ${checkpointState.checkpointEntryId ?? "unknown"}`,
+				);
 			}
 		});
 

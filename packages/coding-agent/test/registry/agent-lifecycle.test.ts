@@ -87,6 +87,36 @@ describe("AgentLifecycleManager", () => {
 		expect(registry.get("generation-Sub")).toBeUndefined();
 	});
 
+	it("cancels only the exact live generation and expected session", () => {
+		const stub = makeSessionStub();
+		const ref = registry.register({
+			id: "cancel-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: stub.session,
+			sessionFile: "/tmp/cancel-Sub.jsonl",
+			status: "running",
+		});
+		let cancellations = 0;
+		expect(
+			registry.setCancellation(
+				ref.id,
+				"run-a",
+				() => {
+					cancellations++;
+				},
+				ref,
+			),
+		).toBe(true);
+		expect(registry.cancel(ref.id, "run-b", ref)).toBe(false);
+		expect(cancellations).toBe(0);
+		expect(registry.cancel(ref.id, "run-a", {} as AgentSession)).toBe(false);
+		expect(cancellations).toBe(0);
+		expect(registry.cancel(ref.id, "run-a", ref)).toBe(true);
+		expect(cancellations).toBe(1);
+	});
+
 	it("adopt arms the TTL: an idle agent is parked — session disposed, ref + sessionFile retained", async () => {
 		vi.useFakeTimers();
 		const stub = makeSessionStub();

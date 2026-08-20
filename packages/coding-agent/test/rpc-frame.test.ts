@@ -280,6 +280,26 @@ describe("RPC frame encoding", () => {
 			error: "RPC response exceeded the transport limit",
 		});
 	});
+	it("keeps protocol v1 frames unchunked after a v1 negotiation", () => {
+		const encoder = new RpcFrameEncoder();
+		encoder.setProtocolVersion(1);
+		const encoded = encoder.encode({
+			id: "request-v1",
+			type: "response",
+			command: "get_messages",
+			success: true,
+			data: { transcript: "x".repeat(MAX_RPC_FRAME_BYTES + 1) },
+		});
+
+		expect(encoded).not.toContain('"type":"rpc_chunk"');
+		expect(decode(encoded)).toEqual({
+			id: "request-v1",
+			type: "response",
+			command: "get_messages",
+			success: false,
+			error: "RPC response exceeded the transport limit",
+		});
+	});
 
 	it("rejects interrupted protocol v2 chunk sequences", () => {
 		const decoder = new RpcFrameDecoder();

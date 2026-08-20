@@ -302,7 +302,7 @@ describe("RpcInputDispatcher", () => {
 	test("ordinary commands stay serialized while first command is blocked", async () => {
 		const releaseFirst = Promise.withResolvers<void>();
 		const started: string[] = [];
-		const { deps, outputs } = makeDeps(async command => {
+		const { deps, outputs } = makeDeps(async (command): Promise<RpcResponse> => {
 			started.push(command.type);
 			if (command.type === "abort_retry") {
 				await releaseFirst.promise;
@@ -328,6 +328,16 @@ describe("RpcInputDispatcher", () => {
 						tokensPerSecond: null,
 						messageCount: 0,
 						queuedMessageCount: 0,
+						mutation: {
+							stable: true,
+							isStreaming: false,
+							isCompacting: false,
+							queuedMessageCount: 0,
+							pendingAsyncWork: false,
+							liveChildTasks: false,
+							pendingExtensionRequests: 0,
+							reasons: [],
+						},
 						todoPhases: [],
 					},
 				};

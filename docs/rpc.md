@@ -121,9 +121,24 @@ Important edge behavior from runtime:
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
 
+The server always emits the initial `ready` frame in protocol v1. A client
+that sees `supportedProtocolVersions: [1, 2]` may negotiate v2 with
+`negotiate_protocol`; repeating a supported version is harmless. The successful
+response selects the version for subsequent outbound framing and capability
+reporting.
+Protocol-v2-only commands are `cancel_task`, `checkpoint`, `rewind`, and
+`get_messages_page`; sending one before v2 negotiation fails with
+`code: "unsupported_protocol"`. Unsupported version numbers fail with
+`code: "unsupported_protocol_version"`.
+
+`get_capabilities` reports the selected `protocolVersion` and the runtime
+features actually wired for that process. Hosts must inspect those booleans
+before invoking optional native operations.
+
 ### State
 
 - `{ id?, type: "get_state" }`
+- `{ id?, type: "get_capabilities" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
@@ -132,6 +147,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_subagent_subscription", level: "off" | "progress" | "events" }`
 - `{ id?, type: "get_subagents" }`
 - `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
+
 
 ### Model
 
@@ -171,6 +187,18 @@ during a long-running `bash` is handled without waiting for it to finish on
 its own. The `bash` response is emitted when the command completes; hosts
 correlate it via `id`. Ordering across concurrent commands is not guaranteed
 — clients MUST match responses on `id`, not on emission order.
+
+### Native task/session operations
+
+- `{ id?, type: "cancel_task", taskId?: string, subagentId?: string, runId?: string }`
+- `{ id?, type: "checkpoint", goal: string, mode?: "agent" | "snapshot" }`
+- `{ id?, type: "rewind", report: string, mode?: "agent" | "snapshot", checkpointId?: string, sessionId?: string }`
+
+These operations are optional and are advertised by `get_capabilities`.
+`checkpoint` and `rewind` mutate the session tree and require a stable
+mutation predicate. `cancel_task` is owner- and generation-scoped: the caller
+must own the subagent, and when a snapshot has a `runId`, the request must
+include that exact `runId`. A task id alone never authorizes cancellation.
 
 ### Session
 
@@ -230,6 +258,62 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 
 Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
 
+### `get_capabilities` payload
+
+`get_capabilities` is authoritative for the negotiated transport and native
+runtime surface. Its response has this shape:
+
+```json
+{
+  "runtime": "omp",
+  "contractVersion": 1,
+  "protocolVersion": 2,
+  "supportedProtocolVersions": [1, 2],
+  "maxFrameBytes": 1048576,
+  "maxReassembledFrameBytes": 67108864,
+  "models": { "discover": true, "switch": true },
+  "thinking": { "discover": true, "switch": true },
+  "commands": { "discover": true, "invokeNative": true },
+  "sessions": {
+    "resume": true,
+    "tree": true,
+    "fork": true,
+    "compact": true,
+    "nativeCheckpoint": false,
+    "completeTurnRollback": false,
+    "mutationStability": true
+  },
+  "tasks": {
+    "lifecycle": true,
+    "nested": true,
+    "childTranscript": true,
+    "workflows": false,
+    "background": true,
+    "targetedCancellation": true,
+    "terminalRecords": true,
+    "replaySelectors": true
+  },
+  "ui": {
+    "select": true,
+    "confirm": true,
+    "input": true,
+    "editor": true,
+    "notify": true,
+    "status": true,
+    "widget": true,
+    "openUrl": false,
+    "arbitraryTerminalComponents": false
+  }
+}
+```
+
+The `ui` object is also present and reports support for `select`, `confirm`,
+`input`, `editor`, `notify`, `status`, and `widget`; `openUrl` and arbitrary
+terminal components are false. Boolean task/session fields are runtime facts,
+not promises about a different OMP build. This sample intentionally shows
+`nativeCheckpoint: false`; a runtime with both native checkpoint tools active
+reports `true`. Clients must use the returned values rather than assume them.
+
 ### `get_state` payload
 
 `tokensPerSecond` is a number when output throughput is available and `null`
@@ -288,9 +372,64 @@ is re-armed.
     "tokens": 1100,
     "contextWindow": 200000,
     "percent": 0.55
+  },
+  "mutation": {
+    "stable": true,
+    "isStreaming": false,
+    "isCompacting": false,
+    "queuedMessageCount": 0,
+    "pendingAsyncWork": false,
+    "liveChildTasks": false,
+    "pendingExtensionRequests": 0,
+    "reasons": []
   }
 }
 ```
+
+### Session mutation stability
+
+`get_state.data.mutation` is a fail-closed predicate for session tree/file
+mutations. `stable` is true only when all of the following are clear:
+
+- `isStreaming` and `isCompacting` are false;
+- `queuedMessageCount` is zero;
+- no pending asynchronous work or live child task exists; and
+- no extension UI request is pending.
+
+`reasons` lists the active blockers using `streaming`, `compacting`,
+`queued_messages`, `pending_async_work`, `live_child_tasks`, and
+`pending_extension_ui`. The root-owned `new_session`, `switch_session`,
+`branch`, `compact`, `checkpoint`, and `rewind` commands reject an unstable
+predicate with `code: "session_busy"`; they do not silently abort active work.
+
+### Native task/session responses
+
+`cancel_task` succeeds only for a running subagent owned by the current
+session. When the snapshot includes `runId`, the request must include the same
+run handle. Failures use these codes: `unsupported_protocol` (v2 not
+negotiated), `unsupported_capability`, `invalid_request`, `unknown_task`,
+`foreign_task`, `not_running`, or `unknown_run`.
+
+```json
+{
+  "type": "response",
+  "command": "cancel_task",
+  "success": true,
+  "data": { "taskId": "Task-1", "runId": "run-1", "cancelled": true }
+}
+```
+
+When `sessions.nativeCheckpoint` is true, `checkpoint` returns
+`{ goal, startedAt, checkpointId?, sessionId? }`. Agent mode creates an active
+checkpoint for the normal checkpoint/rewind flow. Snapshot mode writes a
+durable branch marker and requires `checkpointId` plus the matching `sessionId`
+for rewind. `rewind` returns `{ report, rewound: true }`.
+
+Checkpoint failures are typed as `checkpoint_missing`,
+`checkpoint_stale`, or `checkpoint_mismatch`; malformed modes or missing
+snapshot selectors use `invalid_request`. If `nativeCheckpoint` is false, both
+commands fail with `unsupported_capability`, and `completeTurnRollback` is
+always false.
 
 ### `set_fast_mode` payload
 
@@ -535,6 +674,29 @@ Subagent forwarding defaults to `"off"`. `set_subagent_subscription` selects:
 `fromByte`, `nextByte`, `reset`, raw transcript `entries`, and converted
 `messages`. If `fromByte` exceeds the current file size, reading restarts at
 byte zero and reports `reset: true`.
+
+`get_subagents.data.subagents[]` is the authoritative snapshot for each
+subagent generation. In addition to `id`, `index`, `agent`, `agentSource`,
+`description`, `task`, `assignment`, `status`, `lastUpdate`, and `progress`,
+records may include:
+
+- `runId` (stable execution generation), `parentId`, and `parentToolCallId`;
+- `sessionFile`, `detached`, `startedAt`, `terminalAt`, and `usage`;
+- `role`, `modelRole`, `resolvedModel`, `resolvedModelIsFallback`, and `attempt`;
+- `workflow` metadata (`name`, `phaseIndex`, `phaseTitle`, `agentIndex`);
+- output/patch/worktree/branch paths and `jobId`; and
+- `runHandles`, an object containing authoritative runtime handles when
+  available.
+
+Terminal snapshots retain their final `status` (`completed`, `failed`, or
+`aborted`), progress, usage, IDs, and handles. The registry retains at most 256
+terminal records, keyed by subagent id and generation; a later generation must
+provide a distinct `runId` or session file before it can replace stale state.
+When the runtime persistence path is configured, terminal records are
+rehydrated across process restarts; without one, they are process-local.
+`replaySelectors: true` means hosts may select retained transcripts by
+`subagentId` or exact `sessionFile`, then continue from `fromByte` using the
+`nextByte` cursor and `reset` indicator.
 
 ## Prompt/Queue Concurrency and Ordering
 

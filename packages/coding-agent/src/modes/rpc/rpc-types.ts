@@ -6,7 +6,7 @@
  */
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import type { Effort, ImageContent, Model, ToolExample, Usage } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -39,6 +39,7 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "get_capabilities" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
@@ -73,6 +74,17 @@ export type RpcCommand =
 	// Bash
 	| { id?: string; type: "bash"; command: string }
 	| { id?: string; type: "abort_bash" }
+	// Native task/session operations
+	| { id?: string; type: "cancel_task"; taskId?: string; subagentId?: string; runId?: string }
+	| { id?: string; type: "checkpoint"; goal: string; mode?: "agent" | "snapshot" }
+	| {
+			id?: string;
+			type: "rewind";
+			report: string;
+			mode?: "agent" | "snapshot";
+			checkpointId?: string;
+			sessionId?: string;
+	  }
 
 	// Session
 	| { id?: string; type: "get_session_stats" }
@@ -91,6 +103,89 @@ export type RpcCommand =
 	// Login
 	| { id?: string; type: "get_login_providers" }
 	| { id?: string; type: "login"; providerId: string };
+
+// ============================================================================
+// RPC Capability and mutation contracts
+// ============================================================================
+
+export interface RpcSessionMutationState {
+	stable: boolean;
+	isStreaming: boolean;
+	isCompacting: boolean;
+	queuedMessageCount: number;
+	pendingAsyncWork: boolean;
+	liveChildTasks: boolean;
+	pendingExtensionRequests: number;
+	reasons: Array<
+		| "streaming"
+		| "compacting"
+		| "queued_messages"
+		| "pending_async_work"
+		| "live_child_tasks"
+		| "pending_extension_ui"
+	>;
+}
+
+export interface RpcCapabilities {
+	runtime: "omp";
+	contractVersion: 1;
+	protocolVersion: 1 | 2;
+	supportedProtocolVersions: [1, 2];
+	maxFrameBytes: number;
+	maxReassembledFrameBytes: number;
+	models: { discover: true; switch: true };
+	thinking: { discover: true; switch: true };
+	commands: { discover: true; invokeNative: true };
+	sessions: {
+		resume: true;
+		tree: true;
+		fork: true;
+		compact: true;
+		nativeCheckpoint: boolean;
+		completeTurnRollback: false;
+		mutationStability: true;
+	};
+	ui: {
+		select: true;
+		confirm: true;
+		input: true;
+		editor: true;
+		notify: true;
+		status: true;
+		widget: true;
+		openUrl: false;
+		arbitraryTerminalComponents: false;
+	};
+	tasks: {
+		lifecycle: boolean;
+		nested: boolean;
+		childTranscript: boolean;
+		workflows: false;
+		background: boolean;
+		targetedCancellation: boolean;
+		terminalRecords: boolean;
+		replaySelectors: boolean;
+	};
+}
+
+export interface RpcSubagentRunHandles {
+	sessionFile?: string;
+	transcript?: string;
+	outputPath?: string;
+	patchPath?: string;
+	worktreePath?: string;
+	branchName?: string;
+	branch?: string;
+	jobId?: string;
+	[key: string]: unknown;
+}
+
+export interface RpcSubagentWorkflow {
+	name?: string;
+	phaseIndex?: number;
+	phaseTitle?: string;
+	agentIndex?: number;
+}
 
 // ============================================================================
 // RPC State
@@ -114,6 +209,8 @@ export interface RpcSessionState {
 	messageCount: number;
 	queuedMessageCount: number;
 	todoPhases: TodoPhase[];
+	/** Explicit safety predicate for session tree/file mutation. */
+	mutation: RpcSessionMutationState;
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
@@ -174,9 +271,29 @@ export interface RpcSubagentSnapshot {
 	task?: string;
 	assignment?: string;
 	sessionFile?: string;
+	/** Stable execution generation. A new generation must use a new runId. */
+	runId?: string;
+	detached?: boolean;
+	startedAt?: number;
 	lastUpdate: number;
 	progress?: AgentProgress;
+	usage?: Usage;
+	parentId?: string;
 	parentToolCallId?: string;
+	role?: string;
+	modelRole?: string;
+	resolvedModel?: string;
+	resolvedModelIsFallback?: boolean;
+	attempt?: number;
+	workflow?: RpcSubagentWorkflow;
+	outputPath?: string;
+	patchPath?: string;
+	worktreePath?: string;
+	branchName?: string;
+	jobId?: string;
+
+	runHandles?: RpcSubagentRunHandles;
+	terminalAt?: number;
 }
 
 export interface RpcSubagentMessagesResult {
@@ -192,6 +309,13 @@ export interface RpcSubagentMessagesResult {
 // RPC Responses (stdout)
 // ============================================================================
 
+export interface RpcCheckpointResponseData {
+	goal: string;
+	startedAt: string;
+	checkpointId?: string;
+	sessionId?: string;
+}
+
 // Success responses with data
 export type RpcResponse =
 	// Protocol
@@ -200,7 +324,7 @@ export type RpcResponse =
 			type: "response";
 			command: "negotiate_protocol";
 			success: true;
-			data: { protocolVersion: 2 };
+			data: { protocolVersion: 1 | 2 };
 	  }
 
 	// Prompting (async - events follow)
@@ -213,6 +337,14 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "get_capabilities"; success: true; data: RpcCapabilities }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_task";
+			success: true;
+			data: { taskId: string; runId?: string; cancelled: true };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -301,6 +433,8 @@ export type RpcResponse =
 	// Bash
 	| { id?: string; type: "response"; command: "bash"; success: true; data: BashResult }
 	| { id?: string; type: "response"; command: "abort_bash"; success: true }
+	| { id?: string; type: "response"; command: "checkpoint"; success: true; data: RpcCheckpointResponseData }
+	| { id?: string; type: "response"; command: "rewind"; success: true; data: { report: string; rewound: boolean } }
 
 	// Session
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }

@@ -11,9 +11,11 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { once } from "node:events";
+import { join } from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
+import { AsyncJobManager } from "../../async/job-manager";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -26,7 +28,8 @@ import {
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AgentSession } from "../../session/agent-session";
+import { AgentRegistry } from "../../registry/agent-registry";
+import { type AgentSession, RpcCheckpointError } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
@@ -38,9 +41,10 @@ import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./h
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
-import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import { pageRpcMessages, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
+	RpcCapabilities,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -53,6 +57,7 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcResponse,
+	RpcSessionMutationState,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
@@ -463,7 +468,7 @@ export class RpcShutdownCoordinator {
 	}
 }
 
-export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
+export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear" | "hasLiveSubagents">;
 
 export async function handleRpcSessionChange(
 	session: RpcSessionChangeSession,
@@ -539,6 +544,160 @@ function shouldEmitRpcTitles(): boolean {
 
 function isSubagentSubscriptionLevel(value: unknown): value is RpcSubagentSubscriptionLevel {
 	return value === "off" || value === "progress" || value === "events";
+}
+
+/** Stable, fail-closed predicate used to describe whether session tree/file mutation is quiescent. */
+export function getRpcSessionMutationState(
+	session: Pick<AgentSession, "isStreaming" | "isCompacting" | "queuedMessageCount" | "hasPendingAsyncWork">,
+	context: { liveChildTasks?: boolean; pendingExtensionRequests?: number } = {},
+): RpcSessionMutationState {
+	const reasons: RpcSessionMutationState["reasons"] = [];
+	if (session.isStreaming) reasons.push("streaming");
+	if (session.isCompacting) reasons.push("compacting");
+	if (session.queuedMessageCount > 0) reasons.push("queued_messages");
+	if (session.hasPendingAsyncWork()) reasons.push("pending_async_work");
+	if (context.liveChildTasks === true) reasons.push("live_child_tasks");
+	const pendingExtensionRequests = Math.max(0, context.pendingExtensionRequests ?? 0);
+	if (pendingExtensionRequests > 0) reasons.push("pending_extension_ui");
+	return {
+		stable: reasons.length === 0,
+		isStreaming: session.isStreaming,
+		isCompacting: session.isCompacting,
+		queuedMessageCount: session.queuedMessageCount,
+		pendingAsyncWork: reasons.includes("pending_async_work"),
+		liveChildTasks: context.liveChildTasks === true,
+		pendingExtensionRequests,
+		reasons,
+	};
+}
+
+function rejectUnstableRpcSessionMutation(
+	id: string | undefined,
+	command: string,
+	session: Pick<AgentSession, "isStreaming" | "isCompacting" | "queuedMessageCount" | "hasPendingAsyncWork">,
+): RpcResponse | undefined {
+	const mutation = getRpcSessionMutationState(session);
+	if (mutation.stable) return undefined;
+	return {
+		id,
+		type: "response",
+		command,
+		success: false,
+		error: `Session is busy; ${mutation.reasons.join(", ")}`,
+		code: "session_busy",
+	};
+}
+
+function rejectRpcRootMutation(
+	id: string | undefined,
+	command: string,
+	session: Pick<AgentSession, "isStreaming" | "isCompacting" | "queuedMessageCount" | "hasPendingAsyncWork">,
+	subagentRegistry: Pick<RpcSubagentRegistry, "hasLiveSubagents"> | undefined,
+	pendingExtensionRequests: Pick<Map<string, PendingExtensionRequest>, "size">,
+): RpcResponse | undefined {
+	const mutation = getRpcSessionMutationState(session, {
+		liveChildTasks: subagentRegistry?.hasLiveSubagents() === true,
+		pendingExtensionRequests: pendingExtensionRequests.size,
+	});
+	if (mutation.stable) return undefined;
+	return {
+		id,
+		type: "response",
+		command,
+		success: false,
+		error: `Session is busy; ${mutation.reasons.join(", ")}`,
+		code: "session_busy",
+	};
+}
+const RPC_PROTOCOL_V2_COMMANDS: Record<string, true> = {
+	cancel_task: true,
+	checkpoint: true,
+	rewind: true,
+	get_messages_page: true,
+};
+
+export function rejectRpcCommandForProtocol(
+	id: string | undefined,
+	command: string,
+	protocolVersion: 1 | 2,
+): RpcResponse | undefined {
+	if (protocolVersion === 2 || RPC_PROTOCOL_V2_COMMANDS[command] !== true) return undefined;
+	return {
+		id,
+		type: "response",
+		command,
+		success: false,
+		error: `Command "${command}" requires negotiated RPC protocol v2`,
+		code: "unsupported_protocol",
+	};
+}
+/** Return a stable machine-readable error when a native operation is not wired for this runtime. */
+export function rejectRpcUnsupportedCapability(
+	id: string | undefined,
+	command: string,
+	capability: string,
+	supported: boolean,
+): RpcResponse | undefined {
+	if (supported) return undefined;
+	return {
+		id,
+		type: "response",
+		command,
+		success: false,
+		error: `RPC capability "${capability}" is unavailable`,
+		code: "unsupported_capability",
+	};
+}
+
+/** Build capabilities from the current negotiated transport and actual runtime wiring. */
+export function buildRpcCapabilities(
+	protocolVersion: 1 | 2,
+	subagentEventsAvailable: boolean,
+	options: { nativeCheckpoint?: boolean; targetedCancellation?: boolean } = {},
+): RpcCapabilities {
+	const v2 = protocolVersion === 2;
+	return {
+		runtime: "omp",
+		contractVersion: 1,
+		protocolVersion,
+		supportedProtocolVersions: [1, 2],
+		maxFrameBytes: MAX_RPC_FRAME_BYTES,
+		maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+		models: { discover: true, switch: true },
+		thinking: { discover: true, switch: true },
+		commands: { discover: true, invokeNative: true },
+		sessions: {
+			resume: true,
+			tree: true,
+			fork: true,
+			compact: true,
+			nativeCheckpoint: v2 && options.nativeCheckpoint === true,
+			completeTurnRollback: false,
+			mutationStability: true,
+		},
+
+		ui: {
+			select: true,
+			confirm: true,
+			input: true,
+			editor: true,
+			notify: true,
+			status: true,
+			widget: true,
+			openUrl: false,
+			arbitraryTerminalComponents: false,
+		},
+		tasks: {
+			lifecycle: subagentEventsAvailable,
+			nested: subagentEventsAvailable,
+			childTranscript: subagentEventsAvailable,
+			workflows: false,
+			background: subagentEventsAvailable,
+			targetedCancellation: v2 && options.targetedCancellation === true,
+			terminalRecords: subagentEventsAvailable,
+			replaySelectors: subagentEventsAvailable,
+		},
+	};
 }
 
 export function requestRpcEditor(
@@ -655,6 +814,11 @@ export function requestRpcDialog<T>(
 	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
+/** Restore the notification setting after the RPC transport relinquishes process ownership. */
+export function restoreRpcNotifications(previous: string | undefined): void {
+	if (previous === undefined) delete process.env.PI_NOTIFICATIONS;
+	else process.env.PI_NOTIFICATIONS = previous;
+}
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -665,17 +829,18 @@ export async function runRpcMode(
 	eventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
 ): Promise<never> {
-	// Signal to RPC clients that the server is ready to accept commands
-	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
-	// process.stdout with no newline, which the reader merges with the next JSON line and
-	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
-	// may write there.
+	const previousPiNotifications = process.env.PI_NOTIFICATIONS;
+	const restorePiNotifications = (): void => restoreRpcNotifications(previousPiNotifications);
+	// Native notifications must never contaminate stdout, which is the JSONL
+	// transport owned by the host.
 	process.env.PI_NOTIFICATIONS = "off";
 
 	const frameEncoder = new RpcFrameEncoder();
+	let negotiatedProtocolVersion: 1 | 2 = 1;
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
+
 	let stdoutQueue: Promise<void> = Promise.resolve();
 	const writeFrames = (frames: Iterable<string>) => {
 		stdoutQueue = stdoutQueue
@@ -698,8 +863,11 @@ export async function runRpcMode(
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeFrames(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
-			frameEncoder.setProtocolVersion(2);
+		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true) {
+			const data = isRecord(obj.data) ? obj.data : undefined;
+			const protocolVersion = data?.protocolVersion;
+			if (protocolVersion === 1 || protocolVersion === 2) frameEncoder.setProtocolVersion(protocolVersion);
+		}
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -717,13 +885,29 @@ export async function runRpcMode(
 	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
-
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
-
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
-	const subagentRegistry = eventBus ? new RpcSubagentRegistry(eventBus, output) : undefined;
+	const subagentRegistry = eventBus
+		? new RpcSubagentRegistry(
+				eventBus,
+				output,
+				join(
+					session.sessionManager.getSessionDir(),
+					`.omp-rpc-subagents-${session.sessionManager.getSessionId()}.json`,
+				),
+			)
+		: undefined;
+	await subagentRegistry?.hydrate();
+
+	const getCapabilities = (): RpcCapabilities => {
+		const activeTools = session.getActiveToolNames();
+		return buildRpcCapabilities(negotiatedProtocolVersion, subagentRegistry !== undefined, {
+			nativeCheckpoint: activeTools.includes("checkpoint") && activeTools.includes("rewind"),
+			targetedCancellation: subagentRegistry !== undefined,
+		});
+	};
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -975,12 +1159,21 @@ export async function runRpcMode(
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		const protocolError = rejectRpcCommandForProtocol(id, command.type, negotiatedProtocolVersion);
+		if (protocolError) return protocolError;
 
 		switch (command.type) {
 			case "negotiate_protocol": {
-				if (command.protocolVersion !== 2)
-					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
-				return success(id, "negotiate_protocol", { protocolVersion: 2 });
+				if (command.protocolVersion !== 1 && command.protocolVersion !== 2) {
+					return error(
+						id,
+						"negotiate_protocol",
+						`Unsupported RPC protocol version: ${command.protocolVersion}`,
+						"unsupported_protocol_version",
+					);
+				}
+				negotiatedProtocolVersion = command.protocolVersion;
+				return success(id, "negotiate_protocol", { protocolVersion: negotiatedProtocolVersion });
 			}
 
 			// =================================================================
@@ -1064,6 +1257,15 @@ export async function runRpcMode(
 			case "new_session":
 			case "switch_session":
 			case "branch": {
+				const mutationError = rejectRpcRootMutation(
+					id,
+					command.type,
+					session,
+					subagentRegistry,
+					pendingExtensionRequests,
+				);
+				if (mutationError) return mutationError;
+
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
@@ -1072,6 +1274,10 @@ export async function runRpcMode(
 			// =================================================================
 			// State
 			// =================================================================
+
+			case "get_capabilities": {
+				return success(id, "get_capabilities", getCapabilities());
+			}
 
 			case "get_state": {
 				const state: RpcSessionState = {
@@ -1100,6 +1306,10 @@ export async function runRpcMode(
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					mutation: getRpcSessionMutationState(session, {
+						liveChildTasks: subagentRegistry?.hasLiveSubagents() === true,
+						pendingExtensionRequests: pendingExtensionRequests.size,
+					}),
 				};
 				return success(id, "get_state", state);
 			}
@@ -1258,6 +1468,14 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "compact": {
+				const mutationError = rejectRpcRootMutation(
+					id,
+					"compact",
+					session,
+					subagentRegistry,
+					pendingExtensionRequests,
+				);
+				if (mutationError) return mutationError;
 				const result = await session.compact(command.customInstructions);
 				return success(id, "compact", result);
 			}
@@ -1279,6 +1497,109 @@ export async function runRpcMode(
 			case "abort_retry": {
 				session.abortRetry();
 				return success(id, "abort_retry");
+			}
+
+			case "cancel_task": {
+				const cancellationCapabilityError = rejectRpcUnsupportedCapability(
+					id,
+					"cancel_task",
+					"tasks.targetedCancellation",
+					getCapabilities().tasks.targetedCancellation,
+				);
+				if (cancellationCapabilityError) return cancellationCapabilityError;
+				const taskId = command.taskId ?? command.subagentId;
+
+				if (!taskId) return error(id, "cancel_task", "cancel_task requires taskId", "invalid_request");
+				if (!subagentRegistry) {
+					return error(id, "cancel_task", "Targeted task cancellation is unavailable", "unsupported_capability");
+				}
+				const snapshot = subagentRegistry.getSubagents().find(candidate => candidate.id === taskId);
+				if (!snapshot) return error(id, "cancel_task", `Unknown task: ${taskId}`, "unknown_task");
+				const ownerId = session.getAgentId();
+				if (ownerId === undefined || snapshot.parentId !== ownerId) {
+					return error(id, "cancel_task", `Task is not owned by this session: ${taskId}`, "foreign_task");
+				}
+				if (snapshot.status !== "running") {
+					return error(id, "cancel_task", `Task is not running: ${taskId}`, "not_running");
+				}
+				if (snapshot.runId !== undefined && snapshot.runId !== command.runId) {
+					return error(id, "cancel_task", `Unknown run handle for task: ${taskId}`, "unknown_run");
+				}
+				const ref = AgentRegistry.global().get(taskId);
+				if (
+					!ref ||
+					(ref.status !== "running" && ref.status !== "idle") ||
+					!ref.session ||
+					(snapshot.sessionFile !== undefined &&
+						ref.sessionFile !== null &&
+						ref.sessionFile !== snapshot.sessionFile)
+				) {
+					return error(id, "cancel_task", `Task is not running: ${taskId}`, "not_running");
+				}
+				const managerCancelled =
+					AsyncJobManager.instance()?.cancel(taskId, ownerId ? { ownerId } : undefined) ?? false;
+				const runCancelled =
+					snapshot.runId !== undefined && AgentRegistry.global().cancel(taskId, snapshot.runId, ref);
+				if (!managerCancelled && !runCancelled) {
+					// Synchronous task runs have no AsyncJobManager row; the registry
+					// generation hook still aborts setup before provider dispatch.
+					await ref.session.abort({ reason: `RPC cancellation: ${taskId}` });
+				}
+				return success(id, "cancel_task", { taskId, runId: snapshot.runId, cancelled: true });
+			}
+
+			case "checkpoint":
+			case "rewind": {
+				const checkpointCapabilityError = rejectRpcUnsupportedCapability(
+					id,
+					command.type,
+					"sessions.nativeCheckpoint",
+					getCapabilities().sessions.nativeCheckpoint,
+				);
+				if (checkpointCapabilityError) return checkpointCapabilityError;
+				const mutationError = rejectRpcRootMutation(
+					id,
+					command.type,
+					session,
+					subagentRegistry,
+					pendingExtensionRequests,
+				);
+				if (mutationError) return mutationError;
+				try {
+					if (command.type === "checkpoint") {
+						const mode = command.mode ?? "agent";
+						if (mode !== "agent" && mode !== "snapshot") {
+							return error(
+								id,
+								"checkpoint",
+								`Unsupported checkpoint mode: ${String(command.mode)}`,
+								"invalid_request",
+							);
+						}
+						return success(id, "checkpoint", session.createRpcCheckpoint(command.goal, mode));
+					}
+					const mode = command.mode ?? "agent";
+					if (mode !== "agent" && mode !== "snapshot") {
+						return error(id, "rewind", `Unsupported rewind mode: ${String(command.mode)}`, "invalid_request");
+					}
+					return success(
+						id,
+						"rewind",
+						await session.rewindRpcCheckpoint(
+							command.report,
+							mode === "snapshot"
+								? { mode, checkpointId: command.checkpointId, sessionId: command.sessionId }
+								: undefined,
+						),
+					);
+				} catch (cause) {
+					return error(
+						id,
+						command.type,
+						cause instanceof Error ? cause.message : String(cause),
+						cause instanceof RpcCheckpointError ? cause.code : undefined,
+					);
+				}
 			}
 
 			// =================================================================
@@ -1320,6 +1641,15 @@ export async function runRpcMode(
 			}
 
 			case "set_session_name": {
+				const mutationError = rejectRpcRootMutation(
+					id,
+					"set_session_name",
+					session,
+					subagentRegistry,
+					pendingExtensionRequests,
+				);
+				if (mutationError) return mutationError;
+
 				const name = command.name.trim();
 				if (!name) {
 					return error(id, "set_session_name", "Session name cannot be empty");
@@ -1332,6 +1662,15 @@ export async function runRpcMode(
 			}
 
 			case "handoff": {
+				const mutationError = rejectRpcRootMutation(
+					id,
+					"handoff",
+					session,
+					subagentRegistry,
+					pendingExtensionRequests,
+				);
+				if (mutationError) return mutationError;
+
 				// Resetting the agent mid-stream lets the live turn keep emitting into a
 				// session that handoff has already torn down. Refuse while a prompt is in
 				// flight (mirrors the TUI /handoff guard).
@@ -1351,8 +1690,8 @@ export async function runRpcMode(
 			}
 
 			case "get_messages_page": {
-				if (session.isStreaming || session.isCompacting)
-					return error(id, "get_messages_page", RPC_MESSAGES_PAGE_BUSY_ERROR, "session_busy");
+				const mutationError = rejectUnstableRpcSessionMutation(id, "get_messages_page", session);
+				if (mutationError) return mutationError;
 				const messages = session.messages;
 				try {
 					return success(
@@ -1443,8 +1782,13 @@ export async function runRpcMode(
 			}
 
 			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				const unknownCommand = command as { id?: string; type: string };
+				return error(
+					id ?? unknownCommand.id,
+					unknownCommand.type,
+					`Unknown command: ${unknownCommand.type}`,
+					"unknown_command",
+				);
 			}
 		}
 	};
@@ -1461,7 +1805,9 @@ export async function runRpcMode(
 			// the process exits. dispose() also emits `session_shutdown`, so we
 			// must NOT emit it separately here or the event fires twice. Skipping
 			// dispose left OMP-owned Chromium alive after RPC shutdown (#5643).
+			await subagentRegistry?.flush();
 			await session.dispose();
+			restorePiNotifications();
 			process.exit(0);
 		},
 	});
@@ -1501,11 +1847,13 @@ export async function runRpcMode(
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
+	await subagentRegistry?.flush();
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle
 	// immediately.
 	await session.dispose();
+	restorePiNotifications();
 	process.exit(0);
 }

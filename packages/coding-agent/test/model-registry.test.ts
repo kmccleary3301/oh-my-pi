@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { Effort, type FetchImpl, type Model, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { MAX_CONTEXT_WINDOW_TOKENS, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -993,28 +993,35 @@ describe("ModelRegistry", () => {
 			expect(anthropicModels.some(m => m.id.includes("claude"))).toBe(true);
 		});
 
-		test("built-in gpt-5.4 applies the hardcoded context window policy", () => {
-			expect(sharedBuiltin.find("openai", "gpt-5.4")?.contextWindow).toBe(1_000_000);
+		test("applies OMP's global context window cap to built-in models", () => {
+			for (const [provider, modelId] of [
+				["openai", "gpt-5.4"],
+				["openai-codex", "gpt-5.6-sol"],
+				["google", "gemini-3.7-flash"],
+				["anthropic", "claude-opus-4-8"],
+			] as const) {
+				expect(sharedBuiltin.find(provider, modelId)?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
+			}
 		});
 
-		test("custom gpt-5.4 replacement keeps the hardcoded context window when contextWindow is omitted", () => {
+		test("caps custom gpt-5.4 replacements when contextWindow is omitted", () => {
 			const model = openaiGpt54Replace.find("openai", "gpt-5.4");
-			expect(model?.contextWindow).toBe(1_000_000);
+			expect(model?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
-		test("custom-only gpt-5.4 provider keeps the hardcoded context window when contextWindow is omitted", () => {
+		test("caps custom-only gpt-5.4 models when contextWindow is omitted", () => {
 			const model = myProxyGpt54.find("my-proxy", "gpt-5.4");
-			expect(model?.contextWindow).toBe(1_000_000);
+			expect(model?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
-		test("custom gpt-5.4 replacement preserves its explicit context window", () => {
+		test("custom gpt-5.4 replacement preserves its explicit context window below the cap", () => {
 			expect(openaiGpt54Explicit.find("openai", "gpt-5.4")?.contextWindow).toBe(256000);
 		});
 
-		test("modelOverrides can still patch a custom gpt-5.4 replacement", () => {
-			expect(openaiGpt54Override.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
+		test("caps modelOverrides above the global context window", () => {
+			expect(openaiGpt54Override.find("openai", "gpt-5.4")?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 		});
 
 		test("discoverable bundled replacement survives refresh", async () => {
@@ -1050,12 +1057,12 @@ describe("ModelRegistry", () => {
 			});
 			const fetchMock = mockOpenAiCompatibleModels("http://127.0.0.1:8080/models", ["gpt-5.4"]);
 			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
-			expect(registry.find("custom-local", "gpt-5.4")?.contextWindow).toBe(1_000_000);
+			expect(registry.find("custom-local", "gpt-5.4")?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 
 			await registry.refreshProvider("custom-local", "online");
 
 			const model = registry.find("custom-local", "gpt-5.4");
-			expect(model?.contextWindow).toBe(1_000_000);
+			expect(model?.contextWindow ?? 0).toBeLessThanOrEqual(MAX_CONTEXT_WINDOW_TOKENS);
 			// llama.cpp discovery probes the bare root (`/models`, `/props`); chat
 			// traffic must go to the OpenAI-compatible `/v1` prefix.
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080/v1");
@@ -1107,11 +1114,11 @@ describe("ModelRegistry", () => {
 			});
 			const fetchMock = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
 			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
-			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
+			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 
 			await registry.refreshProvider("openai", "online");
 
-			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
+			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(MAX_CONTEXT_WINDOW_TOKENS);
 		});
 
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {
