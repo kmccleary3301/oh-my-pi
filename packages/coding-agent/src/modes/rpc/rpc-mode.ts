@@ -1543,7 +1543,37 @@ export async function runRpcMode(
 				if (!managerCancelled && !runCancelled) {
 					// Synchronous task runs have no AsyncJobManager row; the registry
 					// generation hook still aborts setup before provider dispatch.
-					await ref.session.abort({ reason: `RPC cancellation: ${taskId}` });
+					// session.abort() waits for the child loop to become idle, which
+					// can stall for executor-driven subagent sessions whose pump is
+					// blocked on the parent tool call. Race the abort against the
+					// registry observing a terminal transition so the RPC client
+					// always receives a response.
+					const abortSettled = ref.session
+						.abort({ reason: `RPC cancellation: ${taskId}` })
+						.then(() => "settled" as const);
+					const registry = AgentRegistry.global();
+					const pollTerminal = (async () => {
+						const deadline = Date.now() + 10_000;
+						while (Date.now() < deadline) {
+							const status = registry.get(taskId)?.status;
+							if (status !== "running" && status !== "idle") return "terminal" as const;
+							await Bun.sleep(100);
+						}
+						return "timeout" as const;
+					})();
+					const outcome = await Promise.race([
+						abortSettled,
+						pollTerminal,
+						Bun.sleep(10_000).then(() => "timeout" as const),
+					]);
+					if (outcome === "timeout") {
+						return error(
+							id,
+							"cancel_task",
+							`Task cancellation did not settle: ${taskId}`,
+							"cancel_timeout",
+						);
+					}
 				}
 				return success(id, "cancel_task", { taskId, runId: snapshot.runId, cancelled: true });
 			}
