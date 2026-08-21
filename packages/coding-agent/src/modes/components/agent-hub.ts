@@ -18,21 +18,13 @@ import {
 	Container,
 	matchesKey,
 	type OverlayHandle,
-	padding,
 	routeSelectListMouse,
 	routeSgrMouseInput,
 	type SelectListMouseTarget,
 	type TUI,
-	visibleWidth,
-	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
-import { formatAge, formatNumber, getProjectDir, logger } from "@oh-my-pi/pi-utils";
-import {
-	AgentActivityIndex,
-	type AgentActivityKind,
-	type AgentActivityRow,
-	activityRowsFromProgress,
-} from "../../activity";
+import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { AgentActivityIndex, activityRowsFromProgress } from "../../activity";
 import type { KeyId } from "../../config/keybindings";
 import type { Settings } from "../../config/settings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
@@ -41,7 +33,6 @@ import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
-import { shortenPath, truncateToWidth } from "../../tools/render-utils";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
@@ -53,74 +44,16 @@ import {
 	projectAgentTree,
 	STATUS_ORDER,
 } from "./agent-hub-projection";
-import {
-	clampHubLine,
-	contextGauge,
-	formatChildIds,
-	formatCost,
-	formatMetricDuration,
-	formatMetrics,
-	formatRoleBadge,
-	modelBadge,
-	type RosterRender,
-	sanitizeDisplayText,
-	sanitizeLine,
-	statusGlyph,
-	statusText,
-	treeBranch,
-} from "./agent-hub-renderer";
+import { clampHubLine } from "./agent-hub-renderer";
+import { ActivityView } from "./agent-hub/activity-view";
+import { RosterView, type HubViewMode } from "./agent-hub/roster-view";
 import { AgentTranscriptViewer } from "./agent-transcript-viewer";
-import {
-	bottomBorder,
-	divider,
-	dividerSplit,
-	row,
-	splitBodyWidth,
-	splitRow,
-	topBorder,
-	topBorderSplit,
-} from "./overlay-box";
-
-/** Two-pane mode needs a useful roster and a readable inspector. */
-const SPLIT_MIN_WIDTH = 96;
-const DETAIL_MIN_WIDTH = 34;
-const ROSTER_MIN_WIDTH = 48;
-
 export type AgentHubSection = "agents" | "activity";
-type HubViewMode = "roster" | "tree";
-type ActivityFilter = "all" | "errors" | "responses" | "tools";
-type ActivityScope = "all" | "agent" | "subtree";
-
 /** Refresh cadence for the relative-time column. */
 const AGE_TICK_MS = 5_000;
 const DATA_CHANGE_RENDER_COALESCE_MS = 100;
 /** Double-tap window for the table's left-left "close hub" gesture. */
 const LEFT_TAP_WINDOW_MS = 500;
-
-function activityGlyph(row: AgentActivityRow): string {
-	if (row.status === "error") return theme.fg("error", theme.status.error);
-	if (row.status === "aborted") return theme.fg("warning", theme.status.aborted);
-	if (row.status === "pending") return theme.fg("accent", theme.status.running);
-	switch (row.kind) {
-		case "response":
-			return theme.fg("success", "◆");
-		case "tool":
-			return theme.fg("success", theme.status.success);
-		case "irc":
-			return theme.fg("accent", "→");
-		case "lifecycle":
-			return theme.fg("muted", "○");
-	}
-}
-
-function activityClock(timestamp: number): string {
-	return new Date(timestamp).toLocaleTimeString(undefined, {
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-		hour12: false,
-	});
-}
 /** Result of one host-backed transcript read for the Agent Hub viewer. */
 export interface AgentHubRemoteTranscript {
 	text: string;
@@ -128,7 +61,6 @@ export interface AgentHubRemoteTranscript {
 	/** Terminal read failure reported by the host; guests should surface it instead of retrying hot. */
 	error?: string;
 }
-
 /** Guest-side proxy for hub actions executed on the collab host. */
 export interface AgentHubRemote {
 	chat(id: string, text: string): void;
@@ -137,7 +69,6 @@ export interface AgentHubRemote {
 	/** Mirrors readFileIncremental: text from fromByte (complete JSONL lines), newSize = next fromByte base; null = temporarily unavailable. */
 	readTranscript(id: string, fromByte: number): Promise<AgentHubRemoteTranscript | null>;
 }
-
 export interface AgentHubDeps {
 	/** Progress/status snapshot source (task lifecycle + progress channels). */
 	observers: SessionObserverRegistry;
@@ -176,11 +107,9 @@ export interface AgentHubDeps {
 	initialSection?: AgentHubSection;
 	/** Injectable unified activity source; production creates one from local or remote transcripts. */
 	activity?: AgentActivityIndex;
-
 	/** Collab guest: route actions/transcripts to the host instead of local sessions. */
 	remote?: AgentHubRemote;
 }
-
 export class AgentHubOverlayComponent extends Container implements SelectListMouseTarget {
 	#registry: AgentRegistry;
 	#observers: SessionObserverRegistry;
@@ -202,16 +131,11 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#section: AgentHubSection;
 	#activity: AgentActivityIndex;
 	#manageActivityLive: boolean;
-	#activityRows: AgentActivityRow[] = [];
+	#activityView: ActivityView;
+	#rosterView: RosterView;
 	#selectedActivityRow = 0;
-	#activityFilter: ActivityFilter = "all";
-	#activityScope: ActivityScope = "all";
-	#activitySearch = "";
-	#activitySearchEditing = false;
-	#activityFollow = true;
 	#activitySyncGeneration = 0;
 	#activitySyncStamp = new Map<string, string>();
-
 	// Table state
 	#rows: AgentRef[] = [];
 	#statusCounts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
@@ -254,7 +178,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	/** Scroll offset for the selected-agent inspector when its content overflows. */
 	#detailScrollOffset = 0;
 	#detailAgentId: string | undefined;
-
 	// Transcript-viewer launch deps (passed through to AgentTranscriptViewer).
 	#ui: TUI;
 	#getTool: ((name: string) => AgentTool | undefined) | undefined;
@@ -265,11 +188,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#proseOnlyThinking: (() => boolean) | undefined;
 	#expandKeys: KeyId[];
 	#focusAgent: ((id: string) => Promise<void>) | undefined;
-
 	// Fullscreen transcript overlay opened by openChat(), if any.
 	#transcriptOverlay: OverlayHandle | undefined;
 	#transcriptViewer: AgentTranscriptViewer | undefined;
-
 	constructor(deps: AgentHubDeps) {
 		super();
 		this.#registry = deps.registry ?? AgentRegistry.global();
@@ -301,13 +222,55 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#proseOnlyThinking = deps.proseOnlyThinking;
 		this.#expandKeys = deps.expandKeys ?? ["ctrl+o"];
 		this.#focusAgent = deps.focusAgent;
-
+		this.#activityView = new ActivityView({
+			activity: this.#activity,
+			registry: this.#registry,
+			settings: this.#settings,
+			getRows: () => this.#rows,
+			getSelectedAgentIndex: () => this.#selectedRow,
+			getSelectedActivityRow: () => this.#selectedActivityRow,
+			setSelectedActivityRow: index => {
+				this.#selectedActivityRow = index;
+			},
+			getChildrenByParent: () => this.#childrenByParent,
+			getObserved: id => this.#observedById.get(id),
+			sectionTabs: () => this.#sectionTabs(),
+			onSwitchToAgents: () => this.#switchSection("agents"),
+			onDone: this.#onDone,
+			openChat: (id, entryId) => this.openChat(id, entryId),
+			requestRender: this.#requestRender,
+		});
+		this.#rosterView = new RosterView({
+			registry: this.#registry,
+			ircUnreadCount: id => this.#irc.unreadCount(id),
+			settings: this.#settings,
+			activity: this.#activity,
+			getRows: () => this.#rows,
+			getSelectedRow: () => this.#selectedRow,
+			getHoveredRow: () => this.#hoveredRow,
+			getViewMode: () => this.#viewMode,
+			getTreeDepthById: () => this.#treeDepthById,
+			getTreeParentById: () => this.#treeParentById,
+			getTreeLastSiblingById: () => this.#treeLastSiblingById,
+			getObserved: id => this.#observableFor(id),
+			getMetrics: (ref, observed) => this.#metricsFor(ref, observed),
+			getAggregate: () => this.#aggregate,
+			getStatusCounts: () => this.#statusCounts,
+			getChildrenByParent: () => this.#childrenByParent,
+			getNotice: () => this.#notice,
+			isLoadingPersistedSubagents: () => this.#loadingPersistedSubagents,
+			isNarrowDetailsOpen: () => this.#narrowDetailsOpen,
+			getDetailScrollOffset: () => this.#detailScrollOffset,
+			setDetailScrollOffset: offset => {
+				this.#detailScrollOffset = offset;
+			},
+		});
 		this.#unsubscribers.push(this.#registry.onChange(() => this.#scheduleDataChange()));
 		this.#unsubscribers.push(this.#observers.onChange(() => this.#scheduleDataChange()));
 		if (!this.#manageActivityLive) {
 			this.#unsubscribers.push(
 				this.#activity.onChange(() => {
-					this.#refreshActivityRows();
+					this.#activityView.refreshRows();
 					this.#requestRender();
 				}),
 			);
@@ -319,7 +282,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			this.#requestRender();
 		}, AGE_TICK_MS);
 		this.#ageTimer.unref?.();
-
 		this.persistedSubagentsReady = this.#remote
 			? Promise.resolve()
 			: registerPersistedSubagents(this.#registry, deps.sessionFile, {
@@ -337,7 +299,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 					});
 		this.#refreshRows();
 	}
-
 	/**
 	 * Whether the current table view has no agents to show (every registered agent
 	 * except Main). Persisted historical rows may arrive later; callers that need
@@ -346,7 +307,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	get isEmpty(): boolean {
 		return this.#rows.length === 0;
 	}
-
 	/** Tear down every subscription and timer. Called by the overlay owner on close. */
 	override dispose(): void {
 		if (this.#disposed) return;
@@ -362,23 +322,26 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		}
 		this.#closeTranscriptOverlay();
 	}
-
 	override render(width: number): readonly string[] {
 		const termHeight = this.#ui.terminal?.rows || process.stdout.rows || 40;
-		const frame = (
-			this.#section === "activity"
-				? this.#renderActivityTable(width, termHeight)
-				: this.#renderTable(width, termHeight)
-		).map(line => clampHubLine(line, width));
+		let frame: string[];
+		if (this.#section === "activity") {
+			frame = this.#activityView.render(width, termHeight);
+		} else {
+			const rosterFrame = this.#rosterView.render(width, termHeight);
+			this.#hitRows = rosterFrame.hitRows;
+			this.#lastSplitRosterWidth = rosterFrame.splitRosterWidth;
+			this.#lastRenderWasSplit = rosterFrame.splitRosterWidth !== undefined;
+			frame = rosterFrame.lines;
+		}
+		frame = frame.map(line => clampHubLine(line, width));
 		if (frame.length <= termHeight) return frame;
-
 		// A tiny terminal can leave less room than the fixed chrome needs. Keep
 		// the title and footer visible instead of spilling into scrollback.
 		const footerLines = Math.min(3, frame.length);
 		const bodyEnd = Math.max(0, termHeight - footerLines);
 		return [...frame.slice(0, bodyEnd), ...frame.slice(-footerLines)].slice(0, termHeight);
 	}
-
 	handleInput(keyData: string): void {
 		if (
 			routeSgrMouseInput(keyData, event => {
@@ -389,16 +352,15 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		) {
 			return;
 		}
-
+		if (this.#section === "activity" && this.#activityView.isSearchEditing) {
+			this.#activityView.handleInput(keyData);
+			return;
+		}
 		for (const key of this.#hubKeys) {
 			if (matchesKey(keyData, key)) {
 				this.#onDone();
 				return;
 			}
-		}
-		if (this.#section === "activity" && this.#activitySearchEditing) {
-			this.#handleActivitySearchInput(keyData);
-			return;
 		}
 		if (keyData === "1") {
 			this.#switchSection("agents");
@@ -408,10 +370,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			this.#switchSection("activity");
 			return;
 		}
-		if (this.#section === "activity") this.#handleActivityInput(keyData);
+		if (this.#section === "activity") this.#activityView.handleInput(keyData);
 		else this.#handleTableInput(keyData);
 	}
-
 	/**
 	 * Seed the table's left-left close detector with the current time so a single
 	 * subsequent `←` (within {@link LEFT_TAP_WINDOW_MS}) dismisses the hub.
@@ -424,7 +385,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	armCloseTap(): void {
 		this.#lastLeftTap = Date.now();
 	}
-
 	/**
 	 * Open the fullscreen transcript viewer for an agent id (public for table Enter
 	 * and tests). Mounts {@link AgentTranscriptViewer} as a `fullscreen` overlay so it
@@ -466,7 +426,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#ui.setFocus(viewer);
 		this.#requestRender();
 	}
-
 	/** Close and dispose the transcript overlay, restoring focus to the hub table. */
 	#closeTranscriptOverlay(expectedViewer?: AgentTranscriptViewer): void {
 		if (expectedViewer && this.#transcriptViewer !== expectedViewer) return;
@@ -482,11 +441,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			this.#requestRender();
 		}
 	}
-
-	// ========================================================================
 	// Live data plumbing
-	// ========================================================================
-
 	#scheduleDataChange(): void {
 		if (this.#dataChangeTimer) return;
 		this.#dataChangeTimer = setTimeout(() => {
@@ -495,12 +450,10 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		}, DATA_CHANGE_RENDER_COALESCE_MS);
 		this.#dataChangeTimer.unref?.();
 	}
-
 	#onDataChange(): void {
 		this.#refreshRows();
 		this.#requestRender();
 	}
-
 	#refreshRows(): void {
 		const selectedId = this.#rows[this.#selectedRow]?.id;
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
@@ -525,7 +478,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 				if (!rowOrder.has(ref.id)) rowOrder.set(ref.id, this.#nextRowOrder++);
 			}
 		}
-
 		if (this.#viewMode === "tree") {
 			const tree = projectAgentTree(rosterRows);
 			this.#rows = tree.rows;
@@ -545,7 +497,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			this.#detailAgentId = detailAgentId;
 			this.#detailScrollOffset = 0;
 		}
-
 		this.#childrenByParent.clear();
 		for (const ref of rosterRows) {
 			const parent = ref.parentId ?? MAIN_AGENT_ID;
@@ -557,9 +508,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		for (const ref of rosterRows) this.#statusCounts[ref.status]++;
 		this.#refreshAggregate();
 		this.#refreshActivityData(rosterRows);
-		this.#refreshActivityRows();
+		this.#activityView.refreshRows();
 	}
-
 	#refreshActivityData(refs: readonly AgentRef[]): void {
 		if (this.#manageActivityLive) {
 			const liveIds = new Set<string>();
@@ -574,7 +524,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 				if (!liveIds.has(ref.id)) this.#activity.setLive(ref.id, []);
 			}
 		}
-
 		const generation = ++this.#activitySyncGeneration;
 		const pending: Promise<void>[] = [];
 		for (const ref of refs) {
@@ -588,58 +537,19 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		void Promise.all(pending)
 			.then(() => {
 				if (this.#disposed || generation !== this.#activitySyncGeneration) return;
-				this.#refreshActivityRows();
+				this.#activityView.refreshRows();
 				this.#requestRender();
 			})
 			.catch(() => {
 				// Individual sync paths already guard I/O failures; keep the hub render loop alive.
 			});
 	}
-
-	#activityAgentIds(): ReadonlySet<string> | undefined {
-		if (this.#activityScope === "all") return undefined;
-		const selected = this.#rows[this.#selectedRow]?.id;
-		if (!selected) return new Set();
-		const ids = new Set([selected]);
-		if (this.#activityScope === "agent") return ids;
-		const queue = [selected];
-		for (let index = 0; index < queue.length; index++) {
-			for (const child of this.#childrenByParent.get(queue[index]!) ?? []) {
-				if (ids.has(child.id)) continue;
-				ids.add(child.id);
-				queue.push(child.id);
-			}
-		}
-		return ids;
-	}
-
-	#refreshActivityRows(): void {
-		const kinds: ReadonlySet<AgentActivityKind> | undefined =
-			this.#activityFilter === "responses"
-				? new Set(["response"])
-				: this.#activityFilter === "tools"
-					? new Set(["tool"])
-					: undefined;
-		let rows = this.#activity.query({
-			agentIds: this.#activityAgentIds(),
-			kinds,
-			search: this.#activitySearch,
-			limit: 2_000,
-		});
-		if (this.#activityFilter === "errors") rows = rows.filter(row => row.status === "error");
-		this.#activityRows = rows;
-		if (rows.length === 0) this.#selectedActivityRow = 0;
-		else if (this.#activityFollow) this.#selectedActivityRow = rows.length - 1;
-		else this.#selectedActivityRow = Math.min(this.#selectedActivityRow, rows.length - 1);
-	}
-
 	#metricsFor(ref: AgentRef, observed: ObservableSession | undefined): AgentMetrics | undefined {
 		if (observed?.progress) return progressMetrics(observed);
 		if (ref.history?.metrics) return ref.history.metrics;
 		const session = this.#fallbackStatsSession(ref, observed);
 		return session ? this.#sessionMetrics.get(session)?.metrics : undefined;
 	}
-
 	#fallbackStatsSession(
 		ref: AgentRef,
 		observed: ObservableSession | undefined,
@@ -648,338 +558,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const session = ref.session;
 		return session && typeof session.getSessionStats === "function" ? session : undefined;
 	}
-
-	// ========================================================================
-	// Table view
-	// ========================================================================
-
-	#sectionTabs(): string {
-		const tab = (section: AgentHubSection, label: string): string =>
-			this.#section === section
-				? theme.bg("selectedBg", theme.bold(theme.fg("accent", ` ${label} `)))
-				: theme.fg("muted", ` ${label} `);
-		return `${tab("agents", "1 Agents")}${theme.fg("dim", theme.sep.dot)}${tab("activity", "2 Activity")}`;
-	}
-
-	#renderActivityTable(width: number, termHeight: number): string[] {
-		this.#hitRows.length = 0;
-		const innerWidth = Math.max(1, width - 4);
-		const contentRows = Math.max(1, termHeight - 4);
-		const body: string[] = [this.#sectionTabs()];
-		const selectedAgent = this.#rows[this.#selectedRow]?.id;
-		const scope =
-			this.#activityScope === "all"
-				? "all agents"
-				: this.#activityScope === "agent"
-					? (selectedAgent ?? "selected agent")
-					: `${selectedAgent ?? "selected"} subtree`;
-		const search = this.#activitySearchEditing
-			? theme.fg("accent", `search: ${this.#activitySearch}▌`)
-			: this.#activitySearch
-				? `search: ${this.#activitySearch}`
-				: "search: —";
-		body.push(
-			theme.fg(
-				"dim",
-				`${scope}${theme.sep.dot}${this.#activityFilter}${theme.sep.dot}${this.#activityFollow ? "following" : "paused"}${theme.sep.dot}${search}`,
-			),
-		);
-		if (contentRows >= 8) body.push("");
-
-		const budget = Math.max(0, contentRows - body.length);
-		if (this.#activityRows.length === 0 && budget > 0) {
-			body.push(theme.fg("muted", this.#activitySearch ? "No matching activity" : "No agent activity recorded yet"));
-		} else if (budget > 0) {
-			const selected = Math.min(this.#selectedActivityRow, this.#activityRows.length - 1);
-			const start = this.#activityFollow
-				? Math.max(0, this.#activityRows.length - budget)
-				: Math.max(0, Math.min(selected - Math.floor(budget / 2), this.#activityRows.length - budget));
-			const end = Math.min(this.#activityRows.length, start + budget);
-			if (start > 0) {
-				body.push(theme.fg("dim", `… ${start} earlier`));
-			}
-			for (let index = start + Number(start > 0); index < end; index++) {
-				this.#hitRows[1 + body.length] = index;
-				body.push(this.#formatActivityRow(this.#activityRows[index]!, index === selected, innerWidth));
-			}
-		}
-		while (body.length < contentRows) body.push("");
-
-		const lines = [topBorder(width, "Agent Hub")];
-		for (const line of body.slice(0, contentRows)) lines.push(row(line, width));
-		lines.push(divider(width));
-		lines.push(
-			row(
-				theme.fg(
-					"dim",
-					"1:agents  j/k:select  Enter:transcript  Space:follow  f:filter  s:scope  /:search  Esc:close",
-				),
-				width,
-			),
-		);
-		lines.push(bottomBorder(width));
-		return lines;
-	}
-
-	#formatActivityRow(activity: AgentActivityRow, selected: boolean, width: number): string {
-		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
-		const ref = this.#registry.get(activity.agentId);
-		const observed = this.#observedById.get(activity.agentId);
-		const role = observed?.progress?.modelRole ?? ref?.history?.modelRole;
-		const roleBadge = role && this.#settings ? `${formatRoleBadge(role, this.#settings)} ` : "";
-		const agent = sanitizeLine(activity.agentId, Math.max(8, Math.min(18, Math.floor(width * 0.18))));
-		const title = sanitizeLine(
-			activity.kind === "tool" ? (activity.toolName ?? activity.title) : activity.title,
-			width,
-		);
-		const prefix =
-			`${cursor} ${theme.fg("dim", activityClock(activity.timestamp))} ${activityGlyph(activity)} ` +
-			`${roleBadge}${theme.bold(agent)} ${theme.fg(activity.kind === "response" ? "success" : "muted", title)}`;
-		const available = Math.max(1, width - visibleWidth(prefix) - visibleWidth(theme.sep.dot));
-		return `${prefix}${theme.fg("dim", theme.sep.dot)}${sanitizeLine(activity.summary, available)}`;
-	}
-
-	#renderTable(width: number, termHeight: number): string[] {
-		this.#hitRows.length = 0;
-		const contentRows = Math.max(1, termHeight - 4);
-		const observedById = this.#observedById;
-		const split = this.#splitRosterWidth(width);
-		this.#lastRenderWasSplit = split !== undefined;
-		this.#lastSplitRosterWidth = split;
-		const selected = this.#rows[this.#selectedRow];
-		const lines: string[] = [];
-
-		if (split !== undefined) {
-			const detailWidth = splitBodyWidth(width, split);
-			const roster = this.#renderRosterPanel(split, contentRows, observedById);
-			const details = this.#renderDetailPanel(selected, detailWidth, contentRows, observedById);
-			lines.push(topBorderSplit(width, "Agent Hub", split));
-			for (let i = 0; i < contentRows; i++) {
-				const hit = roster.hitRows[i];
-				if (hit !== undefined) this.#hitRows[lines.length] = hit;
-				lines.push(splitRow(roster.lines[i] ?? "", details[i] ?? "", width, split));
-			}
-			lines.push(dividerSplit(width, split));
-			lines.push(row(this.#footer(false, Math.max(1, width - 4)), width));
-			lines.push(bottomBorder(width));
-			return lines;
-		}
-
-		const innerWidth = Math.max(1, width - 4);
-		if (this.#narrowDetailsOpen && selected) {
-			const details = this.#renderDetailPanel(selected, innerWidth, contentRows, observedById);
-			lines.push(topBorder(width, `Agent Hub · ${selected.id}`));
-			for (const detail of details) lines.push(row(detail, width));
-		} else {
-			const roster = this.#renderRosterPanel(innerWidth, contentRows, observedById);
-			lines.push(topBorder(width, "Agent Hub"));
-			for (let i = 0; i < contentRows; i++) {
-				const hit = roster.hitRows[i];
-				if (hit !== undefined) this.#hitRows[lines.length] = hit;
-				lines.push(row(roster.lines[i] ?? "", width));
-			}
-		}
-		lines.push(divider(width));
-		lines.push(row(this.#footer(this.#narrowDetailsOpen, innerWidth), width));
-		lines.push(bottomBorder(width));
-		return lines;
-	}
-
-	#splitRosterWidth(width: number): number | undefined {
-		if (width < SPLIT_MIN_WIDTH) return undefined;
-		const rosterWidth = Math.max(ROSTER_MIN_WIDTH, Math.min(Math.floor(width * 0.58), width - DETAIL_MIN_WIDTH - 7));
-		return splitBodyWidth(width, rosterWidth) >= DETAIL_MIN_WIDTH ? rosterWidth : undefined;
-	}
-
-	#footer(showingNarrowDetails: boolean, availableWidth: number): string {
-		const nextView = this.#viewMode === "roster" ? "by parent" : "flat";
-		if (showingNarrowDetails) {
-			return theme.fg("dim", `1:agents  2:activity  Tab:roster  PgUp/PgDn:scroll  Enter:open  Esc:roster`);
-		}
-		if (availableWidth < 96) {
-			return theme.fg("dim", `1:agents  2:activity  j/k:select  t:${nextView}  Tab:details  r/x:manage`);
-		}
-		return theme.fg(
-			"dim",
-			`1:agents  2:activity  j/k/wheel:select  PgUp/PgDn:details  Enter/click:open  t:${nextView}  r:revive  x:kill  Esc:close`,
-		);
-	}
-
-	#renderRosterPanel(width: number, rows: number, observedById: ReadonlyMap<string, ObservableSession>): RosterRender {
-		const lines = this.#summaryLines(width);
-		const hitRows: Array<number | undefined> = Array.from({ length: lines.length });
-		if (rows >= 8) {
-			lines.push("");
-			hitRows.push(undefined);
-		}
-
-		const noticeLines = this.#notice ? [theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width)))] : [];
-		const budget = Math.max(0, rows - lines.length - noticeLines.length);
-		if (this.#rows.length === 0) {
-			if (this.#loadingPersistedSubagents) {
-				if (budget > 0) {
-					lines.push(`${statusGlyph("running")} ${theme.fg("accent", "Loading saved agents…")}`);
-					hitRows.push(undefined);
-				}
-			} else {
-				const emptyState = [
-					`${theme.fg("muted", theme.status.shadowed)} ${theme.bold("No agents in this session")}`,
-					theme.fg("dim", "Finished, parked, and killed subagents remain with the session that created them."),
-					theme.fg("dim", "Resume that session with omp-dev --continue, or spawn a task here."),
-				];
-				for (const line of emptyState.slice(0, budget)) {
-					lines.push(line);
-					hitRows.push(undefined);
-				}
-			}
-		} else if (budget > 0) {
-			const window = this.#renderRosterWindow(width, budget, observedById);
-			lines.push(...window.lines);
-			hitRows.push(...window.hitRows);
-		}
-		for (const notice of noticeLines) {
-			lines.push(notice);
-			hitRows.push(undefined);
-		}
-		while (lines.length < rows) {
-			lines.push("");
-			hitRows.push(undefined);
-		}
-		return { lines: lines.slice(0, rows), hitRows: hitRows.slice(0, rows) };
-	}
-
-	#renderRosterWindow(
-		width: number,
-		budget: number,
-		_observedById: ReadonlyMap<string, ObservableSession>,
-	): RosterRender {
-		const lines: string[] = [];
-		const hitRows: Array<number | undefined> = [];
-		const rendered = new Map<number, string[]>();
-		const entryAt = (index: number): string[] => {
-			const cached = rendered.get(index);
-			if (cached) return cached;
-			const entry = this.#renderEntry(
-				this.#rows[index],
-				index === this.#selectedRow,
-				width,
-				this.#observableFor(this.#rows[index].id),
-				index === this.#hoveredRow,
-			);
-			rendered.set(index, entry);
-			return entry;
-		};
-		const appendEntry = (index: number, entry = entryAt(index)): void => {
-			for (const line of entry) {
-				lines.push(line);
-				hitRows.push(index);
-			}
-		};
-
-		let start = this.#selectedRow;
-		let end = this.#selectedRow + 1;
-		let used = entryAt(this.#selectedRow).length;
-		if (used > budget) {
-			appendEntry(this.#selectedRow, entryAt(this.#selectedRow).slice(0, budget));
-			return { lines, hitRows };
-		}
-
-		// Grow a window around the selection. Only visible entries are rendered,
-		// so the 5,000-agent Hub retains bounded paint cost.
-		for (let grew = true; grew; ) {
-			grew = false;
-			if (end < this.#rows.length) {
-				const next = entryAt(end);
-				if (used + next.length <= budget) {
-					used += next.length;
-					end++;
-					grew = true;
-				}
-			}
-			if (start > 0) {
-				const previous = entryAt(start - 1);
-				if (used + previous.length <= budget) {
-					start--;
-					used += previous.length;
-					grew = true;
-				}
-			}
-		}
-		// Overflow labels consume real rows. Trim the farthest visible neighbors
-		// before painting them so the selected entry and both labels fit.
-		for (
-			let markerRows = Number(start > 0) + Number(end < this.#rows.length);
-			used + markerRows > budget && start < end;
-			markerRows = Number(start > 0) + Number(end < this.#rows.length)
-		) {
-			if (end - 1 > this.#selectedRow) {
-				end--;
-				used -= entryAt(end).length;
-			} else if (start < this.#selectedRow) {
-				used -= entryAt(start).length;
-				start++;
-			} else {
-				break;
-			}
-		}
-		const showTopOverflow = start > 0 && used < budget;
-		const showBottomOverflow = end < this.#rows.length && used + Number(showTopOverflow) < budget;
-		if (showTopOverflow) {
-			lines.push(theme.fg("dim", `… ${start} more`));
-			hitRows.push(undefined);
-		}
-		for (let i = start; i < end; i++) appendEntry(i);
-		if (showBottomOverflow) {
-			lines.push(theme.fg("dim", `… ${this.#rows.length - end} more`));
-			hitRows.push(undefined);
-		}
-		return { lines, hitRows };
-	}
-
-	#summaryLines(width: number): string[] {
-		const active = (label: string): string => theme.bg("selectedBg", theme.bold(theme.fg("accent", ` ${label} `)));
-		const inactive = (label: string): string => theme.fg("muted", ` ${label} `);
-		const projection =
-			this.#viewMode === "roster"
-				? `${active("Flat")}${theme.fg("dim", "/")}${inactive("By parent")}`
-				: `${inactive("Flat")}${theme.fg("dim", "/")}${active("By parent")}`;
-		const counts = this.#statusSummary();
-		const header = `${theme.bold("Roster")}${theme.fg("dim", theme.sep.dot)}${projection}${counts ? theme.fg("dim", theme.sep.dot) + counts : ""}`;
-		const lines = wrapTextWithAnsi(header, Math.max(1, width));
-
-		const metrics = this.#aggregate;
-		if (metrics.reportedAgents === 0) {
-			lines.push(
-				...wrapTextWithAnsi(
-					theme.fg("dim", `Usage —${theme.sep.dot}0/${this.#rows.length} measured`),
-					Math.max(1, width),
-				),
-			);
-			return lines;
-		}
-		const activeTime = formatMetricDuration(metrics);
-		const usage = [
-			theme.fg("statusLineCost", formatCost(metrics.cost)),
-			theme.fg("dim", activeTime ? `${activeTime} agent time` : "agent time —"),
-			theme.fg("dim", `${formatNumber(metrics.requests)} req`),
-			theme.fg("dim", `${formatNumber(metrics.tools)} tools`),
-			theme.fg("dim", `${formatNumber(metrics.tokens)} tok`),
-			theme.fg("dim", `${metrics.activeDurationAgents}/${metrics.reportedAgents} timed`),
-			theme.fg("dim", `${metrics.reportedAgents}/${this.#rows.length} measured`),
-		].join(theme.fg("dim", theme.sep.dot));
-		lines.push(...wrapTextWithAnsi(usage, Math.max(1, width)));
-		return lines;
-	}
-
-	#statusSummary(): string {
-		const parts: string[] = [];
-		for (const status of ["running", "idle", "parked", "aborted"] as const) {
-			const count = this.#statusCounts[status];
-			if (count > 0) parts.push(`${statusGlyph(status)} ${statusText(status, `${count} ${status}`)}`);
-		}
-		return parts.join(theme.sep.dot);
-	}
-
 	#refreshAggregate(refreshFallback = false): void {
 		const result = aggregateMetrics({
 			rows: this.#rows,
@@ -992,197 +570,21 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#aggregate = result.metrics;
 		this.#hasFallbackLiveSessions = result.hasFallbackLiveSessions;
 	}
-
 	#observableFor(id: string): ObservableSession | undefined {
 		return this.#observedById.get(id) ?? this.#observers.getSession(id);
 	}
-
-	#renderDetailPanel(
-		ref: AgentRef | undefined,
-		width: number,
-		rows: number,
-		_observedById: ReadonlyMap<string, ObservableSession>,
-	): string[] {
-		if (!ref) return [theme.fg("dim", "Select an agent to inspect"), ...Array.from({ length: rows - 1 }, () => "")];
-		const observed = this.#observableFor(ref.id);
-		const progress = observed?.progress;
-		const metrics = this.#metricsFor(ref, observed);
-		const children = this.#childrenByParent.get(ref.id) ?? [];
-		const lines: string[] = [];
-		const add = (line = ""): void => {
-			lines.push(truncateToWidth(line, width));
-		};
-		const addWrapped = (text: string, maxRows = 2): void => {
-			for (const wrapped of wrapTextWithAnsi(sanitizeLine(text), Math.max(1, width)).slice(0, maxRows)) add(wrapped);
-		};
-		const section = (label: string, contentRows = 0): void => {
-			if (lines.length > 0 && lines.length + 1 + contentRows < rows) add();
-			add(theme.bold(theme.fg("accent", label)));
-		};
-
-		add(`${statusGlyph(ref.status)} ${theme.bold(sanitizeDisplayText(ref.displayName || ref.id))}`);
-		if (ref.displayName && ref.displayName !== ref.id) add(theme.fg("dim", sanitizeDisplayText(ref.id)));
-		const lifecycle = [
-			statusText(ref.status, ref.status),
-			metrics ? formatMetricDuration(metrics) : undefined,
-			`active ${formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))}`,
-		].filter(Boolean);
-		add(lifecycle.join(theme.fg("dim", theme.sep.dot)));
-		const modelDetails: string[] = [];
-		const modelRole = progress?.modelRole ?? ref.history?.modelRole;
-		if (modelRole && this.#settings) modelDetails.push(formatRoleBadge(modelRole, this.#settings));
-		const badge = modelBadge(ref, observed);
-		if (badge) modelDetails.push(badge);
-		if (modelDetails.length > 0) add(modelDetails.join(theme.sep.dot));
-
-		const task = observed?.description ?? progress?.task ?? ref.activity;
-		if (task) {
-			section("Task");
-			addWrapped(task);
-		}
-
-		const current = progress?.currentTool
-			? `${progress.currentTool}${progress.currentToolArgs ? ` · ${progress.currentToolArgs}` : ""}`
-			: (progress?.lastIntent ?? ref.activity);
-		if (current) {
-			section("Current");
-			addWrapped(current);
-			if (progress?.retryState) {
-				add(theme.fg("warning", `retry ${progress.retryState.attempt}/${progress.retryState.maxAttempts}`));
-			}
-		}
-
-		section("Usage", 1);
-		if (metrics) {
-			addWrapped(formatMetrics(metrics), 3);
-			if (metrics.contextTokens !== undefined && metrics.contextWindow) {
-				add(contextGauge(metrics.contextTokens, metrics.contextWindow));
-			}
-		} else {
-			add(theme.fg("dim", "usage —"));
-		}
-
-		section("Lineage");
-		add(
-			`Spawned by ${sanitizeDisplayText(ref.parentId ?? MAIN_AGENT_ID)}${children.length > 0 ? ` · ${children.length} children` : ""}`,
-		);
-		if (children.length > 0) add(theme.fg("dim", formatChildIds(children, width)));
-		add(theme.fg("dim", `Registered ${new Date(ref.createdAt).toISOString().slice(0, 16).replace("T", " ")}Z`));
-
-		section("Changes");
-		add(
-			theme.fg(
-				"dim",
-				ref.kind === "advisor" || ref.history?.readOnly
-					? "Read-only · 0 LoC"
-					: "Shared workspace · per-agent LoC not attributable",
-			),
-		);
-		const artifacts = ref.history;
-		if (artifacts?.outputPath) addWrapped(`Output ${shortenPath(artifacts.outputPath)}`);
-		if (artifacts?.patchPath) addWrapped(`Patch ${shortenPath(artifacts.patchPath)}`);
-		if (artifacts?.branchName) addWrapped(`Worktree branch ${artifacts.branchName}`);
-
-		if (lines.length < rows) add();
-		if (lines.length < rows) add(theme.bold(theme.fg("accent", "Recent activity")));
-		const activityBudget = Math.max(0, rows - lines.length);
-		const activity = this.#activity.recent(ref.id, activityBudget);
-		if (activity.length === 0 && activityBudget > 0) add(theme.fg("muted", "No response or tool activity yet"));
-		else {
-			for (const event of activity) {
-				const title = sanitizeLine(event.kind === "tool" ? (event.toolName ?? event.title) : event.title, width);
-				const prefix = `${theme.fg("dim", activityClock(event.timestamp))} ${activityGlyph(event)} ${theme.fg("muted", title)} `;
-				add(`${prefix}${sanitizeLine(event.summary, Math.max(1, width - visibleWidth(prefix)))}`);
-			}
-		}
-
-		const maxScroll = Math.max(0, lines.length - rows);
-		this.#detailScrollOffset = Math.min(this.#detailScrollOffset, maxScroll);
-		const visible = lines.slice(this.#detailScrollOffset, this.#detailScrollOffset + rows);
-		while (visible.length < rows) visible.push("");
-		return visible;
+	// Table view
+	#sectionTabs(): string {
+		const tab = (section: AgentHubSection, label: string): string =>
+			this.#section === section
+				? theme.bg("selectedBg", theme.bold(theme.fg("accent", ` ${label} `)))
+				: theme.fg("muted", ` ${label} `);
+		return `${tab("agents", "1 Agents")}${theme.fg("dim", theme.sep.dot)}${tab("activity", "2 Activity")}`;
 	}
-
-	/**
-	 * One agent entry keeps identity/model metadata on one line when it fits,
-	 * then packs task and all five usage metrics together below. Narrow rows wrap
-	 * only those dense secondary fields.
-	 */
-	#renderEntry(
-		ref: AgentRef,
-		selected: boolean,
-		width: number,
-		observed: ObservableSession | undefined,
-		hovered = false,
-	): string[] {
-		const max = Math.max(1, width);
-		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
-		const depth = this.#viewMode === "tree" ? (this.#treeDepthById.get(ref.id) ?? 0) : 0;
-		const branch =
-			this.#viewMode === "tree"
-				? treeBranch(ref, max, this.#treeDepthById, this.#treeParentById, this.#treeLastSiblingById)
-				: "";
-		const id = sanitizeDisplayText(ref.id);
-		const styledId = selected ? theme.bold(theme.fg("accent", id)) : theme.bold(id);
-		const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${branch}${styledId}`];
-		if (ref.displayName && ref.displayName !== ref.id) {
-			fields.push(theme.fg("dim", sanitizeDisplayText(ref.displayName)));
-		}
-		if (this.#viewMode === "roster" && ref.parentId && ref.parentId !== MAIN_AGENT_ID) {
-			fields.push(theme.fg("dim", `↳ ${sanitizeDisplayText(ref.parentId)}`));
-		}
-		if (ref.kind === "advisor") {
-			fields.push(theme.fg("warning", "read-only"));
-		}
-		const unread = this.#irc.unreadCount(ref.id);
-		if (unread > 0) {
-			fields.push(theme.fg("warning", `⧉ ${unread}`));
-		}
-		const left = fields.join("  ");
-
-		const meta: string[] = [];
-		const modelRole = observed?.progress?.modelRole ?? ref.history?.modelRole;
-		if (modelRole && this.#settings) {
-			meta.push(formatRoleBadge(modelRole, this.#settings));
-		}
-		const badge = modelBadge(ref, observed);
-		if (badge) meta.push(badge);
-		meta.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
-		const right = meta.join(theme.sep.dot);
-
-		const leftWidth = visibleWidth(left);
-		const rightWidth = visibleWidth(right);
-		const entry: string[] = [];
-		const detailIndent = Math.min(max - 1, 4 + depth * 2);
-		if (leftWidth + 2 + rightWidth <= max) {
-			entry.push(left + padding(max - leftWidth - rightWidth) + right);
-		} else {
-			entry.push(truncateToWidth(left.replace(/[\r\n]+/g, " "), max));
-			entry.push(`${padding(Math.max(0, detailIndent))}${truncateToWidth(right, Math.max(1, max - detailIndent))}`);
-		}
-
-		const metrics = this.#metricsFor(ref, observed);
-		const usage = metrics ? theme.fg("dim", formatMetrics(metrics)) : theme.fg("dim", "usage —");
-		const task = observed?.description ?? observed?.progress?.task ?? ref.activity;
-		const detailWidth = Math.max(1, max - detailIndent);
-		const details = task
-			? `${theme.fg("muted", sanitizeLine(task, detailWidth))}${theme.fg("dim", theme.sep.dot)}${usage}`
-			: usage;
-		for (const wrapped of wrapTextWithAnsi(details, detailWidth)) {
-			entry.push(`${padding(Math.max(0, detailIndent))}${wrapped}`);
-		}
-		if (!hovered) return entry;
-		return entry.map(lineRow => {
-			const rowWidth = visibleWidth(lineRow);
-			return theme.bg("selectedBg", rowWidth < max ? lineRow + padding(max - rowWidth) : lineRow);
-		});
-	}
-
 	#scrollDetails(direction: -1 | 1): void {
 		this.#detailScrollOffset = Math.max(0, this.#detailScrollOffset + direction * 5);
 		this.#requestRender();
 	}
-
 	#selectRow(index: number): void {
 		if (index !== this.#selectedRow) {
 			this.#detailScrollOffset = 0;
@@ -1190,142 +592,45 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		}
 		this.#selectedRow = index;
 	}
-
 	handleWheel(delta: -1 | 1): void {
 		this.#hoveredRow = null;
 		if (this.#section === "activity") {
-			if (this.#activityRows.length > 0) {
-				this.#activityFollow = false;
-				this.#selectedActivityRow = Math.max(
-					0,
-					Math.min(this.#selectedActivityRow + delta, this.#activityRows.length - 1),
-				);
-			}
-		} else if (this.#rows.length > 0) {
-			this.#selectRow(Math.max(0, Math.min(this.#selectedRow + delta, this.#rows.length - 1)));
+			this.#activityView.handleWheel(delta);
+			return;
 		}
+		if (this.#rows.length > 0) this.#selectRow(Math.max(0, Math.min(this.#selectedRow + delta, this.#rows.length - 1)));
 		this.#requestRender();
 	}
-
 	hitTest(line: number): number | undefined {
-		return this.#hitRows[line];
+		return this.#section === "activity" ? this.#activityView.hitTest(line) : this.#hitRows[line];
 	}
-
 	setHoverIndex(index: number | null): void {
 		if (this.#section === "activity") return;
 		if (index === this.#hoveredRow) return;
 		this.#hoveredRow = index;
 		this.#requestRender();
 	}
-
 	clickItem(index: number): void {
 		if (this.#section === "activity") {
-			if (index === this.#selectedActivityRow) {
-				const activity = this.#activityRows[index];
-				if (activity) this.openChat(activity.agentId, activity.entryId);
-				return;
-			}
-			this.#activityFollow = false;
-			this.#selectedActivityRow = index;
-			this.#requestRender();
+			this.#activityView.clickItem(index);
 			return;
 		}
 		const selected = this.#rows[index];
 		if (!selected) return;
 		this.#hoveredRow = index;
 		this.#selectRow(index);
-		this.#refreshActivityRows();
+		this.#activityView.refreshRows();
 		this.#requestRender();
 		this.#activateAgent(selected);
 	}
-
 	#switchSection(section: AgentHubSection): void {
 		if (this.#section === section) return;
 		this.#section = section;
 		this.#hoveredRow = null;
 		this.#narrowDetailsOpen = false;
-		if (section === "activity") this.#refreshActivityRows();
+		if (section === "activity") this.#activityView.refreshRows();
 		this.#requestRender();
 	}
-
-	#handleActivitySearchInput(keyData: string): void {
-		if (matchesKey(keyData, "escape") || matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
-			this.#activitySearchEditing = false;
-		} else if (matchesKey(keyData, "backspace")) {
-			this.#activitySearch = this.#activitySearch.slice(0, -1);
-		} else if (keyData.length === 1 && keyData >= " " && keyData !== "\u007f") {
-			this.#activitySearch += keyData;
-		} else {
-			return;
-		}
-		this.#refreshActivityRows();
-		this.#requestRender();
-	}
-
-	#handleActivityInput(keyData: string): void {
-		if (matchesKey(keyData, "escape")) {
-			if (this.#activitySearch) {
-				this.#activitySearch = "";
-				this.#refreshActivityRows();
-				this.#requestRender();
-			} else {
-				this.#onDone();
-			}
-			return;
-		}
-		if (matchesKey(keyData, "left")) {
-			this.#switchSection("agents");
-			return;
-		}
-		if (keyData === "/") {
-			this.#activitySearchEditing = true;
-			this.#requestRender();
-			return;
-		}
-		if (keyData === " ") {
-			this.#activityFollow = !this.#activityFollow;
-			if (this.#activityFollow && this.#activityRows.length > 0) {
-				this.#selectedActivityRow = this.#activityRows.length - 1;
-			}
-			this.#requestRender();
-			return;
-		}
-		if (keyData === "f") {
-			const filters: ActivityFilter[] = ["all", "errors", "responses", "tools"];
-			this.#activityFilter = filters[(filters.indexOf(this.#activityFilter) + 1) % filters.length]!;
-			this.#refreshActivityRows();
-			this.#requestRender();
-			return;
-		}
-		if (keyData === "s") {
-			const scopes: ActivityScope[] = ["all", "agent", "subtree"];
-			this.#activityScope = scopes[(scopes.indexOf(this.#activityScope) + 1) % scopes.length]!;
-			this.#refreshActivityRows();
-			this.#requestRender();
-			return;
-		}
-		if (matchesKey(keyData, "j") || matchesSelectDown(keyData)) {
-			if (this.#activityRows.length > 0) {
-				this.#activityFollow = false;
-				this.#selectedActivityRow = Math.min(this.#selectedActivityRow + 1, this.#activityRows.length - 1);
-			}
-			this.#requestRender();
-			return;
-		}
-		if (matchesKey(keyData, "k") || matchesSelectUp(keyData)) {
-			if (this.#activityRows.length > 0) {
-				this.#activityFollow = false;
-				this.#selectedActivityRow = Math.max(this.#selectedActivityRow - 1, 0);
-			}
-			this.#requestRender();
-			return;
-		}
-		if (matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
-			const activity = this.#activityRows[this.#selectedActivityRow];
-			if (activity) this.openChat(activity.agentId, activity.entryId);
-		}
-	}
-
 	#handleTableInput(keyData: string): void {
 		if (matchesKey(keyData, "escape")) {
 			if (this.#narrowDetailsOpen && !this.#lastRenderWasSplit) {
@@ -1382,7 +687,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			if (this.#rows.length > 0) {
 				this.#selectRow(Math.min(this.#selectedRow + 1, this.#rows.length - 1));
 			}
-			this.#refreshActivityRows();
+			this.#activityView.refreshRows();
 			this.#requestRender();
 			return;
 		}
@@ -1390,7 +695,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			if (this.#rows.length > 0) {
 				this.#selectRow(Math.max(this.#selectedRow - 1, 0));
 			}
-			this.#refreshActivityRows();
+			this.#activityView.refreshRows();
 			this.#requestRender();
 			return;
 		}
@@ -1408,7 +713,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			return;
 		}
 	}
-
 	/**
 	 * Enter on a row: focus the main view on the agent's live session and close
 	 * the hub. The transcript then renders through the regular session pipeline —
@@ -1434,7 +738,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			}
 		})();
 	}
-
 	#reviveSelected(): void {
 		const ref = this.#rows[this.#selectedRow];
 		if (!ref) return;
@@ -1463,7 +766,6 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			});
 		this.#requestRender();
 	}
-
 	#killSelected(): void {
 		const ref = this.#rows[this.#selectedRow];
 		if (!ref) return;

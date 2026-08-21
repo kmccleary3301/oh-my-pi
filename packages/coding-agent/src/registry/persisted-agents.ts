@@ -6,6 +6,7 @@ import { EPHEMERAL_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { loadBundledAgents } from "../task/agents";
 import { isReadOnlyAgent } from "../task/read-only-policy";
+import { recordOf } from "../utils/objects";
 import { persistedVibeChildIds } from "../vibe/runtime";
 import {
 	type AgentHistorySummary,
@@ -32,11 +33,6 @@ interface PersistedTranscript {
 	lastActivity?: number;
 }
 
-function recordOf(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: undefined;
-}
 
 function timestampOf(value: unknown): number | undefined {
 	if (typeof value !== "string") return undefined;

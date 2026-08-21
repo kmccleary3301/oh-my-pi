@@ -51,6 +51,8 @@ describe("AgentActivityIndex", () => {
 		});
 		expect(activity.query({ kinds: new Set(["tool"]) })).toHaveLength(1);
 		expect(activity.query({ search: "SRC/A.TS" })).toHaveLength(1);
+		expect(activity.recent("Worker", 0)).toEqual([]);
+		expect(activity.query({ limit: 0 })).toEqual([]);
 	});
 
 	it("tails appended JSONL incrementally and scopes rows by agent subtree", async () => {
