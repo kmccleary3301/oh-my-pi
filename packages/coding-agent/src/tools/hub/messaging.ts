@@ -11,7 +11,7 @@
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
-import { formatAge, formatDuration } from "@oh-my-pi/pi-utils";
+import { formatAge, formatDuration, Snowflake } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../../irc/bus";
@@ -143,7 +143,7 @@ export interface HubSendParams {
 }
 
 export async function executeSend(
-	deps: { registry: AgentRegistry; senderId: string; settings: Settings },
+	deps: { registry: AgentRegistry; senderId: string; settings: Settings; sessionFile?: string | null },
 	params: HubSendParams,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<CoordinationDetails>> {
@@ -169,6 +169,7 @@ export async function executeSend(
 	}
 
 	const bus = IrcBus.global();
+	bus.configureHistory(deps.sessionFile);
 	let waited: IrcMessage | null | undefined;
 	const timeoutMs = params.await ? resolveMessageTimeoutMs(settings, params.timeoutMs) : undefined;
 	const awaitAbort = params.await ? new AbortController() : undefined;
@@ -208,10 +209,11 @@ export async function executeSend(
 		// directly (its own incoming card); relaying the sibling legs to the
 		// main UI would then show the same body once per other recipient.
 		const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
+		const broadcastId = isBroadcast ? Snowflake.next() : undefined;
 		const receipts = await Promise.all(
 			targets.map(target =>
 				bus.send(
-					{ from: senderId, to: target, body: message, replyTo: params.replyTo },
+					{ from: senderId, to: target, body: message, replyTo: params.replyTo, broadcastId },
 					// Awaited sends mark the sender as blocked on an answer so a
 					// busy recipient that cannot reach a step boundary (async
 					// disabled) auto-replies instead of stranding the sender.

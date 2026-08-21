@@ -16,6 +16,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -774,5 +775,29 @@ describe("Agent hub data refresh coalescing", () => {
 			hub.dispose();
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("Agent hub slash deep-links", () => {
+	it("opens Activity from /hub and Messages from /irc", async () => {
+		const showAgentHub = vi.fn();
+		const showAgentsDashboard = vi.fn();
+		const setText = vi.fn();
+		const runtime = {
+			ctx: {
+				showAgentHub,
+				showAgentsDashboard,
+				editor: { setText },
+			} as unknown as InteractiveModeContext,
+		};
+
+		expect(await executeBuiltinSlashCommand("/hub", runtime)).toBe(true);
+		expect(showAgentHub).toHaveBeenLastCalledWith({ initialSection: "activity" });
+		expect(await executeBuiltinSlashCommand("/irc", runtime)).toBe(true);
+		expect(showAgentHub).toHaveBeenLastCalledWith({ initialSection: "messages" });
+		expect(await executeBuiltinSlashCommand("/agents", runtime)).toBe(true);
+		expect(showAgentsDashboard).toHaveBeenCalledTimes(1);
+		expect(showAgentHub).toHaveBeenCalledTimes(2);
+		expect(setText).toHaveBeenCalledTimes(3);
 	});
 });
